@@ -1,0 +1,315 @@
+Start testing: Oct 29 23:42 대한민국 표준시
+----------------------------------------------------------
+1/3 Testing: no_args
+1/3 Test: no_args
+Command: "C:/HP_laptop/ByteSieve/build/Debug/disk-scanner.exe"
+Directory: C:/HP_laptop/ByteSieve/build
+"no_args" start time: Oct 29 23:42 대한민국 표준시
+Output:
+----------------------------------------------------------
+U
+s
+a
+g
+e
+:
+ 
+d
+i
+s
+k
+-
+s
+c
+a
+n
+n
+e
+r
+ 
+<
+d
+i
+r
+e
+c
+t
+o
+r
+y
+>
+
+
+
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+d
+i
+s
+k
+-
+s
+c
+a
+n
+n
+e
+r
+ 
+-
+h
+ 
+|
+ 
+-
+-
+h
+e
+l
+p
+
+
+
+
+
+
+C
+o
+u
+n
+t
+s
+ 
+f
+i
+l
+e
+s
+,
+ 
+d
+i
+r
+e
+c
+t
+o
+r
+i
+e
+s
+ 
+a
+n
+d
+ 
+t
+o
+t
+a
+l
+ 
+s
+i
+z
+e
+ 
+u
+n
+d
+e
+r
+ 
+<
+d
+i
+r
+e
+c
+t
+o
+r
+y
+>
+.
+
+
+
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"no_args" end time: Oct 29 23:42 대한민국 표준시
+"no_args" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/3 Testing: help
+2/3 Test: help
+Command: "C:/HP_laptop/ByteSieve/build/Debug/disk-scanner.exe" "--help"
+Directory: C:/HP_laptop/ByteSieve/build
+"help" start time: Oct 29 23:42 대한민국 표준시
+Output:
+----------------------------------------------------------
+U
+s
+a
+g
+e
+:
+ 
+d
+i
+s
+k
+-
+s
+c
+a
+n
+n
+e
+r
+ 
+<
+d
+i
+r
+e
+c
+t
+o
+r
+y
+>
+
+
+
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+d
+i
+s
+k
+-
+s
+c
+a
+n
+n
+e
+r
+ 
+-
+h
+ 
+|
+ 
+-
+-
+h
+e
+l
+p
+
+
+
+
+
+
+C
+o
+u
+n
+t
+s
+ 
+f
+i
+l
+e
+s
+,
+ 
+d
+i
+r
+e
+c
+t
+o
+r
+i
+e
+s
+ 
+a
+n
+d
+ 
+t
+o
+t
+a
+l
+ 
+s
+i
+z
+e
+ 
+u
+n
+d
+e
+r
+ 
+<
+d
+i
+r
+e
+c
+t
+o
+r
+y
+>
+.
+
+
+
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"help" end time: Oct 29 23:42 대한민국 표준시
+"help" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/3 Testing: path
+3/3 Test: path
+Command: "C:/HP_laptop/ByteSieve/build/Debug/test_path.exe"
+Directory: C:/HP_laptop/ByteSieve/build
+"path" start time: Oct 29 23:42 대한민국 표준시
+Output:
+----------------------------------------------------------
+all path tests passed
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"path" end time: Oct 29 23:42 대한민국 표준시
+"path" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Oct 29 23:42 대한민국 표준시

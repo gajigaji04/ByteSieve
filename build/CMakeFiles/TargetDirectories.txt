@@ -1,0 +1,6 @@
+C:/HP_laptop/ByteSieve/build/CMakeFiles/bytesieve_path.dir
+C:/HP_laptop/ByteSieve/build/CMakeFiles/disk-scanner.dir
+C:/HP_laptop/ByteSieve/build/CMakeFiles/test_path.dir
+C:/HP_laptop/ByteSieve/build/CMakeFiles/RUN_TESTS.dir
+C:/HP_laptop/ByteSieve/build/CMakeFiles/ALL_BUILD.dir
+C:/HP_laptop/ByteSieve/build/CMakeFiles/ZERO_CHECK.dir
