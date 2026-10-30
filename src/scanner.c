@@ -124,31 +124,25 @@ static int is_dot_entry(const wchar_t *name)
 }
 
 static void account_entry(const WIN32_FIND_DATAW *fd, ScanReport *report,
-                          scan_visit_fn visit, void *ctx)
+                          ScanEntry *entry)
 {
-    ScanEntry entry;
+    entry->name = fd->cFileName;
+    entry->attributes = (uint32_t)fd->dwFileAttributes;
+    entry->is_dir = (fd->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    entry->is_reparse = (fd->dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    entry->descend = scan_should_descend(entry->attributes);
 
-    entry.name = fd->cFileName;
-    entry.attributes = (uint32_t)fd->dwFileAttributes;
-    entry.is_dir = (fd->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    entry.is_reparse = (fd->dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-    entry.descend = scan_should_descend(entry.attributes);
-
-    if (entry.is_dir) {
-        entry.size = 0;
+    if (entry->is_dir) {
+        entry->size = 0;
         report->dir_count++;
-        if (entry.is_reparse) {
+        if (entry->is_reparse) {
             report->reparse_count++;
         }
     } else {
-        entry.size = scan_combine_size((uint32_t)fd->nFileSizeHigh,
-                                       (uint32_t)fd->nFileSizeLow);
+        entry->size = scan_combine_size((uint32_t)fd->nFileSizeHigh,
+                                        (uint32_t)fd->nFileSizeLow);
         report->file_count++;
-        report->total_bytes += entry.size;
-    }
-
-    if (visit != NULL) {
-        visit(&entry, ctx);
+        report->total_bytes += entry->size;
     }
 }
 
@@ -156,6 +150,7 @@ static void account_entry(const WIN32_FIND_DATAW *fd, ScanReport *report,
 typedef struct {
     wchar_t *path;
     uint32_t depth;
+    uintptr_t id;
 } DirFrame;
 
 typedef struct {
@@ -165,7 +160,8 @@ typedef struct {
 } DirStack;
 
 /* path 의 소유권을 가져간다. 실패하면 path 를 해제하고 0 을 반환한다. */
-static int stack_push(DirStack *stack, wchar_t *path, uint32_t depth)
+static int stack_push(DirStack *stack, wchar_t *path, uint32_t depth,
+                      uintptr_t id)
 {
     if (stack->len == stack->cap) {
         size_t cap = stack->cap ? stack->cap * 2 : 16;
@@ -179,6 +175,7 @@ static int stack_push(DirStack *stack, wchar_t *path, uint32_t depth)
     }
     stack->items[stack->len].path = path;
     stack->items[stack->len].depth = depth;
+    stack->items[stack->len].id = id;
     stack->len++;
     return 1;
 }
@@ -232,7 +229,7 @@ static wchar_t *open_root(const wchar_t *dir, ScanReport *report)
  */
 static ScanStatus enumerate_dir(const DirFrame *frame, uint32_t max_depth,
                                 DirStack *stack, ScanReport *report,
-                                scan_visit_fn visit, void *ctx)
+                                const ScanHooks *hooks, void *ctx)
 {
     WIN32_FIND_DATAW fd;
     HANDLE find;
@@ -261,20 +258,27 @@ static ScanStatus enumerate_dir(const DirFrame *frame, uint32_t max_depth,
     }
 
     do {
+        ScanEntry entry;
+        uintptr_t child_id = 0;
+        int will_descend;
+
         if (is_dot_entry(fd.cFileName)) {
             continue;
         }
-        account_entry(&fd, report, visit, ctx);
+        account_entry(&fd, report, &entry);
+        will_descend = frame->depth < max_depth && entry.descend;
+        if (hooks->on_entry != NULL) {
+            child_id = hooks->on_entry(&entry, frame->id, will_descend, ctx);
+        }
 
-        if (frame->depth < max_depth &&
-            scan_should_descend((uint32_t)fd.dwFileAttributes)) {
+        if (will_descend) {
             wchar_t *child = path_join(frame->path, fd.cFileName);
             if (child == NULL) {
                 /* path_join 은 길이 초과와 메모리 부족을 구분하지 않는다. */
                 record_error(report, frame->path, ERROR_FILENAME_EXCED_RANGE);
                 report->skipped_dir_count++;
                 status = SCAN_PARTIAL;
-            } else if (!stack_push(stack, child, frame->depth + 1)) {
+            } else if (!stack_push(stack, child, frame->depth + 1, child_id)) {
                 record_error(report, frame->path, ERROR_NOT_ENOUGH_MEMORY);
                 report->skipped_dir_count++;
                 status = SCAN_PARTIAL;
@@ -292,9 +296,33 @@ static ScanStatus enumerate_dir(const DirFrame *frame, uint32_t max_depth,
     return status;
 }
 
-ScanStatus scan_tree(const wchar_t *dir, uint32_t max_depth, ScanReport *report,
-                     scan_visit_fn visit, void *ctx)
+/* 훅 호출로 감싼 enumerate_dir. */
+static ScanStatus visit_dir(const DirFrame *frame, uint32_t max_depth,
+                            DirStack *stack, ScanReport *report,
+                            const ScanHooks *hooks, void *ctx)
 {
+    ScanDirInfo info;
+    ScanStatus result;
+
+    info.id = frame->id;
+    info.path = frame->path;
+    info.depth = frame->depth;
+    info.pending = stack->len;
+    if (hooks->on_dir_begin != NULL) {
+        hooks->on_dir_begin(&info, ctx);
+    }
+    result = enumerate_dir(frame, max_depth, stack, report, hooks, ctx);
+    if (hooks->on_dir_end != NULL) {
+        info.pending = stack->len;
+        hooks->on_dir_end(&info, result, ctx);
+    }
+    return result;
+}
+
+ScanStatus scan_tree_ex(const wchar_t *dir, uint32_t max_depth, uintptr_t root_id,
+                        ScanReport *report, const ScanHooks *hooks, void *ctx)
+{
+    static const ScanHooks no_hooks = {NULL, NULL, NULL};
     DirStack stack = {0};
     DirFrame frame;
     ScanStatus status = SCAN_COMPLETE;
@@ -303,6 +331,9 @@ ScanStatus scan_tree(const wchar_t *dir, uint32_t max_depth, ScanReport *report,
 
     if (report == NULL) {
         return SCAN_FATAL;
+    }
+    if (hooks == NULL) {
+        hooks = &no_hooks;
     }
 
     ext = open_root(dir, report);
@@ -313,7 +344,8 @@ ScanStatus scan_tree(const wchar_t *dir, uint32_t max_depth, ScanReport *report,
 
     frame.path = ext;
     frame.depth = 0;
-    result = enumerate_dir(&frame, max_depth, &stack, report, visit, ctx);
+    frame.id = root_id;
+    result = visit_dir(&frame, max_depth, &stack, report, hooks, ctx);
     free(ext);
     if (result == SCAN_FATAL) {
         /* 루트를 열지 못하면 하위 트리 전체를 알 수 없으므로 중단한다. */
@@ -331,7 +363,7 @@ ScanStatus scan_tree(const wchar_t *dir, uint32_t max_depth, ScanReport *report,
      */
     while (stack.len > 0) {
         frame = stack.items[--stack.len];
-        result = enumerate_dir(&frame, max_depth, &stack, report, visit, ctx);
+        result = visit_dir(&frame, max_depth, &stack, report, hooks, ctx);
         if (result != SCAN_COMPLETE) {
             status = SCAN_PARTIAL;
         }
@@ -340,6 +372,37 @@ ScanStatus scan_tree(const wchar_t *dir, uint32_t max_depth, ScanReport *report,
 
     stack_free(&stack);
     return status;
+}
+
+/* scan_tree 의 visit 콜백을 on_entry 훅으로 옮긴다. */
+typedef struct {
+    scan_visit_fn visit;
+    void *ctx;
+} VisitAdapter;
+
+static uintptr_t adapt_visit(const ScanEntry *entry, uintptr_t parent,
+                             int will_descend, void *ctx)
+{
+    VisitAdapter *a = ctx;
+
+    (void)parent;
+    (void)will_descend;
+    a->visit(entry, a->ctx);
+    return 0;
+}
+
+ScanStatus scan_tree(const wchar_t *dir, uint32_t max_depth, ScanReport *report,
+                     scan_visit_fn visit, void *ctx)
+{
+    ScanHooks hooks = {NULL, NULL, NULL};
+    VisitAdapter adapter;
+
+    adapter.visit = visit;
+    adapter.ctx = ctx;
+    if (visit != NULL) {
+        hooks.on_entry = adapt_visit;
+    }
+    return scan_tree_ex(dir, max_depth, 0, report, &hooks, &adapter);
 }
 
 ScanStatus scan_directory(const wchar_t *dir, ScanReport *report,
