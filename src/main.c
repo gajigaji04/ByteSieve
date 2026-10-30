@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <wchar.h>
 
+#include "scanner.h"
+
 enum {
     EXIT_COMPLETE = 0,
     EXIT_PARTIAL = 1,
@@ -21,6 +23,41 @@ static void print_usage(FILE *out)
 static int is_help(const wchar_t *arg)
 {
     return wcscmp(arg, L"-h") == 0 || wcscmp(arg, L"--help") == 0;
+}
+
+static int run_scan(const wchar_t *target)
+{
+    ScanReport report;
+    ScanStatus status;
+    size_t i;
+
+    scan_report_init(&report);
+    status = scan_directory(target, &report, NULL, NULL);
+
+    for (i = 0; i < report.errors_len; i++) {
+        fwprintf(stderr, L"error: %ls: Windows error %lu\n",
+                 report.errors[i].path ? report.errors[i].path : target,
+                 (unsigned long)report.errors[i].code);
+    }
+
+    wprintf(L"Target:         %ls\n", target);
+    wprintf(L"Files:          %llu\n", (unsigned long long)report.file_count);
+    wprintf(L"Directories:    %llu\n", (unsigned long long)report.dir_count);
+    wprintf(L"Total size:     %llu bytes\n", (unsigned long long)report.total_bytes);
+    wprintf(L"Reparse points: %llu (not descended)\n",
+            (unsigned long long)report.reparse_count);
+    wprintf(L"Errors:         %llu\n", (unsigned long long)report.error_count);
+
+    scan_report_free(&report);
+
+    switch (status) {
+    case SCAN_COMPLETE:
+        return EXIT_COMPLETE;
+    case SCAN_PARTIAL:
+        return EXIT_PARTIAL;
+    default:
+        return EXIT_FATAL;
+    }
 }
 
 int wmain(int argc, wchar_t **argv)
@@ -45,7 +82,5 @@ int wmain(int argc, wchar_t **argv)
         return EXIT_FATAL;
     }
 
-    /* 스캔은 이후 단계에서 구현한다. */
-    wprintf(L"Target: %ls\n", argv[1]);
-    return EXIT_COMPLETE;
+    return run_scan(argv[1]);
 }
