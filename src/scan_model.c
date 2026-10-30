@@ -82,6 +82,7 @@ static size_t add_node(ScanModel *m, wchar_t *name, size_t parent, uint32_t flag
 typedef struct {
     ScanModel *model;
     scan_progress_fn progress;
+    scan_cancel_fn cancel;
     void *ctx;
     uint64_t dirs_scanned;
 } BuildCtx;
@@ -163,6 +164,13 @@ static void on_dir_end(const ScanDirInfo *dir, ScanStatus result, void *ctx)
     }
 }
 
+static int should_cancel(void *ctx)
+{
+    BuildCtx *b = ctx;
+
+    return b->cancel(b->ctx);
+}
+
 /* 플래그를 마무리하고 하위 트리 합계를 계산한다(재귀 없이 역순 한 번). */
 static void finalize(ScanModel *m)
 {
@@ -170,9 +178,9 @@ static void finalize(ScanModel *m)
 
     for (i = 0; i < m->len; i++) {
         ScanNode *n = &m->nodes[i];
-        /* 들어가야 했지만 스택에 넣지 못해 열거하지 못한 폴더. */
+        /* 들어가야 했지만 스택에 넣지 못했거나 취소로 열거하지 못한 폴더. */
         if (!(n->flags & (NODE_BEGUN | SCAN_NODE_REPARSE | SCAN_NODE_DEPTH_LIMIT))) {
-            n->flags |= SCAN_NODE_FAILED;
+            n->flags |= m->report.cancelled ? SCAN_NODE_CANCELLED : SCAN_NODE_FAILED;
         }
         n->flags &= ~NODE_BEGUN;
         n->total_files = n->own_files;
@@ -193,7 +201,14 @@ static void finalize(ScanModel *m)
 ScanStatus scan_model_build(ScanModel *model, const wchar_t *root, uint32_t max_depth,
                             scan_progress_fn progress, void *ctx)
 {
-    static const ScanHooks hooks = {on_entry, on_dir_begin, on_dir_end};
+    return scan_model_build_ex(model, root, max_depth, progress, NULL, ctx);
+}
+
+ScanStatus scan_model_build_ex(ScanModel *model, const wchar_t *root, uint32_t max_depth,
+                               scan_progress_fn progress, scan_cancel_fn cancel,
+                               void *ctx)
+{
+    ScanHooks hooks = {on_entry, on_dir_begin, on_dir_end, NULL};
     BuildCtx b;
     size_t root_index = SCAN_NODE_NONE;
     wchar_t *full;
@@ -209,7 +224,11 @@ ScanStatus scan_model_build(ScanModel *model, const wchar_t *root, uint32_t max_
 
     b.model = model;
     b.progress = progress;
+    b.cancel = cancel;
     b.ctx = ctx;
+    if (cancel != NULL) {
+        hooks.should_cancel = should_cancel;
+    }
     b.dirs_scanned = 0;
     model->status = scan_tree_ex(root, max_depth,
                                  root_index == SCAN_NODE_NONE ? 0 : ID_OF(root_index),

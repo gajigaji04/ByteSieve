@@ -25,7 +25,8 @@ enum {
     SCAN_NODE_REPARSE = 1u << 0,     /* 재분석 지점이라 하위로 들어가지 않음 */
     SCAN_NODE_DEPTH_LIMIT = 1u << 1, /* max_depth 때문에 하위로 들어가지 않음 */
     SCAN_NODE_FAILED = 1u << 2,      /* 열지 못함(하위 내용 모름) */
-    SCAN_NODE_INCOMPLETE = 1u << 3   /* 열거 도중 오류(일부 항목 누락 가능) */
+    SCAN_NODE_INCOMPLETE = 1u << 3,  /* 열거 도중 오류·취소(일부 항목 누락 가능) */
+    SCAN_NODE_CANCELLED = 1u << 4    /* 취소로 열거하지 않음(하위 내용 모름) */
 };
 
 typedef struct {
@@ -61,6 +62,9 @@ typedef struct {
 
 typedef void (*scan_progress_fn)(const ScanProgress *progress, void *ctx);
 
+/* 0 이 아니면 스캔을 멈춘다. 스캔 스레드에서 호출되므로 다른 스레드가 세운 플래그를 읽으면 된다. */
+typedef int (*scan_cancel_fn)(void *ctx);
+
 typedef struct {
     ScanNode *nodes;
     size_t len;
@@ -82,6 +86,16 @@ void scan_model_free(ScanModel *model);
  */
 ScanStatus scan_model_build(ScanModel *model, const wchar_t *root, uint32_t max_depth,
                             scan_progress_fn progress, void *ctx);
+
+/*
+ * scan_model_build 에 취소를 더한 판. cancel 이 0 이 아닌 값을 돌려주면 그때까지 모은
+ * 트리로 마무리하고 SCAN_PARTIAL 을 반환한다(model->report.cancelled = 1).
+ * 열거하지 못한 폴더는 SCAN_NODE_CANCELLED, 열거 도중 멈춘 폴더는 SCAN_NODE_INCOMPLETE.
+ * progress 와 cancel 은 같은 ctx 를 받는다. cancel 이 NULL 이면 scan_model_build 와 같다.
+ */
+ScanStatus scan_model_build_ex(ScanModel *model, const wchar_t *root, uint32_t max_depth,
+                               scan_progress_fn progress, scan_cancel_fn cancel,
+                               void *ctx);
 
 /* 진행률 추정(0.0~1.0): 열거를 마친 폴더 / (마친 폴더 + 남은 폴더). */
 double scan_progress_fraction(const ScanProgress *progress);

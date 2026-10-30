@@ -37,6 +37,17 @@ target_include_directories(bytesieve_model PUBLIC src)
 target_link_libraries(bytesieve_model PUBLIC bytesieve_scanner)
 bytesieve_configure(bytesieve_model)
 
+# 스캔을 별도 스레드에서 돌리는 작업(진행률 스냅샷·취소). GUI 와 테스트가 함께 쓴다.
+add_library(bytesieve_job STATIC src/scan_job.c)
+target_include_directories(bytesieve_job PUBLIC src)
+target_link_libraries(bytesieve_job PUBLIC bytesieve_model)
+bytesieve_configure(bytesieve_job)
+
+# Win32 GUI: 진행률 표시줄, 폴더 트리(TreeView), 용량 순위(ListView).
+add_executable(bytesieve-gui WIN32 src/gui_main.c)
+target_link_libraries(bytesieve-gui PRIVATE bytesieve_job comctl32 shell32 ole32)
+bytesieve_configure(bytesieve-gui)
+
 add_executable(disk-scanner src/main.c)
 target_link_libraries(disk-scanner PRIVATE bytesieve_cli bytesieve_jsonl)
 bytesieve_configure(disk-scanner)
@@ -134,3 +145,16 @@ add_executable(test_scan_model tests/test_scan_model.c)
 target_link_libraries(test_scan_model PRIVATE bytesieve_model)
 bytesieve_configure(test_scan_model)
 add_test(NAME scan_model COMMAND test_scan_model)
+
+add_executable(test_scan_job tests/test_scan_job.c)
+target_link_libraries(test_scan_job PRIVATE bytesieve_job)
+bytesieve_configure(test_scan_job)
+add_test(NAME scan_job COMMAND test_scan_job)
+
+# GUI 자체 검사: 창(숨김)에서 스캔을 끝까지 돌리거나 시작 직후 취소한 뒤
+# 진행률·트리·순위 화면이 모델과 맞는지 확인하고 종료 코드로 알린다.
+add_test(NAME gui_scan COMMAND bytesieve-gui --self-test ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME gui_cancel COMMAND bytesieve-gui --self-test-cancel ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME gui_missing_dir COMMAND bytesieve-gui --self-test ${CMAKE_CURRENT_SOURCE_DIR}/no-such-dir)
+set_tests_properties(gui_missing_dir PROPERTIES WILL_FAIL TRUE)
+set_tests_properties(gui_scan gui_cancel gui_missing_dir PROPERTIES TIMEOUT 120)

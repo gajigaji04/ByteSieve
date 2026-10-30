@@ -236,6 +236,7 @@ static ScanStatus enumerate_dir(const DirFrame *frame, uint32_t max_depth,
     wchar_t *pattern;
     DWORD err;
     ScanStatus status = SCAN_COMPLETE;
+    unsigned seen = 0;
 
     pattern = path_join(frame->path, L"*");
     if (pattern == NULL) {
@@ -265,6 +266,13 @@ static ScanStatus enumerate_dir(const DirFrame *frame, uint32_t max_depth,
         if (is_dot_entry(fd.cFileName)) {
             continue;
         }
+        /* 큰 디렉터리에서도 취소가 늦지 않도록 열거 도중에도 확인한다. */
+        if (hooks->should_cancel != NULL && ++seen % SCAN_CANCEL_CHECK_INTERVAL == 0 &&
+            hooks->should_cancel(ctx)) {
+            report->cancelled = 1;
+            status = SCAN_PARTIAL;
+            break;
+        }
         account_entry(&fd, report, &entry);
         will_descend = frame->depth < max_depth && entry.descend;
         if (hooks->on_entry != NULL) {
@@ -286,7 +294,7 @@ static ScanStatus enumerate_dir(const DirFrame *frame, uint32_t max_depth,
         }
     } while (FindNextFileW(find, &fd));
 
-    err = GetLastError();
+    err = report->cancelled ? ERROR_NO_MORE_FILES : GetLastError();
     if (err != ERROR_NO_MORE_FILES) {
         record_error(report, frame->path, err);
         status = SCAN_PARTIAL;
@@ -322,7 +330,7 @@ static ScanStatus visit_dir(const DirFrame *frame, uint32_t max_depth,
 ScanStatus scan_tree_ex(const wchar_t *dir, uint32_t max_depth, uintptr_t root_id,
                         ScanReport *report, const ScanHooks *hooks, void *ctx)
 {
-    static const ScanHooks no_hooks = {NULL, NULL, NULL};
+    static const ScanHooks no_hooks = {NULL, NULL, NULL, NULL};
     DirStack stack = {0};
     DirFrame frame;
     ScanStatus status = SCAN_COMPLETE;
@@ -362,6 +370,14 @@ ScanStatus scan_tree_ex(const wchar_t *dir, uint32_t max_depth, uintptr_t root_i
      * 하위 디렉터리 실패(SCAN_FATAL 포함)는 그 디렉터리만 건너뛰고 계속한다.
      */
     while (stack.len > 0) {
+        if (report->cancelled ||
+            (hooks->should_cancel != NULL && hooks->should_cancel(ctx))) {
+            /* 남은 디렉터리는 열거하지 못한 것으로 센다. */
+            report->cancelled = 1;
+            report->skipped_dir_count += stack.len;
+            status = SCAN_PARTIAL;
+            break;
+        }
         frame = stack.items[--stack.len];
         result = visit_dir(&frame, max_depth, &stack, report, hooks, ctx);
         if (result != SCAN_COMPLETE) {
@@ -394,7 +410,7 @@ static uintptr_t adapt_visit(const ScanEntry *entry, uintptr_t parent,
 ScanStatus scan_tree(const wchar_t *dir, uint32_t max_depth, ScanReport *report,
                      scan_visit_fn visit, void *ctx)
 {
-    ScanHooks hooks = {NULL, NULL, NULL};
+    ScanHooks hooks = {NULL, NULL, NULL, NULL};
     VisitAdapter adapter;
 
     adapter.visit = visit;

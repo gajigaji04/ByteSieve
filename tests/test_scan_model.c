@@ -547,6 +547,93 @@ static void test_deep_chain(void)
     free(root);
 }
 
+/* calls 번째 호출부터 취소를 요청한다. */
+typedef struct {
+    int calls;
+    int cancel_from;
+} CancelCtx;
+
+static int cancel_after(void *ctx)
+{
+    CancelCtx *c = ctx;
+    return ++c->calls >= c->cancel_from;
+}
+
+/* 루트를 열거한 직후 취소하면 하위 폴더는 SCAN_NODE_CANCELLED 로 남는다. */
+static void test_cancel(void)
+{
+    ScanModel m;
+    CancelCtx c = {0, 1};
+    size_t big, small, empty, locked, link;
+
+    scan_model_init(&m);
+    CHECK(scan_model_build_ex(&m, g_root, SCAN_DEPTH_UNLIMITED, NULL, cancel_after, &c) ==
+          SCAN_PARTIAL);
+    CHECK(m.status == SCAN_PARTIAL);
+    CHECK(m.report.cancelled == 1);
+    CHECK(m.report.aborted == 0);
+    CHECK_U64(m.report.skipped_dir_count, 4); /* big, small, empty, locked */
+    CHECK_U64(m.report.error_count, 0);
+
+    big = find_child(&m, 0, L"big");
+    small = find_child(&m, 0, L"small");
+    empty = find_child(&m, 0, L"empty");
+    locked = find_child(&m, 0, L"locked");
+    link = find_child(&m, 0, L"link");
+    CHECK(big != SCAN_NODE_NONE && (m.nodes[big].flags & SCAN_NODE_CANCELLED));
+    CHECK(small != SCAN_NODE_NONE && (m.nodes[small].flags & SCAN_NODE_CANCELLED));
+    CHECK(empty != SCAN_NODE_NONE && (m.nodes[empty].flags & SCAN_NODE_CANCELLED));
+    CHECK(locked != SCAN_NODE_NONE && (m.nodes[locked].flags & SCAN_NODE_CANCELLED));
+    CHECK(big != SCAN_NODE_NONE && !(m.nodes[big].flags & SCAN_NODE_FAILED));
+    CHECK(link != SCAN_NODE_NONE && m.nodes[link].flags == SCAN_NODE_REPARSE);
+    CHECK(m.nodes[0].flags == 0);
+    CHECK_U64(m.nodes[0].total_bytes, 5);
+    CHECK_U64(m.nodes[big].child_count, 0);
+    scan_model_free(&m);
+
+    /* 취소하지 않으면 scan_model_build 와 결과가 같다. */
+    c.calls = 0;
+    c.cancel_from = 1000000;
+    scan_model_init(&m);
+    CHECK(scan_model_build_ex(&m, g_root, SCAN_DEPTH_UNLIMITED, NULL, cancel_after, &c) ==
+          SCAN_PARTIAL); /* locked 때문 */
+    CHECK(m.report.cancelled == 0);
+    CHECK(c.calls > 0);
+    CHECK_U64(m.nodes[0].total_bytes, 1115);
+    scan_model_free(&m);
+}
+
+/* 항목이 많은 폴더는 열거 도중에도 취소를 확인한다. */
+static void test_cancel_mid_dir(void)
+{
+    wchar_t *base = fixture(L"many");
+    ScanModel m;
+    CancelCtx c = {0, 1};
+    unsigned i;
+    int ok = base != NULL && CreateDirectoryW(base, NULL);
+
+    for (i = 0; ok && i < SCAN_CANCEL_CHECK_INTERVAL + 44; i++) {
+        wchar_t name[32];
+        swprintf(name, 32, L"many\\f%03u", i);
+        ok = write_file(name, 1);
+    }
+    CHECK(ok);
+
+    scan_model_init(&m);
+    CHECK(scan_model_build_ex(&m, base, SCAN_DEPTH_UNLIMITED, NULL, cancel_after, &c) ==
+          SCAN_PARTIAL);
+    CHECK(m.report.cancelled == 1);
+    CHECK_U64(m.report.file_count, SCAN_CANCEL_CHECK_INTERVAL - 1);
+    CHECK_U64(m.report.error_count, 0);
+    CHECK(m.nodes[0].flags == SCAN_NODE_INCOMPLETE);
+    scan_model_free(&m);
+
+    if (base != NULL) {
+        remove_tree(base);
+    }
+    free(base);
+}
+
 int main(void)
 {
     if (!setup_fixture()) {
@@ -561,6 +648,8 @@ int main(void)
     test_progress();
     test_fatal_root();
     test_deep_chain();
+    test_cancel();
+    test_cancel_mid_dir();
     teardown_fixture();
 
     if (g_failures != 0) {
