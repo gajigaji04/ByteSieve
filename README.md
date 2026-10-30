@@ -5,6 +5,7 @@ CLI(텍스트·JSON Lines)와 Win32 GUI(진행률·폴더 트리·용량 순위)
 GUI의 드라이브 탭에서는 시스템의 모든 논리 드라이브 용량과 사용률을 한눈에 볼 수 있고,
 정리 후보 탭에서는 `node_modules`·빌드 결과물·개발 캐시·임시·로그 파일을 찾아 예상 확보 용량을 보여 주고,
 고른 항목을 확인을 거쳐 **Windows 휴지통으로** 옮깁니다(영구 삭제 없음, 시스템·중요 폴더 보호).
+시스템 탭에서는 RAM·CPU 사용률을 1초마다 측정해 막대와 최근 60초 그래프로 보여 줍니다.
 C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니다.
 
 ## 진행 현황
@@ -16,13 +17,14 @@ C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니�
 | 3 | 오류 및 취소 처리: 권한 거부, 긴 경로, 재분석 지점, 중단 처리 | 완료 |
 | 4 | JSON Lines 출력: 시작·진행·결과·완료 이벤트 | 완료 |
 | 5 | GUI 연동: 스캔 진행률, 폴더 트리, 용량 순위 화면 | 완료 |
-| 6 | 고급 분석: 실제 디스크 점유량, BitLocker 정보, 메모리 최적화 | 예정 |
+| 6 | 고급 분석: 실제 디스크 점유량, BitLocker 정보, 메모리 최적화 | 예정(RAM·CPU 모니터링은 대시보드 Phase 4로 완료) |
 
 | 대시보드 | 내용 | 상태 |
 |---|---|---|
 | Phase 1 | 드라이브 사용량: 논리 드라이브 목록, 전체·사용·여유 용량, 사용률 막대, 새로고침 | 완료 |
 | Phase 2 | 정리 후보 탐지: 개발 캐시·빌드 결과물·임시·로그, 예상 확보 용량, 유형 필터, 취소 (읽기 전용) | 완료 |
 | Phase 3 | 안전한 정리: 항목 선택, 확인 창, 휴지통 이동(영구 삭제 없음), 시스템·중요 경로 보호, 성공·실패 표시 | 완료 |
+| Phase 4 | 시스템 모니터링: RAM 전체·사용·사용 가능 용량과 사용률, CPU 사용률, 사용률 막대·60초 그래프, 1초 갱신 | 완료 |
 
 ## 구현된 기능
 
@@ -116,13 +118,22 @@ C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니�
 - 작업은 STA로 초기화한 별도 스레드(`CleanupTrashJob`)에서 하므로 큰 `node_modules`를 옮겨도 창이 멈추지 않습니다. 취소하면 옮기고 있던 항목만 끝까지 옮기고 나머지는 `cancelled`로 남깁니다.
 - 보호 판정(`cleanup_guard_check`)은 문자열만 보는 순수 함수라, 실제 시스템 폴더를 건드리지 않고 단위 테스트합니다.
 
+### 시스템 측정 (`sysmon`)
+- **RAM**: `GlobalMemoryStatusEx`의 `ullTotalPhys`(전체)·`ullAvailPhys`(사용 가능)를 쓰고, 사용 = 전체 - 사용 가능, 사용률은 천분율(0.1% 단위, 내림)입니다. 전체가 0이거나 사용 가능이 전체보다 크면 `invalid`로 표시합니다.
+- **CPU**: `GetSystemTimes`의 누적 idle·kernel·user 시간(kernel에 idle 포함)을 직전 측정값과 비교해 `1 - idle 증가분 ÷ (kernel + user) 증가분`으로 계산합니다(천분율, 반올림). 모든 논리 프로세서를 합친 사용률입니다.
+  - 첫 측정은 비교할 값이 없어 `pending`(측정 중)입니다.
+  - 카운터가 줄었거나 증가분이 0이면 `invalid`로 표시하고 이번 값을 새 기준으로 다시 계산합니다. idle이 전체보다 크게 늘면 0%로 봅니다.
+- API가 실패하면 그 항목만 `error`와 Windows 오류 코드를 기록하고 값은 0으로 둡니다. RAM이 실패해도 CPU는 계속 측정하고, CPU가 실패하면 기준값을 버려 회복 직후 다시 `pending`부터 시작합니다.
+- 큰 값(오래 켜 둔 시스템의 누적 시간, 아주 큰 메모리)도 곱셈이 넘치지 않게 계산합니다.
+- 측정 함수를 주입할 수 있어(`sysmon_init`) API 실패·이상값을 가짜 함수로 테스트합니다.
+
 ### CLI (`disk-scanner`)
 - 사람이 읽는 요약을 출력합니다. 오류는 종류별 개수와 함께 최대 20개까지 나열합니다.
 - `--jsonl`을 주면 표준 출력에 UTF-8 JSON Lines 이벤트를 출력합니다. 이벤트 순서는 `start` → `progress`(1,000개 항목마다) → `result` → `complete`입니다.
 - 종료 코드: `0` 완료, `1` 일부 실패, `2` 스캔 불가 또는 잘못된 인자.
 
 ### GUI (`bytesieve-gui`)
-창은 **폴더 스캔**, **드라이브**, **정리 후보** 세 탭으로 나뉩니다.
+창은 **폴더 스캔**, **드라이브**, **정리 후보**, **시스템** 네 탭으로 나뉩니다.
 
 **폴더 스캔 탭**
 - 경로 입력, 찾아보기, 스캔, 취소 버튼이 있습니다.
@@ -150,6 +161,15 @@ C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니�
   - 끝나면 상태 줄에 `성공 n개(확보 용량) · 실패 n개 · 취소 n개`를, **정리** 열에 항목별로 `휴지통으로 이동됨`, `건너뜀: 탐지 후 바뀜(...)`, `실패: <Windows 오류 설명> (0x...)`을 표시합니다. 실패가 있으면 경로와 사유를 나열한 요약 창도 띄웁니다. 실패·취소한 항목은 선택이 남아 다시 시도할 수 있습니다.
 - 탐지나 휴지통 이동 중에 창을 닫으면 작업을 취소하고 스레드가 끝날 때까지 기다린 뒤 종료합니다.
 
+**시스템 탭 (`gui_monitor`)**
+- **메모리(RAM)** 줄에 `사용 11.4 GiB / 전체 15.3 GiB · 사용 가능 3.99 GiB · 사용률 73.9%`처럼 전체·사용·사용 가능 용량과 사용률을, **CPU** 줄에 사용률과 논리 프로세서 수를 보여 줍니다.
+- 각 줄 아래 사용률 막대가 있고, 90% 이상이면 빨간색(오류 상태)으로 바뀝니다.
+- **최근 60초 사용률** 그래프에 CPU(파랑)·메모리(보라) 꺾은선을 0·25·50·75·100% 눈금과 함께 그립니다. 가장 최근 값이 오른쪽 끝이며, 메모리 DC에 그린 뒤 한 번에 옮겨 깜박이지 않습니다.
+- 측정은 탭을 처음 열 때 시작하고, 이후 다른 탭으로 옮겨도 그래프 기록을 위해 계속합니다.
+- **1초 간격 갱신·UI 멈춤 방지**: 전용 측정 스레드가 1초마다 측정합니다(측정에 걸린 시간만큼 기다림을 줄여 간격이 밀리지 않음). 결과는 잠금으로 보호한 최신 값 하나에만 쓰고 알림 메시지는 처리되기 전까지 하나만 보내므로, UI가 잠시 바빠도 메시지가 쌓이거나 메모리가 새지 않습니다. 화면 갱신은 UI 스레드에서만 합니다.
+- **측정 실패**: 그 항목에 `측정 실패 (Windows 오류 n)`을 표시하고 막대를 비우며 그래프 선을 끊습니다. 상태 줄에도 `일부 값을 측정하지 못했습니다`가 붙습니다. 다음 측정이 성공하면 자동으로 회복합니다. 측정 스레드를 만들지 못하면 상태 줄에 사유를 표시합니다.
+- 창을 닫으면 측정 스레드에 종료를 알리고 끝날 때까지 기다린 뒤 패널을 해제합니다.
+
 ## 디렉터리 구조
 
 ```
@@ -165,6 +185,7 @@ ByteSieve/
 │   ├── jsonl.c/.h          JSON Lines 이벤트 출력
 │   ├── drive.c/.h          논리 드라이브 목록·용량 조회, 오류 분류, 사용률
 │   ├── size_format.c/.h    용량 표시 문자열("1.50 KiB")
+│   ├── sysmon.c/.h         RAM·CPU 사용률 측정(GlobalMemoryStatusEx, GetSystemTimes), 이상값·실패 처리
 │   ├── cleanup_rules.c/.h  정리 후보 이름 규칙, 프로젝트 표시 파일, 시스템 보호 경로
 │   ├── cleanup_scan.c/.h   정리 후보 탐지 엔진(중첩·용량 집계·필터·정렬)
 │   ├── cleanup_job.c/.h    탐지 작업 스레드, 진행률 사본, 취소
@@ -172,7 +193,8 @@ ByteSieve/
 │   ├── main.c              CLI 진입점(disk-scanner)
 │   ├── gui_main.c          Win32 GUI 진입점(bytesieve-gui), 탭 전환
 │   ├── gui_drives.c/.h     드라이브 대시보드 패널(목록·사용률 막대·새로고침)
-│   └── gui_cleanup.c/.h    정리 후보 패널(탐지·취소·유형 필터·체크 목록·확인·휴지통 이동·결과)
+│   ├── gui_cleanup.c/.h    정리 후보 패널(탐지·취소·유형 필터·체크 목록·확인·휴지통 이동·결과)
+│   └── gui_monitor.c/.h    시스템 패널(RAM·CPU 사용률 막대·60초 그래프, 측정 스레드)
 └── tests/
     ├── test_path.c         경로 유틸리티
     ├── test_scanner.c      스캐너(권한 거부·정션·긴 경로 등)
@@ -182,6 +204,7 @@ ByteSieve/
     ├── test_cli.c          인자 파싱·출력 형식
     ├── test_drive.c        드라이브 조회·오류 분류·사용률 계산
     ├── test_size_format.c  용량 표시 문자열
+    ├── test_sysmon.c       RAM·CPU 사용률 계산, 이상값, 측정 실패·회복(가짜 측정 함수), 실제 시스템
     ├── test_cleanup_rules.c 탐지 규칙·보호 경로 판정
     ├── test_cleanup_scan.c 탐지 엔진·필터·취소·작업 스레드(픽스처 폴더)
     ├── test_cleanup_trash.c 삭제 보호 판정, 실제 휴지통 이동·거부, 작업 스레드·취소
@@ -189,7 +212,7 @@ ByteSieve/
     └── cli_check.cmake     CLI 종료 코드·출력 검사 스크립트
 ```
 
-CMake 대상은 다음과 같습니다. 정적 라이브러리는 `bytesieve_path` → `bytesieve_scanner` → `bytesieve_model` → `bytesieve_job` 순서로 의존하고, `bytesieve_cli`와 `bytesieve_jsonl`은 `bytesieve_scanner`에 의존합니다. `bytesieve_drive`(드라이브 조회)와 `bytesieve_format`(용량 표시)은 다른 라이브러리에 의존하지 않습니다. 정리 후보 탐지는 `bytesieve_cleanup_rules`(→ `bytesieve_path`) ← `bytesieve_cleanup`(+ `bytesieve_scanner`) ← `bytesieve_cleanup_job` 순서로 의존하고, 휴지통 이동 `bytesieve_cleanup_trash`는 `bytesieve_cleanup`과 `ole32`·`shell32`·`uuid`에 의존합니다. 실행 파일은 `disk-scanner`(CLI)와 `bytesieve-gui`(GUI)입니다.
+CMake 대상은 다음과 같습니다. 정적 라이브러리는 `bytesieve_path` → `bytesieve_scanner` → `bytesieve_model` → `bytesieve_job` 순서로 의존하고, `bytesieve_cli`와 `bytesieve_jsonl`은 `bytesieve_scanner`에 의존합니다. `bytesieve_drive`(드라이브 조회), `bytesieve_format`(용량 표시), `bytesieve_sysmon`(RAM·CPU 측정)은 다른 라이브러리에 의존하지 않습니다. 정리 후보 탐지는 `bytesieve_cleanup_rules`(→ `bytesieve_path`) ← `bytesieve_cleanup`(+ `bytesieve_scanner`) ← `bytesieve_cleanup_job` 순서로 의존하고, 휴지통 이동 `bytesieve_cleanup_trash`는 `bytesieve_cleanup`과 `ole32`·`shell32`·`uuid`에 의존합니다. 실행 파일은 `disk-scanner`(CLI)와 `bytesieve-gui`(GUI)입니다.
 
 ## 빌드
 
@@ -262,6 +285,7 @@ build\Debug\bytesieve-gui.exe --self-test-drives               # 드라이브 �
 build\Debug\bytesieve-gui.exe --self-test-cleanup C:\some\dir         # 정리 후보 탐지 후 목록·필터 검증
 build\Debug\bytesieve-gui.exe --self-test-cleanup-cancel C:\some\dir  # 탐지 시작 직후 취소
 build\Debug\bytesieve-gui.exe --self-test-trash C:\some\dir          # 주의: 옮길 수 있는 항목을 모두 휴지통으로 옮김
+build\Debug\bytesieve-gui.exe --self-test-monitor             # 시스템 탭에서 4번 측정한 뒤 화면·갱신 간격·실패 표시 검증
 ```
 
 `--self-test-trash`는 확인 창 없이 실제로 휴지통으로 옮기므로 테스트용 폴더에만 쓰세요. `gui_trash` 테스트는 빌드 폴더 안에 전용 픽스처를 만들어 이 옵션을 실행합니다.
@@ -272,12 +296,14 @@ build\Debug\bytesieve-gui.exe --self-test-trash C:\some\dir          # 주의: �
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-현재 테스트는 41개입니다.
-- 단위 테스트: `path`, `scanner`, `scan_model`, `scan_job`, `jsonl`, `cli`, `drive`, `size_format`, `cleanup_rules`, `cleanup_scan`, `cleanup_trash`
+현재 테스트는 43개입니다.
+- 단위 테스트: `path`, `scanner`, `scan_model`, `scan_job`, `jsonl`, `cli`, `drive`, `size_format`, `sysmon`, `cleanup_rules`, `cleanup_scan`, `cleanup_trash`
 - CLI 종료 코드·출력 검사: `cli_*` 및 인자 검사 테스트들
-- GUI 자체 검사: `gui_scan`, `gui_cancel`, `gui_missing_dir`, `gui_drives`, `gui_cleanup`, `gui_cleanup_cancel`, `gui_trash`
+- GUI 자체 검사: `gui_scan`, `gui_cancel`, `gui_missing_dir`, `gui_drives`, `gui_cleanup`, `gui_cleanup_cancel`, `gui_trash`, `gui_monitor`
 
 `drive` 테스트는 가짜 조회 함수로 이동식 드라이브 오류·분리·잘못된 값을 재현하고, 실제 시스템에서는 Windows가 설치된 드라이브가 정상 조회되는지와 없는 드라이브 문자가 실패 상태로 처리되는지 확인합니다.
+
+`sysmon` 테스트는 RAM 사용률(내림·경계값·아주 큰 값·사용 가능 > 전체), CPU 사용률(반올림·0%·100%·idle 과다 보고·증가분 0·카운터 역행·큰 누적값)을 확인하고, 가짜 측정 함수로 RAM·CPU API 실패와 오류 코드 기록, CPU 실패 후 `pending` → 회복, 역행 후 재계산을 재현합니다. 실제 시스템에서는 두 번 측정해 값의 범위와 `GlobalMemoryStatusEx` 전체 용량 일치를 확인합니다. `gui_monitor`는 숨긴 창에서 4번 측정한 뒤 문구·막대 위치·경고 상태·그래프 기록이 최근 측정값과 맞는지, 평균 갱신 간격이 1초 근처(0.7~2초)인지 확인하고, 실패 측정값을 넣어 오류 문구·빈 막대·그래프 끊김을 확인합니다.
 
 `cleanup_scan` 테스트는 임시 폴더에 픽스처를 만들어 중첩된 `node_modules`·`dist`, 확인됨/추정, 비슷하지만 해당하지 않는 이름(`report.log.bak`, `buildx`), 정션과 정션 순환, 접근 거부 폴더, 260자를 넘는 경로, 보호 경로 제외와 보호 경로 안에서의 경고, 유형 필터와 정렬, 취소, 작업 스레드를 확인합니다.
 

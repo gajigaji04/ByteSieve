@@ -78,11 +78,19 @@ add_library(bytesieve_drive STATIC src/drive.c)
 target_include_directories(bytesieve_drive PUBLIC src)
 bytesieve_configure(bytesieve_drive)
 
+# RAM·CPU 사용률 측정(GlobalMemoryStatusEx, GetSystemTimes). UI 와 독립.
+add_library(bytesieve_sysmon STATIC src/sysmon.c)
+target_include_directories(bytesieve_sysmon PUBLIC src)
+bytesieve_configure(bytesieve_sysmon)
+
 # Win32 GUI: 폴더 스캔 탭(진행률 표시줄, 폴더 트리, 용량 순위), 드라이브 대시보드 탭,
-# 정리 후보 탭(개발 캐시·빌드 결과물·임시·로그 탐지, 선택 항목 휴지통 이동).
-add_executable(bytesieve-gui WIN32 src/gui_main.c src/gui_drives.c src/gui_cleanup.c)
+# 정리 후보 탭(개발 캐시·빌드 결과물·임시·로그 탐지, 선택 항목 휴지통 이동),
+# 시스템 탭(RAM·CPU 실시간 사용률 막대·그래프).
+add_executable(bytesieve-gui WIN32 src/gui_main.c src/gui_drives.c src/gui_cleanup.c
+               src/gui_monitor.c)
 target_link_libraries(bytesieve-gui PRIVATE bytesieve_job bytesieve_drive bytesieve_format
-                      bytesieve_cleanup_job bytesieve_cleanup_trash comctl32 shell32 ole32)
+                      bytesieve_cleanup_job bytesieve_cleanup_trash bytesieve_sysmon
+                      comctl32 shell32 ole32)
 bytesieve_configure(bytesieve-gui)
 
 add_executable(disk-scanner src/main.c)
@@ -193,6 +201,11 @@ target_link_libraries(test_drive PRIVATE bytesieve_drive)
 bytesieve_configure(test_drive)
 add_test(NAME drive COMMAND test_drive)
 
+add_executable(test_sysmon tests/test_sysmon.c)
+target_link_libraries(test_sysmon PRIVATE bytesieve_sysmon)
+bytesieve_configure(test_sysmon)
+add_test(NAME sysmon COMMAND test_sysmon)
+
 add_executable(test_size_format tests/test_size_format.c)
 target_link_libraries(test_size_format PRIVATE bytesieve_format)
 bytesieve_configure(test_size_format)
@@ -232,5 +245,7 @@ add_test(NAME gui_trash
          COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bytesieve-gui>
                  -DFIXTURE=${CMAKE_CURRENT_BINARY_DIR}/gui_trash_fixture
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/gui_trash_check.cmake)
+# 시스템 탭: 몇 초 동안 RAM·CPU 를 측정해 화면·1초 갱신 간격·측정 실패 표시를 확인한다.
+add_test(NAME gui_monitor COMMAND bytesieve-gui --self-test-monitor)
 set_tests_properties(gui_scan gui_cancel gui_missing_dir gui_drives gui_cleanup
-                     gui_cleanup_cancel gui_trash PROPERTIES TIMEOUT 120)
+                     gui_cleanup_cancel gui_trash gui_monitor PROPERTIES TIMEOUT 120)
