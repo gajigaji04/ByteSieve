@@ -11,6 +11,7 @@
 
 #include "gui_cleanup.h"
 #include "gui_drives.h"
+#include "gui_monitor.h"
 #include "path.h"
 #include "scan_job.h"
 #include "scan_model.h"
@@ -30,6 +31,8 @@
 /* --self-test 의 전체 제한 시간. */
 #define SELF_TEST_TIMEOUT_MS 60000
 #define TIMER_SELF_TEST 1
+/* --self-test-monitor 가 검증 전에 기다리는 측정 횟수. */
+#define MONITOR_SELF_TEST_SAMPLES 4
 
 enum {
     IDC_PATH = 100,
@@ -42,11 +45,12 @@ enum {
     IDC_LIST,
     IDC_TABS,
     IDC_DRIVES,
-    IDC_CLEANUP
+    IDC_CLEANUP,
+    IDC_MONITOR
 };
 
 /* 탭 순서. */
-enum { TAB_SCAN, TAB_DRIVES, TAB_CLEANUP };
+enum { TAB_SCAN, TAB_DRIVES, TAB_CLEANUP, TAB_MONITOR };
 
 /* 순위 목록 열. */
 enum { COL_RANK, COL_PATH, COL_SIZE, COL_FILES, COL_SHARE, COL_COUNT };
@@ -58,13 +62,14 @@ typedef enum {
     SELF_TEST_DRIVES, /* 드라이브 탭 새로고침 → 화면 검증 → 종료 */
     SELF_TEST_CLEANUP,       /* 정리 후보 탭 탐지 → 화면 검증 → 종료 */
     SELF_TEST_CLEANUP_CANCEL, /* 정리 후보 탐지 시작 직후 취소 → 화면 검증 → 종료 */
-    SELF_TEST_TRASH /* 정리 후보 탐지 → 모두 선택 → 휴지통 이동(확인 창 없이) → 화면 검증 → 종료 */
+    SELF_TEST_TRASH, /* 정리 후보 탐지 → 모두 선택 → 휴지통 이동(확인 창 없이) → 화면 검증 → 종료 */
+    SELF_TEST_MONITOR /* 시스템 탭 측정 몇 회 → 화면·갱신 간격·실패 표시 검증 → 종료 */
 } SelfTest;
 
 typedef struct {
     HWND hwnd;
     HWND path, browse, scan, cancel, progress, status, tree, list;
-    HWND tabs, drives, cleanup;
+    HWND tabs, drives, cleanup, monitor;
     HFONT font;
     int dpi;
 
@@ -161,6 +166,8 @@ static void layout(void)
                body_h > 0 ? body_h : 0, TRUE);
     MoveWindow(g_app.cleanup, x + m, rc.top + m, w - 2 * m > 0 ? w - 2 * m : 0,
                body_h > 0 ? body_h : 0, TRUE);
+    MoveWindow(g_app.monitor, x + m, rc.top + m, w - 2 * m > 0 ? w - 2 * m : 0,
+               body_h > 0 ? body_h : 0, TRUE);
 }
 
 /* ---- 탭 ---- */
@@ -170,7 +177,8 @@ static int current_tab(void)
     return TabCtrl_GetCurSel(g_app.tabs);
 }
 
-/* 고른 탭의 컨트롤만 보이게 한다. 드라이브 탭을 처음 열면 바로 조회한다. */
+/* 고른 탭의 컨트롤만 보이게 한다. 드라이브 탭을 처음 열면 바로 조회하고,
+ * 시스템 탭을 처음 열면 측정을 시작한다(이후 탭을 옮겨도 그래프 기록을 위해 계속 측정). */
 static void show_tab(int tab)
 {
     HWND scan_controls[] = {g_app.path,     g_app.browse, g_app.scan, g_app.cancel,
@@ -186,8 +194,12 @@ static void show_tab(int tab)
     }
     ShowWindow(g_app.drives, tab == TAB_DRIVES ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.cleanup, tab == TAB_CLEANUP ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_app.monitor, tab == TAB_MONITOR ? SW_SHOW : SW_HIDE);
     if (tab == TAB_DRIVES && !drive_panel_loaded(g_app.drives)) {
         drive_panel_refresh(g_app.drives);
+    }
+    if (tab == TAB_MONITOR) {
+        monitor_panel_start(g_app.monitor);
     }
 }
 
@@ -682,6 +694,18 @@ static int verify_cleanup_tab(void)
     return failures == 0 ? 0 : 1;
 }
 
+/* 시스템 탭에서 몇 번 측정한 뒤 탭 전환 상태와 패널 내용을 확인한다. */
+static int verify_monitor_tab(void)
+{
+    int failures = monitor_panel_verify(g_app.monitor);
+
+    SELF_CHECK(current_tab() == TAB_MONITOR);
+    SELF_CHECK(is_shown(g_app.monitor) && !is_shown(g_app.drives) && !is_shown(g_app.cleanup));
+    SELF_CHECK(!is_shown(g_app.tree) && !is_shown(g_app.list) && !is_shown(g_app.path));
+    SELF_CHECK(GetWindow(g_app.tabs, GW_HWNDNEXT) == NULL);
+    return failures == 0 ? 0 : 1;
+}
+
 /* ---- 창 프로시저 ---- */
 
 static HWND make_child(const wchar_t *cls, const wchar_t *text, DWORD style, DWORD ex,
@@ -725,6 +749,8 @@ static void create_controls(void)
         SendMessageW(g_app.tabs, TCM_INSERTITEMW, TAB_DRIVES, (LPARAM)&tab);
         tab.pszText = L"정리 후보";
         SendMessageW(g_app.tabs, TCM_INSERTITEMW, TAB_CLEANUP, (LPARAM)&tab);
+        tab.pszText = L"시스템";
+        SendMessageW(g_app.tabs, TCM_INSERTITEMW, TAB_MONITOR, (LPARAM)&tab);
     }
 
     g_app.path = make_child(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE,
@@ -760,6 +786,7 @@ static void create_controls(void)
 
     g_app.drives = drive_panel_create(g_app.hwnd, IDC_DRIVES, g_app.font, g_app.dpi);
     g_app.cleanup = cleanup_panel_create(g_app.hwnd, IDC_CLEANUP, g_app.font, g_app.dpi);
+    g_app.monitor = monitor_panel_create(g_app.hwnd, IDC_MONITOR, g_app.font, g_app.dpi);
     /* 새 자식 창은 Z 순서 맨 아래에 붙으므로, 모두 만든 뒤 탭 컨트롤을 맨 아래로 보내
      * 탭 위의 컨트롤이 가려지지 않게 한다. */
     SetWindowPos(g_app.tabs, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -855,6 +882,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 DestroyWindow(hwnd);
             }
             return 0;
+        case IDC_MONITOR:
+            /* 첫 측정(CPU 값 없음) 뒤 몇 번 더 받아 갱신 간격까지 확인한다. */
+            if (HIWORD(wp) == MPN_SAMPLED && g_app.self_test == SELF_TEST_MONITOR &&
+                monitor_panel_samples(g_app.monitor) >= MONITOR_SELF_TEST_SAMPLES) {
+                KillTimer(hwnd, TIMER_SELF_TEST);
+                g_app.self_test_exit = verify_monitor_tab();
+                DestroyWindow(hwnd);
+            }
+            return 0;
         }
         break;
     case WM_NOTIFY:
@@ -908,6 +944,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  *   bytesieve-gui --self-test-cleanup-cancel <dir> 탐지 시작 직후 취소한 뒤 화면을 검증하고 종료
  *   bytesieve-gui --self-test-trash <dir>          탐지 후 옮길 수 있는 항목을 모두 휴지통으로
  *                                                  옮기고(확인 창 없음) 결과 화면을 검증하고 종료
+ *   bytesieve-gui --self-test-monitor     시스템 탭에서 RAM·CPU 를 몇 번 측정한 뒤 화면을 검증하고 종료
  */
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
@@ -942,6 +979,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     } else if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test-trash") == 0) {
         g_app.self_test = SELF_TEST_TRASH;
         cleanup_target = argv[2];
+    } else if (argv != NULL && argc >= 2 && wcscmp(argv[1], L"--self-test-monitor") == 0) {
+        g_app.self_test = SELF_TEST_MONITOR;
     } else if (argv != NULL && argc >= 2) {
         target = argv[1];
     }
@@ -968,6 +1007,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     InitCommonControlsEx(&icc);
     drive_panel_register(inst);
     cleanup_panel_register(inst);
+    monitor_panel_register(inst);
 
     memset(&wc, 0, sizeof(wc));
     wc.cbSize = sizeof(wc);
@@ -1013,6 +1053,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         } else {
             SetTimer(g_app.hwnd, TIMER_SELF_TEST, SELF_TEST_TIMEOUT_MS, NULL);
             show_tab(TAB_DRIVES);
+        }
+    }
+    if (g_app.self_test == SELF_TEST_MONITOR) {
+        show_tab(TAB_MONITOR);
+        if (!monitor_panel_start(g_app.monitor)) {
+            fwprintf(stderr, L"self-test failed: monitor did not start\n");
+            g_app.self_test_exit = 1;
+            DestroyWindow(g_app.hwnd);
+        } else {
+            SetTimer(g_app.hwnd, TIMER_SELF_TEST, SELF_TEST_TIMEOUT_MS, NULL);
         }
     }
     if (cleanup_target != NULL) {
