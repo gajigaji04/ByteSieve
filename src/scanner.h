@@ -19,7 +19,8 @@ typedef enum {
     SCAN_ERR_NOT_FOUND,     /* 경로·드라이브·네트워크 경로 없음(스캔 중 삭제 포함) */
     SCAN_ERR_INVALID_PATH,  /* 잘못된 이름, 디렉터리가 아님, 잘못된 인자 */
     SCAN_ERR_PATH_TOO_LONG, /* 확장 경로 한도(PATH_MAX_WIDE) 초과 */
-    SCAN_ERR_NO_MEMORY
+    SCAN_ERR_NO_MEMORY,
+    SCAN_ERR_KIND_COUNT /* 종류 개수(배열 크기용) */
 } ScanErrorKind;
 
 /* 기록된 오류 하나. path 는 표시용(확장 접두사 제거) 경로이며 NULL 일 수 있다. */
