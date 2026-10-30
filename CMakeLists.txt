@@ -21,8 +21,13 @@ target_include_directories(bytesieve_scanner PUBLIC src)
 target_link_libraries(bytesieve_scanner PUBLIC bytesieve_path)
 bytesieve_configure(bytesieve_scanner)
 
+add_library(bytesieve_jsonl STATIC src/jsonl.c)
+target_include_directories(bytesieve_jsonl PUBLIC src)
+target_link_libraries(bytesieve_jsonl PUBLIC bytesieve_scanner)
+bytesieve_configure(bytesieve_jsonl)
+
 add_executable(disk-scanner src/main.c)
-target_link_libraries(disk-scanner PRIVATE bytesieve_scanner)
+target_link_libraries(disk-scanner PRIVATE bytesieve_scanner bytesieve_jsonl)
 bytesieve_configure(disk-scanner)
 
 enable_testing()
@@ -52,3 +57,8 @@ add_executable(test_scanner tests/test_scanner.c)
 target_link_libraries(test_scanner PRIVATE bytesieve_scanner)
 bytesieve_configure(test_scanner)
 add_test(NAME scanner COMMAND test_scanner)
+
+add_executable(test_jsonl tests/test_jsonl.c)
+target_link_libraries(test_jsonl PRIVATE bytesieve_jsonl)
+bytesieve_configure(test_jsonl)
+add_test(NAME jsonl COMMAND test_jsonl)

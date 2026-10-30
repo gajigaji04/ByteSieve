@@ -3,7 +3,11 @@
 #include <stdio.h>
 #include <wchar.h>
 
+#include "jsonl.h"
 #include "scanner.h"
+
+/* JSON Lines 모드에서 progress 이벤트를 내는 항목 간격. */
+#define JSONL_PROGRESS_INTERVAL 1000
 
 enum {
     EXIT_COMPLETE = 0,
@@ -83,15 +87,7 @@ static int run_scan(const wchar_t *target, uint32_t max_depth)
     wprintf(L"Status:         %ls\n", scan_status_name(status));
 
     scan_report_free(&report);
-
-    switch (status) {
-    case SCAN_COMPLETE:
-        return EXIT_COMPLETE;
-    case SCAN_PARTIAL:
-        return EXIT_PARTIAL;
-    default:
-        return EXIT_FATAL;
-    }
+    return exit_code_for(status);
 }
 
 int wmain(int argc, wchar_t **argv)
