@@ -56,9 +56,14 @@ static int run_scan(const wchar_t *target, uint32_t max_depth)
     status = scan_tree(target, max_depth, &report, NULL, NULL);
 
     for (i = 0; i < report.errors_len; i++) {
-        fwprintf(stderr, L"error: %ls: Windows error %lu\n",
+        fwprintf(stderr, L"error: %ls: %ls (Windows error %lu)\n",
                  report.errors[i].path ? report.errors[i].path : target,
+                 scan_error_kind_name(report.errors[i].kind),
                  (unsigned long)report.errors[i].code);
+    }
+    if (report.error_count > report.errors_len) {
+        fwprintf(stderr, L"error: %llu more error(s) not recorded (out of memory)\n",
+                 (unsigned long long)(report.error_count - report.errors_len));
     }
 
     wprintf(L"Target:         %ls\n", target);
@@ -73,6 +78,9 @@ static int run_scan(const wchar_t *target, uint32_t max_depth)
     wprintf(L"Reparse points: %llu (not descended)\n",
             (unsigned long long)report.reparse_count);
     wprintf(L"Errors:         %llu\n", (unsigned long long)report.error_count);
+    wprintf(L"Skipped dirs:   %llu\n", (unsigned long long)report.skipped_dir_count);
+    wprintf(L"Aborted:        %ls\n", report.aborted ? L"yes" : L"no");
+    wprintf(L"Status:         %ls\n", scan_status_name(status));
 
     scan_report_free(&report);
 

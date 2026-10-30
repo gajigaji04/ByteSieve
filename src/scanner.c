@@ -37,6 +37,66 @@ int scan_should_descend(uint32_t attributes)
            (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
 }
 
+ScanErrorKind scan_classify_error(uint32_t code)
+{
+    switch (code) {
+    case ERROR_ACCESS_DENIED:
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_PRIVILEGE_NOT_HELD:
+        return SCAN_ERR_ACCESS_DENIED;
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+    case ERROR_INVALID_DRIVE:
+    case ERROR_NOT_READY:
+    case ERROR_BAD_NETPATH:
+    case ERROR_BAD_NET_NAME:
+        return SCAN_ERR_NOT_FOUND;
+    case ERROR_INVALID_NAME:
+    case ERROR_BAD_PATHNAME:
+    case ERROR_DIRECTORY:
+    case ERROR_INVALID_PARAMETER:
+        return SCAN_ERR_INVALID_PATH;
+    case ERROR_FILENAME_EXCED_RANGE:
+    case ERROR_BUFFER_OVERFLOW:
+        return SCAN_ERR_PATH_TOO_LONG;
+    case ERROR_NOT_ENOUGH_MEMORY:
+    case ERROR_OUTOFMEMORY:
+        return SCAN_ERR_NO_MEMORY;
+    default:
+        return SCAN_ERR_OTHER;
+    }
+}
+
+const wchar_t *scan_status_name(ScanStatus status)
+{
+    switch (status) {
+    case SCAN_COMPLETE:
+        return L"complete";
+    case SCAN_PARTIAL:
+        return L"partial";
+    default:
+        return L"fatal";
+    }
+}
+
+const wchar_t *scan_error_kind_name(ScanErrorKind kind)
+{
+    switch (kind) {
+    case SCAN_ERR_ACCESS_DENIED:
+        return L"access_denied";
+    case SCAN_ERR_NOT_FOUND:
+        return L"not_found";
+    case SCAN_ERR_INVALID_PATH:
+        return L"invalid_path";
+    case SCAN_ERR_PATH_TOO_LONG:
+        return L"path_too_long";
+    case SCAN_ERR_NO_MEMORY:
+        return L"no_memory";
+    default:
+        return L"other";
+    }
+}
+
 /* 오류를 기록한다. 메모리가 부족하면 개수만 센다. */
 static void record_error(ScanReport *report, const wchar_t *path, DWORD code)
 {
@@ -53,6 +113,7 @@ static void record_error(ScanReport *report, const wchar_t *path, DWORD code)
     }
     report->errors[report->errors_len].path = path_strip_extended(path);
     report->errors[report->errors_len].code = (uint32_t)code;
+    report->errors[report->errors_len].kind = scan_classify_error((uint32_t)code);
     report->errors_len++;
 }
 
@@ -166,7 +227,8 @@ static wchar_t *open_root(const wchar_t *dir, ScanReport *report)
 
 /*
  * frame 디렉터리 바로 아래를 열거해 집계하고, 깊이 제한 안의 하위 디렉터리를
- * stack 에 쌓는다. 디렉터리를 열지 못하면 SCAN_FAILED, 도중 오류는 SCAN_PARTIAL.
+ * stack 에 쌓는다. 디렉터리를 열지 못하면 SCAN_FATAL, 도중 오류는 SCAN_PARTIAL.
+ * 열지 못한 디렉터리와 스택에 넣지 못한 하위 디렉터리는 skipped_dir_count 로 센다.
  */
 static ScanStatus enumerate_dir(const DirFrame *frame, uint32_t max_depth,
                                 DirStack *stack, ScanReport *report,
@@ -181,7 +243,8 @@ static ScanStatus enumerate_dir(const DirFrame *frame, uint32_t max_depth,
     pattern = path_join(frame->path, L"*");
     if (pattern == NULL) {
         record_error(report, frame->path, ERROR_FILENAME_EXCED_RANGE);
-        return SCAN_FAILED;
+        report->skipped_dir_count++;
+        return SCAN_FATAL;
     }
 
     find = FindFirstFileW(pattern, &fd);
@@ -193,7 +256,8 @@ static ScanStatus enumerate_dir(const DirFrame *frame, uint32_t max_depth,
             return SCAN_COMPLETE;
         }
         record_error(report, frame->path, err);
-        return SCAN_FAILED;
+        report->skipped_dir_count++;
+        return SCAN_FATAL;
     }
 
     do {
@@ -208,9 +272,11 @@ static ScanStatus enumerate_dir(const DirFrame *frame, uint32_t max_depth,
             if (child == NULL) {
                 /* path_join 은 길이 초과와 메모리 부족을 구분하지 않는다. */
                 record_error(report, frame->path, ERROR_FILENAME_EXCED_RANGE);
+                report->skipped_dir_count++;
                 status = SCAN_PARTIAL;
             } else if (!stack_push(stack, child, frame->depth + 1)) {
                 record_error(report, frame->path, ERROR_NOT_ENOUGH_MEMORY);
+                report->skipped_dir_count++;
                 status = SCAN_PARTIAL;
             }
         }
@@ -236,27 +302,33 @@ ScanStatus scan_tree(const wchar_t *dir, uint32_t max_depth, ScanReport *report,
     wchar_t *ext;
 
     if (report == NULL) {
-        return SCAN_FAILED;
+        return SCAN_FATAL;
     }
 
     ext = open_root(dir, report);
     if (ext == NULL) {
-        return SCAN_FAILED;
+        report->aborted = 1;
+        return SCAN_FATAL;
     }
 
     frame.path = ext;
     frame.depth = 0;
     result = enumerate_dir(&frame, max_depth, &stack, report, visit, ctx);
     free(ext);
-    if (result == SCAN_FAILED) {
+    if (result == SCAN_FATAL) {
+        /* 루트를 열지 못하면 하위 트리 전체를 알 수 없으므로 중단한다. */
+        report->aborted = 1;
         stack_free(&stack);
-        return SCAN_FAILED;
+        return SCAN_FATAL;
     }
     if (result != SCAN_COMPLETE) {
         status = SCAN_PARTIAL;
     }
 
-    /* 마지막에 쌓인 디렉터리부터 꺼내므로 깊이 우선으로 진행된다. */
+    /*
+     * 마지막에 쌓인 디렉터리부터 꺼내므로 깊이 우선으로 진행된다.
+     * 하위 디렉터리 실패(SCAN_FATAL 포함)는 그 디렉터리만 건너뛰고 계속한다.
+     */
     while (stack.len > 0) {
         frame = stack.items[--stack.len];
         result = enumerate_dir(&frame, max_depth, &stack, report, visit, ctx);
