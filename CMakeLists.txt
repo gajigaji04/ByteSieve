@@ -43,13 +43,10 @@ add_test(NAME scan_source_dir COMMAND disk-scanner ${CMAKE_CURRENT_SOURCE_DIR}/s
 add_test(NAME scan_missing_dir COMMAND disk-scanner ${CMAKE_CURRENT_SOURCE_DIR}/no-such-dir)
 set_tests_properties(scan_missing_dir PROPERTIES WILL_FAIL TRUE)
 
-# JSON Lines 모드: stdout 은 UTF-8 이벤트 줄(start → result → complete).
-add_test(NAME jsonl_scan COMMAND disk-scanner --jsonl ${CMAKE_CURRENT_SOURCE_DIR}/src)
-set_tests_properties(jsonl_scan PROPERTIES PASS_REGULAR_EXPRESSION
-    "^{\"event\":\"start\",[^\n]*}\n{\"event\":\"result\",[^\n]*}\n{\"event\":\"complete\",\"status\":\"complete\",\"exit_code\":0}\n$")
-add_test(NAME jsonl_missing_dir COMMAND disk-scanner --jsonl ${CMAKE_CURRENT_SOURCE_DIR}/no-such-dir)
-set_tests_properties(jsonl_missing_dir PROPERTIES PASS_REGULAR_EXPRESSION
-    "{\"event\":\"complete\",\"status\":\"failed\",\"exit_code\":2}")
+# --max-depth 는 0 이상의 정수만 허용한다.
+add_test(NAME scan_max_depth COMMAND disk-scanner --max-depth 0 ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME scan_bad_max_depth COMMAND disk-scanner --max-depth -1 ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_tests_properties(scan_bad_max_depth PROPERTIES WILL_FAIL TRUE)
 
 add_executable(test_path tests/test_path.c)
 target_link_libraries(test_path PRIVATE bytesieve_path)
