@@ -9,9 +9,11 @@
 #include <string.h>
 #include <wchar.h>
 
+#include "gui_drives.h"
 #include "path.h"
 #include "scan_job.h"
 #include "scan_model.h"
+#include "size_format.h"
 
 /* 공용 컨트롤 v6(비주얼 스타일). */
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -36,8 +38,13 @@ enum {
     IDC_PROGRESS,
     IDC_STATUS,
     IDC_TREE,
-    IDC_LIST
+    IDC_LIST,
+    IDC_TABS,
+    IDC_DRIVES
 };
+
+/* 탭 순서. */
+enum { TAB_SCAN, TAB_DRIVES };
 
 /* 순위 목록 열. */
 enum { COL_RANK, COL_PATH, COL_SIZE, COL_FILES, COL_SHARE, COL_COUNT };
@@ -45,12 +52,14 @@ enum { COL_RANK, COL_PATH, COL_SIZE, COL_FILES, COL_SHARE, COL_COUNT };
 typedef enum {
     SELF_TEST_NONE = 0,
     SELF_TEST_SCAN,  /* 스캔 → 화면 검증 → 종료 */
-    SELF_TEST_CANCEL /* 스캔 시작 직후 취소 → 화면 검증 → 종료 */
+    SELF_TEST_CANCEL, /* 스캔 시작 직후 취소 → 화면 검증 → 종료 */
+    SELF_TEST_DRIVES  /* 드라이브 탭 새로고침 → 화면 검증 → 종료 */
 } SelfTest;
 
 typedef struct {
     HWND hwnd;
     HWND path, browse, scan, cancel, progress, status, tree, list;
+    HWND tabs, drives;
     HFONT font;
     int dpi;
 
@@ -68,24 +77,6 @@ static App g_app;
 static int scale(int px)
 {
     return MulDiv(px, g_app.dpi, 96);
-}
-
-/* "512 B", "1.5 KiB" 처럼 짧게 쓴다. */
-static void format_size(uint64_t bytes, wchar_t *buf, size_t len)
-{
-    static const wchar_t *units[] = {L"KiB", L"MiB", L"GiB", L"TiB", L"PiB", L"EiB"};
-    double value = (double)bytes;
-    int unit = -1;
-
-    if (bytes < 1024) {
-        swprintf(buf, len, L"%llu B", (unsigned long long)bytes);
-        return;
-    }
-    while (value >= 1024.0 && unit < 5) {
-        value /= 1024.0;
-        unit++;
-    }
-    swprintf(buf, len, value < 10.0 ? L"%.2f %ls" : L"%.1f %ls", value, units[unit]);
 }
 
 static double share_of(uint64_t part, uint64_t whole)
@@ -120,25 +111,35 @@ static void layout(void)
 {
     RECT rc;
     int m = scale(8), h = scale(24), bw = scale(84), gap = scale(6);
-    int w, y, path_w, body_h, tree_w;
+    int x, w, y, path_w, body_h, tree_w;
 
+    /* 탭 컨트롤이 창 전체를 차지하고, 각 탭의 컨트롤은 탭의 표시 영역 안에 놓는다. */
     GetClientRect(g_app.hwnd, &rc);
+    MoveWindow(g_app.tabs, rc.left + scale(4), rc.top + scale(4), rc.right - scale(8),
+               rc.bottom - scale(8), TRUE);
+    GetWindowRect(g_app.tabs, &rc);
+    MapWindowPoints(NULL, g_app.hwnd, (POINT *)&rc, 2);
+    TabCtrl_AdjustRect(g_app.tabs, FALSE, &rc);
+    x = rc.left;
     w = rc.right - rc.left;
+    if (w < 0) {
+        w = 0;
+    }
 
-    y = m;
+    y = rc.top + m;
     path_w = w - 2 * m - 3 * (bw + gap);
     if (path_w < scale(80)) {
         path_w = scale(80);
     }
-    MoveWindow(g_app.path, m, y, path_w, h, TRUE);
-    MoveWindow(g_app.browse, m + path_w + gap, y, bw, h, TRUE);
-    MoveWindow(g_app.scan, m + path_w + gap + (bw + gap), y, bw, h, TRUE);
-    MoveWindow(g_app.cancel, m + path_w + gap + 2 * (bw + gap), y, bw, h, TRUE);
+    MoveWindow(g_app.path, x + m, y, path_w, h, TRUE);
+    MoveWindow(g_app.browse, x + m + path_w + gap, y, bw, h, TRUE);
+    MoveWindow(g_app.scan, x + m + path_w + gap + (bw + gap), y, bw, h, TRUE);
+    MoveWindow(g_app.cancel, x + m + path_w + gap + 2 * (bw + gap), y, bw, h, TRUE);
 
     y += h + gap;
-    MoveWindow(g_app.progress, m, y, w - 2 * m, scale(16), TRUE);
+    MoveWindow(g_app.progress, x + m, y, w - 2 * m, scale(16), TRUE);
     y += scale(16) + gap;
-    MoveWindow(g_app.status, m, y, w - 2 * m, scale(20), TRUE);
+    MoveWindow(g_app.status, x + m, y, w - 2 * m, scale(20), TRUE);
     y += scale(20) + gap;
 
     body_h = rc.bottom - y - m;
@@ -146,8 +147,39 @@ static void layout(void)
         body_h = 0;
     }
     tree_w = (w - 2 * m - gap) * 2 / 5;
-    MoveWindow(g_app.tree, m, y, tree_w, body_h, TRUE);
-    MoveWindow(g_app.list, m + tree_w + gap, y, w - 2 * m - gap - tree_w, body_h, TRUE);
+    MoveWindow(g_app.tree, x + m, y, tree_w, body_h, TRUE);
+    MoveWindow(g_app.list, x + m + tree_w + gap, y, w - 2 * m - gap - tree_w, body_h, TRUE);
+
+    body_h = rc.bottom - rc.top - 2 * m;
+    MoveWindow(g_app.drives, x + m, rc.top + m, w - 2 * m > 0 ? w - 2 * m : 0,
+               body_h > 0 ? body_h : 0, TRUE);
+}
+
+/* ---- 탭 ---- */
+
+static int current_tab(void)
+{
+    return TabCtrl_GetCurSel(g_app.tabs);
+}
+
+/* 고른 탭의 컨트롤만 보이게 한다. 드라이브 탭을 처음 열면 바로 조회한다. */
+static void show_tab(int tab)
+{
+    HWND scan_controls[] = {g_app.path,     g_app.browse, g_app.scan, g_app.cancel,
+                            g_app.progress, g_app.status, g_app.tree, g_app.list};
+    int show_scan = tab == TAB_SCAN;
+    size_t i;
+
+    if (TabCtrl_GetCurSel(g_app.tabs) != tab) {
+        TabCtrl_SetCurSel(g_app.tabs, tab);
+    }
+    for (i = 0; i < sizeof(scan_controls) / sizeof(scan_controls[0]); i++) {
+        ShowWindow(scan_controls[i], show_scan ? SW_SHOW : SW_HIDE);
+    }
+    ShowWindow(g_app.drives, show_scan ? SW_HIDE : SW_SHOW);
+    if (!show_scan && !drive_panel_loaded(g_app.drives)) {
+        drive_panel_refresh(g_app.drives);
+    }
 }
 
 /* ---- 결과 표시 ---- */
@@ -607,6 +639,25 @@ static int verify_screen(void)
     return failures == 0 ? 0 : 1;
 }
 
+/* 창 자체의 표시 상태(부모가 숨겨져 있어도 판단할 수 있게 스타일을 본다). */
+static int is_shown(HWND h)
+{
+    return (GetWindowLongW(h, GWL_STYLE) & WS_VISIBLE) != 0;
+}
+
+/* 드라이브 탭 새로고침이 끝난 뒤 탭 전환 상태와 패널 내용을 확인한다. */
+static int verify_drive_tab(void)
+{
+    int failures = drive_panel_verify(g_app.drives);
+
+    SELF_CHECK(current_tab() == TAB_DRIVES);
+    SELF_CHECK(is_shown(g_app.drives));
+    SELF_CHECK(!is_shown(g_app.tree) && !is_shown(g_app.list) && !is_shown(g_app.path));
+    /* 탭 컨트롤이 맨 아래가 아니면 그 위의 패널이 가려진다. */
+    SELF_CHECK(GetWindow(g_app.tabs, GW_HWNDNEXT) == NULL);
+    return failures == 0 ? 0 : 1;
+}
+
 /* ---- 창 프로시저 ---- */
 
 static HWND make_child(const wchar_t *cls, const wchar_t *text, DWORD style, DWORD ex,
@@ -639,6 +690,17 @@ static void create_controls(void)
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
     g_app.font = CreateFontIndirectW(&ncm.lfMessageFont);
 
+    g_app.tabs = make_child(WC_TABCONTROLW, L"", WS_CLIPSIBLINGS | WS_TABSTOP, 0, IDC_TABS);
+    {
+        TCITEMW tab;
+        memset(&tab, 0, sizeof(tab));
+        tab.mask = TCIF_TEXT;
+        tab.pszText = L"폴더 스캔";
+        SendMessageW(g_app.tabs, TCM_INSERTITEMW, TAB_SCAN, (LPARAM)&tab);
+        tab.pszText = L"드라이브";
+        SendMessageW(g_app.tabs, TCM_INSERTITEMW, TAB_DRIVES, (LPARAM)&tab);
+    }
+
     g_app.path = make_child(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE,
                             IDC_PATH);
     g_app.browse = make_child(L"BUTTON", L"찾아보기...", BS_PUSHBUTTON | WS_TABSTOP, 0,
@@ -669,10 +731,20 @@ static void create_controls(void)
         SendMessageW(g_app.list, LVM_INSERTCOLUMNW, (WPARAM)i, (LPARAM)&col);
     }
     set_scanning(0);
+
+    g_app.drives = drive_panel_create(g_app.hwnd, IDC_DRIVES, g_app.font, g_app.dpi);
+    /* 새 자식 창은 Z 순서 맨 아래에 붙으므로, 모두 만든 뒤 탭 컨트롤을 맨 아래로 보내
+     * 탭 위의 컨트롤이 가려지지 않게 한다. */
+    SetWindowPos(g_app.tabs, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    show_tab(TAB_SCAN);
 }
 
 static LRESULT on_notify(NMHDR *hdr)
 {
+    if (hdr->idFrom == IDC_TABS && hdr->code == TCN_SELCHANGE) {
+        show_tab(current_tab());
+        return 0;
+    }
     if (hdr->idFrom == IDC_TREE && hdr->code == TVN_ITEMEXPANDINGW) {
         NMTREEVIEWW *tv = (NMTREEVIEWW *)hdr;
         if (tv->action == TVE_EXPAND && g_app.has_model) {
@@ -716,10 +788,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case IDC_SCAN:
         case IDOK: /* 경로 칸에서 Enter */
-            start_scan();
+            if (current_tab() == TAB_SCAN) {
+                start_scan();
+            }
             return 0;
         case IDC_CANCEL:
             cancel_scan();
+            return 0;
+        case IDC_DRIVES:
+            if (HIWORD(wp) == DPN_REFRESHED && g_app.self_test == SELF_TEST_DRIVES) {
+                KillTimer(hwnd, TIMER_SELF_TEST);
+                g_app.self_test_exit = verify_drive_tab();
+                DestroyWindow(hwnd);
+            }
             return 0;
         }
         break;
@@ -769,6 +850,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  *   bytesieve-gui [<directory>]          폴더를 채우고 바로 스캔
  *   bytesieve-gui --self-test <dir>       스캔 후 화면을 검증하고 종료(0 성공, 1 실패)
  *   bytesieve-gui --self-test-cancel <dir> 시작 직후 취소한 뒤 화면을 검증하고 종료
+ *   bytesieve-gui --self-test-drives      드라이브 탭을 조회한 뒤 화면을 검증하고 종료
  */
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
@@ -790,6 +872,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     } else if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test-cancel") == 0) {
         g_app.self_test = SELF_TEST_CANCEL;
         target = argv[2];
+    } else if (argv != NULL && argc >= 2 && wcscmp(argv[1], L"--self-test-drives") == 0) {
+        g_app.self_test = SELF_TEST_DRIVES;
     } else if (argv != NULL && argc >= 2) {
         target = argv[1];
     }
@@ -812,8 +896,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_TREEVIEW_CLASSES | ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS |
-                ICC_STANDARD_CLASSES;
+                ICC_STANDARD_CLASSES | ICC_TAB_CLASSES;
     InitCommonControlsEx(&icc);
+    drive_panel_register(inst);
 
     memset(&wc, 0, sizeof(wc));
     wc.cbSize = sizeof(wc);
@@ -849,6 +934,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
             } else {
                 SetTimer(g_app.hwnd, TIMER_SELF_TEST, SELF_TEST_TIMEOUT_MS, NULL);
             }
+        }
+    }
+    if (g_app.self_test == SELF_TEST_DRIVES) {
+        if (g_app.drives == NULL) {
+            fwprintf(stderr, L"self-test failed: drive panel was not created\n");
+            g_app.self_test_exit = 1;
+            DestroyWindow(g_app.hwnd);
+        } else {
+            SetTimer(g_app.hwnd, TIMER_SELF_TEST, SELF_TEST_TIMEOUT_MS, NULL);
+            show_tab(TAB_DRIVES);
         }
     }
     LocalFree(argv);

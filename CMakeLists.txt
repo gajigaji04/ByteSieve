@@ -43,9 +43,20 @@ target_include_directories(bytesieve_job PUBLIC src)
 target_link_libraries(bytesieve_job PUBLIC bytesieve_model)
 bytesieve_configure(bytesieve_job)
 
-# Win32 GUI: 진행률 표시줄, 폴더 트리(TreeView), 용량 순위(ListView).
-add_executable(bytesieve-gui WIN32 src/gui_main.c)
-target_link_libraries(bytesieve-gui PRIVATE bytesieve_job comctl32 shell32 ole32)
+# 용량 표시 문자열("1.50 KiB"). GUI 의 스캔 화면과 드라이브 대시보드가 함께 쓴다.
+add_library(bytesieve_format STATIC src/size_format.c)
+target_include_directories(bytesieve_format PUBLIC src)
+bytesieve_configure(bytesieve_format)
+
+# 논리 드라이브 목록·용량 조회(GetLogicalDrives, GetDiskFreeSpaceExW). 스캐너와 독립.
+add_library(bytesieve_drive STATIC src/drive.c)
+target_include_directories(bytesieve_drive PUBLIC src)
+bytesieve_configure(bytesieve_drive)
+
+# Win32 GUI: 폴더 스캔 탭(진행률 표시줄, 폴더 트리, 용량 순위)과 드라이브 대시보드 탭.
+add_executable(bytesieve-gui WIN32 src/gui_main.c src/gui_drives.c)
+target_link_libraries(bytesieve-gui PRIVATE bytesieve_job bytesieve_drive bytesieve_format
+                      comctl32 shell32 ole32)
 bytesieve_configure(bytesieve-gui)
 
 add_executable(disk-scanner src/main.c)
@@ -151,10 +162,22 @@ target_link_libraries(test_scan_job PRIVATE bytesieve_job)
 bytesieve_configure(test_scan_job)
 add_test(NAME scan_job COMMAND test_scan_job)
 
+add_executable(test_drive tests/test_drive.c)
+target_link_libraries(test_drive PRIVATE bytesieve_drive)
+bytesieve_configure(test_drive)
+add_test(NAME drive COMMAND test_drive)
+
+add_executable(test_size_format tests/test_size_format.c)
+target_link_libraries(test_size_format PRIVATE bytesieve_format)
+bytesieve_configure(test_size_format)
+add_test(NAME size_format COMMAND test_size_format)
+
 # GUI 자체 검사: 창(숨김)에서 스캔을 끝까지 돌리거나 시작 직후 취소한 뒤
 # 진행률·트리·순위 화면이 모델과 맞는지 확인하고 종료 코드로 알린다.
 add_test(NAME gui_scan COMMAND bytesieve-gui --self-test ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME gui_cancel COMMAND bytesieve-gui --self-test-cancel ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME gui_missing_dir COMMAND bytesieve-gui --self-test ${CMAKE_CURRENT_SOURCE_DIR}/no-such-dir)
 set_tests_properties(gui_missing_dir PROPERTIES WILL_FAIL TRUE)
-set_tests_properties(gui_scan gui_cancel gui_missing_dir PROPERTIES TIMEOUT 120)
+# 드라이브 탭으로 전환해 조회를 마친 뒤 목록이 시스템 드라이브 정보와 맞는지 확인한다.
+add_test(NAME gui_drives COMMAND bytesieve-gui --self-test-drives)
+set_tests_properties(gui_scan gui_cancel gui_missing_dir gui_drives PROPERTIES TIMEOUT 120)
