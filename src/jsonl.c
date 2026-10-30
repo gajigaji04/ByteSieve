@@ -197,6 +197,17 @@ void jsonl_result(JsonBuf *buf, const wchar_t *target, const ScanReport *report)
     append_u64_field(buf, "files", report->file_count);
     append_u64_field(buf, "dirs", report->dir_count);
     append_u64_field(buf, "bytes", report->total_bytes);
+    append_u64_field(buf, "alloc_bytes", report->alloc_bytes);
+    append_key(buf, "disk");
+    append(buf, "{", 1);
+    append_str(buf, "\"slack\":");
+    append_u64(buf, report->slack_bytes);
+    append_u64_field(buf, "compressed_saved", report->compressed_saved_bytes);
+    append_u64_field(buf, "sparse_saved", report->sparse_saved_bytes);
+    append_u64_field(buf, "cloud_saved", report->cloud_saved_bytes);
+    append_u64_field(buf, "other_saved", report->other_saved_bytes);
+    append_u64_field(buf, "unknown_files", report->alloc_unknown_files);
+    append(buf, "}", 1);
     append_u64_field(buf, "reparse_points", report->reparse_count);
     append_u64_field(buf, "error_count", report->error_count);
     append_key(buf, "errors");
@@ -260,4 +271,50 @@ void jsonl_progress_visit(const ScanEntry *entry, void *ctx)
             jsonl_buf_flush(p->buf, p->out);
         }
     }
+}
+
+static void append_i64(JsonBuf *buf, int64_t v)
+{
+    if (v < 0) {
+        append(buf, "-", 1);
+        append_u64(buf, (uint64_t)0 - (uint64_t)v);
+    } else {
+        append_u64(buf, (uint64_t)v);
+    }
+}
+
+void jsonl_changes(JsonBuf *buf, const HistoryDiff *diff, const wchar_t *saved_to, size_t limit)
+{
+    size_t i, shown;
+
+    begin_event(buf, "changes");
+    append_str(buf, diff != NULL ? ",\"previous\":true" : ",\"previous\":false");
+    if (diff != NULL) {
+        append_u64_field(buf, "since", diff->old_time);
+        append_u64_field(buf, "old_bytes", diff->old_total);
+        append_u64_field(buf, "new_bytes", diff->new_total);
+        append_key(buf, "items");
+        append(buf, "[", 1);
+        shown = diff->len < limit ? diff->len : limit;
+        for (i = 0; i < shown; i++) {
+            const HistoryChange *c = &diff->items[i];
+            if (i > 0) {
+                append(buf, ",", 1);
+            }
+            append_str(buf, "{\"path\":");
+            jsonl_append_string(buf, c->rel);
+            append_str(buf, ",\"kind\":");
+            jsonl_append_string(buf, history_kind_name(c->kind));
+            append_u64_field(buf, "old", c->old_bytes);
+            append_u64_field(buf, "new", c->new_bytes);
+            append_str(buf, ",\"delta\":");
+            append_i64(buf, c->delta);
+            append_str(buf, c->uncertain ? ",\"uncertain\":true}" : ",\"uncertain\":false}");
+        }
+        append(buf, "]", 1);
+        append_u64_field(buf, "more", diff->len - shown);
+    }
+    append_key(buf, "saved_to");
+    jsonl_append_string(buf, saved_to);
+    end_event(buf);
 }

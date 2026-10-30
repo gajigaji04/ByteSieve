@@ -23,12 +23,12 @@ bytesieve_configure(bytesieve_scanner)
 
 add_library(bytesieve_jsonl STATIC src/jsonl.c)
 target_include_directories(bytesieve_jsonl PUBLIC src)
-target_link_libraries(bytesieve_jsonl PUBLIC bytesieve_scanner)
+target_link_libraries(bytesieve_jsonl PUBLIC bytesieve_scanner bytesieve_history)
 bytesieve_configure(bytesieve_jsonl)
 
 add_library(bytesieve_cli STATIC src/cli.c)
 target_include_directories(bytesieve_cli PUBLIC src)
-target_link_libraries(bytesieve_cli PUBLIC bytesieve_scanner)
+target_link_libraries(bytesieve_cli PUBLIC bytesieve_scanner bytesieve_history bytesieve_format)
 bytesieve_configure(bytesieve_cli)
 
 # GUI 연동용 데이터 모델(진행률·폴더 트리·용량 순위). 출력 코드에 의존하지 않는다.
@@ -36,6 +36,12 @@ add_library(bytesieve_model STATIC src/scan_model.c)
 target_include_directories(bytesieve_model PUBLIC src)
 target_link_libraries(bytesieve_model PUBLIC bytesieve_scanner)
 bytesieve_configure(bytesieve_model)
+
+# 폴더별 용량 변화 추적(스냅숏 저장·비교). 모델에 의존한다.
+add_library(bytesieve_history STATIC src/scan_history.c)
+target_include_directories(bytesieve_history PUBLIC src)
+target_link_libraries(bytesieve_history PUBLIC bytesieve_model)
+bytesieve_configure(bytesieve_history)
 
 # 스캔을 별도 스레드에서 돌리는 작업(진행률 스냅샷·취소). GUI 와 테스트가 함께 쓴다.
 add_library(bytesieve_job STATIC src/scan_job.c)
@@ -88,10 +94,15 @@ bytesieve_configure(bytesieve_sysmon)
 # 시스템 탭(RAM·CPU 실시간 사용률 막대·그래프).
 add_executable(bytesieve-gui WIN32 src/gui_main.c src/gui_drives.c src/gui_cleanup.c
                src/gui_monitor.c)
-target_link_libraries(bytesieve-gui PRIVATE bytesieve_job bytesieve_drive bytesieve_format
-                      bytesieve_cleanup_job bytesieve_cleanup_trash bytesieve_sysmon
-                      comctl32 shell32 ole32)
+target_link_libraries(bytesieve-gui PRIVATE bytesieve_job bytesieve_history bytesieve_drive
+                      bytesieve_format bytesieve_cleanup_job bytesieve_cleanup_trash
+                      bytesieve_sysmon comctl32 shell32 ole32)
 bytesieve_configure(bytesieve-gui)
+
+# 대용량 폴더 스캔의 실행 시간·메모리 측정 도구.
+add_executable(bytesieve-bench src/bench.c)
+target_link_libraries(bytesieve-bench PRIVATE bytesieve_model bytesieve_cleanup bytesieve_format psapi)
+bytesieve_configure(bytesieve-bench)
 
 add_executable(disk-scanner src/main.c)
 target_link_libraries(disk-scanner PRIVATE bytesieve_cli bytesieve_jsonl)
@@ -166,6 +177,13 @@ bytesieve_cli_test(jsonl_partial 1 "--jsonl|@FIXTURE@"
     "\"error_count\":1,\"errors\":.{\"path\":\"[^\"]*locked\",\"code\":5}.|\"status\":\"partial\",\"exit_code\":1" ""
     -DDENY_FIXTURE=${CMAKE_CURRENT_BINARY_DIR}/cli_jsonl_partial_fixture)
 
+# 폴더별 용량 변화 추적: 기준 스냅숏 → 픽스처 변경 → 비교, JSON Lines changes 이벤트.
+add_test(NAME cli_track
+         COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:disk-scanner>
+                 -DFIXTURE=${CMAKE_CURRENT_BINARY_DIR}/cli_track_fixture
+                 -DHIST=${CMAKE_CURRENT_BINARY_DIR}/cli_track_history
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_track_check.cmake)
+
 add_executable(test_path tests/test_path.c)
 target_link_libraries(test_path PRIVATE bytesieve_path)
 bytesieve_configure(test_path)
@@ -175,6 +193,12 @@ add_executable(test_scanner tests/test_scanner.c)
 target_link_libraries(test_scanner PRIVATE bytesieve_scanner)
 bytesieve_configure(test_scanner)
 add_test(NAME scanner COMMAND test_scanner)
+
+# 디스크 사용량 분석(논리 대 할당 크기)과 병렬 미리 열거의 순서 보장.
+add_executable(test_scan_alloc tests/test_scan_alloc.c)
+target_link_libraries(test_scan_alloc PRIVATE bytesieve_scanner)
+bytesieve_configure(test_scan_alloc)
+add_test(NAME scan_alloc COMMAND test_scan_alloc)
 
 add_executable(test_jsonl tests/test_jsonl.c)
 target_link_libraries(test_jsonl PRIVATE bytesieve_jsonl)
@@ -190,6 +214,11 @@ add_executable(test_scan_model tests/test_scan_model.c)
 target_link_libraries(test_scan_model PRIVATE bytesieve_model)
 bytesieve_configure(test_scan_model)
 add_test(NAME scan_model COMMAND test_scan_model)
+
+add_executable(test_scan_history tests/test_scan_history.c)
+target_link_libraries(test_scan_history PRIVATE bytesieve_history)
+bytesieve_configure(test_scan_history)
+add_test(NAME scan_history COMMAND test_scan_history)
 
 add_executable(test_scan_job tests/test_scan_job.c)
 target_link_libraries(test_scan_job PRIVATE bytesieve_job)
@@ -245,7 +274,16 @@ add_test(NAME gui_trash
          COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bytesieve-gui>
                  -DFIXTURE=${CMAKE_CURRENT_BINARY_DIR}/gui_trash_fixture
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/gui_trash_check.cmake)
+# 폴더 스캔 탭 변화 추적: 기준 스캔 → 픽스처 변경 → 변화 순위 보기·변화 열 확인.
+add_test(NAME gui_history
+         COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bytesieve-gui>
+                 -DFIXTURE=${CMAKE_CURRENT_BINARY_DIR}/gui_history_fixture
+                 -DHIST=${CMAKE_CURRENT_BINARY_DIR}/gui_history_check
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/gui_history_check.cmake)
 # 시스템 탭: 몇 초 동안 RAM·CPU 를 측정해 화면·1초 갱신 간격·측정 실패 표시를 확인한다.
 add_test(NAME gui_monitor COMMAND bytesieve-gui --self-test-monitor)
 set_tests_properties(gui_scan gui_cancel gui_missing_dir gui_drives gui_cleanup
-                     gui_cleanup_cancel gui_trash gui_monitor PROPERTIES TIMEOUT 120)
+                     gui_cleanup_cancel gui_trash gui_monitor gui_history PROPERTIES TIMEOUT 120)
+# 폴더 스캔 자체 검사가 사용자 기록 폴더(%LOCALAPPDATA%)에 스냅숏을 쓰지 않게 한다.
+set_tests_properties(gui_scan gui_cancel gui_missing_dir PROPERTIES
+                     ENVIRONMENT "BYTESIEVE_HISTORY_DIR=${CMAKE_CURRENT_BINARY_DIR}/gui_test_history")

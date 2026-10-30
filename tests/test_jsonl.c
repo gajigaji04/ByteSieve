@@ -134,7 +134,9 @@ static void test_result(void)
 
     jsonl_result(&b, L"D:\\", &r);
     CHECK_BUF(&b, "{\"event\":\"result\",\"target\":\"D:\\\\\",\"files\":0,\"dirs\":0,"
-                  "\"bytes\":0,\"reparse_points\":0,\"error_count\":0,\"errors\":[]}\n");
+                  "\"bytes\":0,\"alloc_bytes\":0,\"disk\":{\"slack\":0,\"compressed_saved\":0,"
+                  "\"sparse_saved\":0,\"cloud_saved\":0,\"other_saved\":0,\"unknown_files\":0},"
+                  "\"reparse_points\":0,\"error_count\":0,\"errors\":[]}\n");
 
     errs[0].path = L"D:\\a \"b\"";
     errs[0].code = 5;
@@ -147,12 +149,64 @@ static void test_result(void)
     r.error_count = 3; /* 저장하지 못한 오류도 센다. */
     r.errors = errs;
     r.errors_len = 2;
+    r.alloc_bytes = 5368713216ULL;
+    r.slack_bytes = 4093;
+    r.compressed_saved_bytes = 1;
+    r.sparse_saved_bytes = 2;
+    r.cloud_saved_bytes = 3;
+    r.other_saved_bytes = 4;
+    r.alloc_unknown_files = 5;
     jsonl_result(&b, L"D:\\", &r);
     CHECK_BUF(&b, "{\"event\":\"result\",\"target\":\"D:\\\\\",\"files\":3,\"dirs\":2,"
-                  "\"bytes\":5368709123,\"reparse_points\":1,\"error_count\":3,"
+                  "\"bytes\":5368709123,\"alloc_bytes\":5368713216,\"disk\":{\"slack\":4093,"
+                  "\"compressed_saved\":1,\"sparse_saved\":2,\"cloud_saved\":3,"
+                  "\"other_saved\":4,\"unknown_files\":5},\"reparse_points\":1,"
+                  "\"error_count\":3,"
                   "\"errors\":[{\"path\":\"D:\\\\a \\\"b\\\"\",\"code\":5},"
                   "{\"path\":null,\"code\":87}]}\n");
 
+    jsonl_buf_free(&b);
+}
+
+static void test_changes(void)
+{
+    JsonBuf b;
+    HistoryDiff d;
+    HistoryChange items[3];
+
+    jsonl_buf_init(&b);
+    jsonl_changes(&b, NULL, L"C:\\h\\a.snap", 10);
+    CHECK_BUF(&b, "{\"event\":\"changes\",\"previous\":false,\"saved_to\":\"C:\\\\h\\\\a.snap\"}\n");
+
+    history_diff_init(&d);
+    memset(items, 0, sizeof(items));
+    items[0].rel = L"proj\\node_modules";
+    items[0].kind = HISTORY_GROWN;
+    items[0].old_bytes = 200;
+    items[0].new_bytes = 1200;
+    items[0].delta = 1000;
+    items[1].rel = L"old";
+    items[1].kind = HISTORY_REMOVED;
+    items[1].old_bytes = 100;
+    items[1].delta = -100;
+    items[1].uncertain = 1;
+    items[2].rel = L"x";
+    items[2].kind = HISTORY_ADDED;
+    items[2].new_bytes = 5;
+    items[2].delta = 5;
+    d.items = items;
+    d.len = 3;
+    d.old_time = 133000000000000000ULL;
+    d.old_total = 300;
+    d.new_total = 1205;
+    /* 최대 2개만 나열하고 나머지는 more 로 센다. 저장 실패면 saved_to 는 null. */
+    jsonl_changes(&b, &d, NULL, 2);
+    CHECK_BUF(&b, "{\"event\":\"changes\",\"previous\":true,\"since\":133000000000000000,"
+                  "\"old_bytes\":300,\"new_bytes\":1205,\"items\":["
+                  "{\"path\":\"proj\\\\node_modules\",\"kind\":\"grown\",\"old\":200,"
+                  "\"new\":1200,\"delta\":1000,\"uncertain\":false},"
+                  "{\"path\":\"old\",\"kind\":\"removed\",\"old\":100,\"new\":0,"
+                  "\"delta\":-100,\"uncertain\":true}],\"more\":1,\"saved_to\":null}\n");
     jsonl_buf_free(&b);
 }
 
@@ -217,6 +271,7 @@ int main(void)
     test_progress();
     test_progress_visit();
     test_result();
+    test_changes();
     test_complete();
     test_lines_and_flush();
 

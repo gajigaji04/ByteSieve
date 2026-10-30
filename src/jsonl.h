@@ -6,13 +6,19 @@
 #include <stdio.h>
 #include <wchar.h>
 
+#include "scan_history.h"
 #include "scanner.h"
 
 /*
  * JSON Lines 이벤트 출력. 이벤트 하나는 '\n' 으로 끝나는 UTF-8 JSON 객체 한 줄이다.
  *   {"event":"start","target":...}
  *   {"event":"progress","files":..,"dirs":..,"bytes":..,"errors":..}
- *   {"event":"result","target":...,"files":..,...,"errors":[{"path":..,"code":..}]}
+ *   {"event":"result","target":...,"files":..,"dirs":..,"bytes":..,"alloc_bytes":..,
+ *    "disk":{"slack":..,"compressed_saved":..,"sparse_saved":..,"cloud_saved":..,
+ *            "other_saved":..,"unknown_files":..},...,"errors":[{"path":..,"code":..}]}
+ *   {"event":"changes","previous":true|false,"since":<FILETIME>,"old_bytes":..,"new_bytes":..,
+ *    "items":[{"path":..,"kind":"grown|shrunk|added|removed","old":..,"new":..,
+ *              "delta":..,"uncertain":true|false}],"more":..,"saved_to":..}   (--track)
  *   {"event":"complete","status":"complete|partial|failed","exit_code":..}
  */
 
@@ -41,6 +47,12 @@ void jsonl_start(JsonBuf *buf, const wchar_t *target);
 void jsonl_progress(JsonBuf *buf, const ScanReport *report);
 void jsonl_result(JsonBuf *buf, const wchar_t *target, const ScanReport *report);
 void jsonl_complete(JsonBuf *buf, ScanStatus status, int exit_code);
+
+/*
+ * 변화 추적 결과. diff 가 NULL 이면 직전 스냅숏이 없는 것("previous":false, items 없음).
+ * saved_to 가 NULL 이면 저장하지 못한 것(null). 항목은 최대 limit 개, 나머지는 "more" 로 센다.
+ */
+void jsonl_changes(JsonBuf *buf, const HistoryDiff *diff, const wchar_t *saved_to, size_t limit);
 
 /* scan_directory 의 visit 콜백으로 써서 interval 항목마다 progress 이벤트를 낸다. */
 typedef struct {

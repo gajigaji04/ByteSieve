@@ -13,6 +13,7 @@
 #include "gui_drives.h"
 #include "gui_monitor.h"
 #include "path.h"
+#include "scan_history.h"
 #include "scan_job.h"
 #include "scan_model.h"
 #include "size_format.h"
@@ -46,14 +47,28 @@ enum {
     IDC_TABS,
     IDC_DRIVES,
     IDC_CLEANUP,
-    IDC_MONITOR
+    IDC_MONITOR,
+    IDC_VIEW,
+    IDC_ANALYSIS
 };
 
 /* 탭 순서. */
 enum { TAB_SCAN, TAB_DRIVES, TAB_CLEANUP, TAB_MONITOR };
 
 /* 순위 목록 열. */
-enum { COL_RANK, COL_PATH, COL_SIZE, COL_FILES, COL_SHARE, COL_COUNT };
+enum { COL_RANK, COL_PATH, COL_SIZE, COL_CHANGE, COL_ALLOC, COL_FILES, COL_SHARE, COL_COUNT };
+
+/* 오른쪽 목록 보기(보기 콤보 상자 순서). */
+enum { VIEW_SIZE, VIEW_ALLOC, VIEW_CHANGE, VIEW_COUNT };
+
+/* 직전 스캔과의 비교·기록 상태. */
+typedef enum {
+    HIST_NONE = 0,   /* 스캔 전, 또는 스캔 실패 */
+    HIST_BASELINE,   /* 직전 스냅숏이 없어 이번 스캔을 기준으로 저장했다 */
+    HIST_COMPARED,   /* 직전 스냅숏과 비교했고 새 스냅숏을 저장했다 */
+    HIST_CANCELLED,  /* 취소되어 저장하지 않았다(직전과 비교만 했을 수 있음) */
+    HIST_FAILED      /* 기록 위치를 정하지 못했거나 저장하지 못했다 */
+} HistoryState;
 
 typedef enum {
     SELF_TEST_NONE = 0,
@@ -63,12 +78,13 @@ typedef enum {
     SELF_TEST_CLEANUP,       /* 정리 후보 탭 탐지 → 화면 검증 → 종료 */
     SELF_TEST_CLEANUP_CANCEL, /* 정리 후보 탐지 시작 직후 취소 → 화면 검증 → 종료 */
     SELF_TEST_TRASH, /* 정리 후보 탐지 → 모두 선택 → 휴지통 이동(확인 창 없이) → 화면 검증 → 종료 */
-    SELF_TEST_MONITOR /* 시스템 탭 측정 몇 회 → 화면·갱신 간격·실패 표시 검증 → 종료 */
+    SELF_TEST_MONITOR, /* 시스템 탭 측정 몇 회 → 화면·갱신 간격·실패 표시 검증 → 종료 */
+    SELF_TEST_CHANGES  /* 스캔 → 직전 스냅숏과 비교한 변화 보기 검증·출력 → 종료 */
 } SelfTest;
 
 typedef struct {
     HWND hwnd;
-    HWND path, browse, scan, cancel, progress, status, tree, list;
+    HWND path, browse, scan, cancel, progress, status, tree, list, view, analysis;
     HWND tabs, drives, cleanup, monitor;
     HFONT font;
     int dpi;
@@ -77,6 +93,13 @@ typedef struct {
     ScanModel model;
     int has_model;
     int progress_pos;
+
+    /* 폴더별 용량 변화(직전 스캔 대비) */
+    HistoryState history;
+    unsigned long history_error;
+    HistoryDiff diff;        /* history 가 COMPARED(또는 비교 뒤 CANCELLED)일 때 */
+    int has_diff;
+    size_t *change_of_node;  /* 노드 → diff 항목 번호(없으면 SCAN_NODE_NONE) */
 
     SelfTest self_test;
     int self_test_exit;
@@ -121,7 +144,7 @@ static const wchar_t *flag_label(uint32_t flags)
 static void layout(void)
 {
     RECT rc;
-    int m = scale(8), h = scale(24), bw = scale(84), gap = scale(6);
+    int m = scale(8), h = scale(24), bw = scale(84), gap = scale(6), view_w = scale(170);
     int x, w, y, path_w, body_h, tree_w;
 
     /* 탭 컨트롤이 창 전체를 차지하고, 각 탭의 컨트롤은 탭의 표시 영역 안에 놓는다. */
@@ -138,7 +161,7 @@ static void layout(void)
     }
 
     y = rc.top + m;
-    path_w = w - 2 * m - 3 * (bw + gap);
+    path_w = w - 2 * m - 3 * (bw + gap) - (view_w + gap);
     if (path_w < scale(80)) {
         path_w = scale(80);
     }
@@ -146,11 +169,15 @@ static void layout(void)
     MoveWindow(g_app.browse, x + m + path_w + gap, y, bw, h, TRUE);
     MoveWindow(g_app.scan, x + m + path_w + gap + (bw + gap), y, bw, h, TRUE);
     MoveWindow(g_app.cancel, x + m + path_w + gap + 2 * (bw + gap), y, bw, h, TRUE);
+    /* 콤보 상자 높이는 펼친 목록 높이까지 포함한다. */
+    MoveWindow(g_app.view, x + m + path_w + gap + 3 * (bw + gap), y, view_w, scale(120), TRUE);
 
     y += h + gap;
     MoveWindow(g_app.progress, x + m, y, w - 2 * m, scale(16), TRUE);
     y += scale(16) + gap;
     MoveWindow(g_app.status, x + m, y, w - 2 * m, scale(20), TRUE);
+    y += scale(20);
+    MoveWindow(g_app.analysis, x + m, y, w - 2 * m, scale(20), TRUE);
     y += scale(20) + gap;
 
     body_h = rc.bottom - y - m;
@@ -181,8 +208,9 @@ static int current_tab(void)
  * 시스템 탭을 처음 열면 측정을 시작한다(이후 탭을 옮겨도 그래프 기록을 위해 계속 측정). */
 static void show_tab(int tab)
 {
-    HWND scan_controls[] = {g_app.path,     g_app.browse, g_app.scan, g_app.cancel,
-                            g_app.progress, g_app.status, g_app.tree, g_app.list};
+    HWND scan_controls[] = {g_app.path,   g_app.browse, g_app.scan,     g_app.cancel,
+                            g_app.view,   g_app.progress, g_app.status, g_app.analysis,
+                            g_app.tree,   g_app.list};
     int show_scan = tab == TAB_SCAN;
     size_t i;
 
@@ -297,50 +325,270 @@ static void list_set(int row, int col, const wchar_t *text)
     SendMessageW(g_app.list, LVM_SETITEMTEXTW, (WPARAM)row, (LPARAM)&lv);
 }
 
+static int current_view(void)
+{
+    LRESULT sel = SendMessageW(g_app.view, CB_GETCURSEL, 0, 0);
+
+    return sel >= 0 && sel < VIEW_COUNT ? (int)sel : VIEW_SIZE;
+}
+
+/* 부호 있는 용량("+1.20 GiB", "-300 B"). */
+static void format_delta(int64_t delta, wchar_t *buf, size_t len)
+{
+    wchar_t size[32];
+    uint64_t mag = delta < 0 ? (uint64_t)0 - (uint64_t)delta : (uint64_t)delta;
+
+    format_size(mag, size, 32);
+    swprintf(buf, len, L"%ls%ls", delta > 0 ? L"+" : delta < 0 ? L"-" : L"", size);
+}
+
+/* 변화 열 문구. */
+static void change_text(const HistoryChange *c, wchar_t *buf, size_t len)
+{
+    wchar_t delta[48];
+
+    format_delta(c->delta, delta, 48);
+    swprintf(buf, len, L"%ls%ls%ls",
+             c->kind == HISTORY_ADDED     ? L"새 폴더 "
+             : c->kind == HISTORY_REMOVED ? L"삭제됨 "
+                                          : L"",
+             delta, c->uncertain ? L" (?)" : L"");
+}
+
+/* 한 줄을 넣는다. node 가 SCAN_NODE_NONE 이면(삭제된 폴더) 용량 열을 비운다. */
+static void insert_row(int index, size_t node, const wchar_t *path, const wchar_t *flags,
+                       const HistoryChange *change, uint64_t whole)
+{
+    wchar_t buf[96];
+    LVITEMW lv;
+    int row;
+
+    swprintf(buf, 96, L"%u", (unsigned)(index + 1));
+    memset(&lv, 0, sizeof(lv));
+    lv.mask = LVIF_TEXT | LVIF_PARAM;
+    lv.iItem = index;
+    lv.pszText = buf;
+    lv.lParam = (LPARAM)node;
+    row = (int)SendMessageW(g_app.list, LVM_INSERTITEMW, 0, (LPARAM)&lv);
+    if (row < 0) {
+        return;
+    }
+    if (path != NULL) {
+        size_t plen = wcslen(path) + wcslen(flags) + 1;
+        wchar_t *text = malloc(plen * sizeof(*text));
+        if (text != NULL) {
+            swprintf(text, plen, L"%ls%ls", path, flags);
+            list_set(row, COL_PATH, text);
+            free(text);
+        }
+    }
+    if (node != SCAN_NODE_NONE) {
+        const ScanNode *n = &g_app.model.nodes[node];
+        format_size(n->total_bytes, buf, 96);
+        list_set(row, COL_SIZE, buf);
+        format_size(n->total_alloc, buf, 96);
+        list_set(row, COL_ALLOC, buf);
+        swprintf(buf, 96, L"%llu", (unsigned long long)n->total_files);
+        list_set(row, COL_FILES, buf);
+        swprintf(buf, 96, L"%.1f%%", share_of(n->total_bytes, whole));
+        list_set(row, COL_SHARE, buf);
+    } else {
+        list_set(row, COL_SIZE, L"-");
+        list_set(row, COL_ALLOC, L"-");
+        list_set(row, COL_FILES, L"-");
+        list_set(row, COL_SHARE, L"-");
+    }
+    if (change != NULL) {
+        change_text(change, buf, 96);
+        list_set(row, COL_CHANGE, buf);
+    }
+}
+
+/*
+ * 오른쪽 목록을 보기에 맞게 채운다.
+ *   용량·디스크 사용 순위: 상위 RANK_COUNT 개 폴더(변화 열은 직전 스캔 대비, 없으면 빈칸)
+ *   변화 순위: 직전 스캔 대비 변화가 큰 폴더(삭제된 폴더 포함)
+ */
 static void fill_rank(void)
 {
     size_t top[RANK_COUNT];
     size_t count, i;
-    uint64_t whole = g_app.model.nodes[0].total_bytes;
+    uint64_t whole;
+    int view = current_view();
 
-    count = scan_model_rank(&g_app.model, SCAN_RANK_TOTAL_BYTES, top, RANK_COUNT);
+    ListView_DeleteAllItems(g_app.list);
+    if (!g_app.has_model || g_app.model.len == 0) {
+        return;
+    }
+    whole = g_app.model.nodes[0].total_bytes;
     SendMessageW(g_app.list, WM_SETREDRAW, FALSE, 0);
-    for (i = 0; i < count; i++) {
-        const ScanNode *n = &g_app.model.nodes[top[i]];
-        wchar_t buf[64], *path;
-        LVITEMW lv;
-        int row;
-
-        swprintf(buf, 64, L"%u", (unsigned)(i + 1));
-        memset(&lv, 0, sizeof(lv));
-        lv.mask = LVIF_TEXT | LVIF_PARAM;
-        lv.iItem = (int)i;
-        lv.pszText = buf;
-        lv.lParam = (LPARAM)top[i];
-        row = (int)SendMessageW(g_app.list, LVM_INSERTITEMW, 0, (LPARAM)&lv);
-        if (row < 0) {
-            break;
-        }
-
-        path = scan_model_path(&g_app.model, top[i]);
-        if (path != NULL) {
-            size_t plen = wcslen(path) + 16;
-            wchar_t *text = malloc(plen * sizeof(*text));
-            if (text != NULL) {
-                swprintf(text, plen, L"%ls%ls", path, flag_label(n->flags));
-                list_set(row, COL_PATH, text);
-                free(text);
-            }
+    if (view == VIEW_CHANGE) {
+        count = g_app.has_diff ? (g_app.diff.len < RANK_COUNT ? g_app.diff.len : RANK_COUNT) : 0;
+        for (i = 0; i < count; i++) {
+            const HistoryChange *c = &g_app.diff.items[i];
+            wchar_t *path = history_full_path(g_app.model.nodes[0].name, c->rel);
+            const wchar_t *flags = c->node != SCAN_NODE_NONE
+                                       ? flag_label(g_app.model.nodes[c->node].flags)
+                                       : L"";
+            insert_row((int)i, c->node, path, flags, c, whole);
             free(path);
         }
-        format_size(n->total_bytes, buf, 64);
-        list_set(row, COL_SIZE, buf);
-        swprintf(buf, 64, L"%llu", (unsigned long long)n->total_files);
-        list_set(row, COL_FILES, buf);
-        swprintf(buf, 64, L"%.1f%%", share_of(n->total_bytes, whole));
-        list_set(row, COL_SHARE, buf);
+    } else {
+        count = scan_model_rank(&g_app.model,
+                                view == VIEW_ALLOC ? SCAN_RANK_TOTAL_ALLOC : SCAN_RANK_TOTAL_BYTES,
+                                top, RANK_COUNT);
+        for (i = 0; i < count; i++) {
+            const HistoryChange *c = NULL;
+            wchar_t *path = scan_model_path(&g_app.model, top[i]);
+            if (g_app.change_of_node != NULL &&
+                g_app.change_of_node[top[i]] != SCAN_NODE_NONE) {
+                c = &g_app.diff.items[g_app.change_of_node[top[i]]];
+            }
+            insert_row((int)i, top[i], path, flag_label(g_app.model.nodes[top[i]].flags), c,
+                       whole);
+            free(path);
+        }
     }
     SendMessageW(g_app.list, WM_SETREDRAW, TRUE, 0);
+}
+
+/* 디스크 사용량 분석과 직전 스캔 대비 변화를 둘째 상태 줄에 쓴다. */
+static void update_analysis(void)
+{
+    const ScanReport *r = &g_app.model.report;
+    wchar_t text[768], a[32], b[32], c[32];
+    size_t used = 0;
+    int n;
+
+#define APPEND(...)                                                                          \
+    do {                                                                                     \
+        n = swprintf(text + used, sizeof(text) / sizeof(text[0]) - used, __VA_ARGS__);       \
+        if (n > 0) {                                                                         \
+            used += (size_t)n;                                                               \
+        }                                                                                    \
+    } while (0)
+
+    text[0] = L'\0';
+    if (!g_app.has_model || g_app.model.status == SCAN_FATAL) {
+        SetWindowTextW(g_app.analysis, L"");
+        return;
+    }
+    format_size(r->alloc_bytes, a, 32);
+    format_delta((int64_t)(r->alloc_bytes - r->total_bytes), b, 32);
+    APPEND(L"디스크 사용 %ls(논리 크기 대비 %ls)", a, b);
+    if (r->slack_bytes > 0) {
+        format_size(r->slack_bytes, a, 32);
+        APPEND(L" · 클러스터 낭비 +%ls", a);
+    }
+    if (r->compressed_saved_bytes > 0) {
+        format_size(r->compressed_saved_bytes, a, 32);
+        APPEND(L" · 압축 -%ls(%llu개)", a, (unsigned long long)r->compressed_files);
+    }
+    if (r->sparse_saved_bytes > 0) {
+        format_size(r->sparse_saved_bytes, a, 32);
+        APPEND(L" · 스파스 -%ls(%llu개)", a, (unsigned long long)r->sparse_files);
+    }
+    if (r->cloud_saved_bytes > 0) {
+        format_size(r->cloud_saved_bytes, a, 32);
+        APPEND(L" · 클라우드 전용 -%ls(%llu개)", a, (unsigned long long)r->cloud_files);
+    }
+    if (r->other_saved_bytes > 0) {
+        format_size(r->other_saved_bytes, a, 32);
+        APPEND(L" · 기타 -%ls(%llu개)", a, (unsigned long long)r->other_saved_files);
+    }
+    APPEND(L"   |   ");
+    if (g_app.has_diff) {
+        FILETIME utc, local;
+        SYSTEMTIME st;
+        utc.dwLowDateTime = (DWORD)(g_app.diff.old_time & 0xFFFFFFFFu);
+        utc.dwHighDateTime = (DWORD)(g_app.diff.old_time >> 32);
+        if (!FileTimeToLocalFileTime(&utc, &local) || !FileTimeToSystemTime(&local, &st)) {
+            memset(&st, 0, sizeof(st));
+        }
+        format_delta((int64_t)(g_app.diff.new_total - g_app.diff.old_total), a, 32);
+        format_size(g_app.diff.old_total, b, 32);
+        format_size(g_app.diff.new_total, c, 32);
+        APPEND(L"직전 스캔(%02u-%02u %02u:%02u) 대비 %ls(%ls → %ls) · 늘어남 %u · 줄어듦 %u · "
+               L"새 폴더 %u · 삭제 %u",
+               (unsigned)st.wMonth, (unsigned)st.wDay, (unsigned)st.wHour, (unsigned)st.wMinute,
+               a, b, c, (unsigned)g_app.diff.grown, (unsigned)g_app.diff.shrunk,
+               (unsigned)g_app.diff.added, (unsigned)g_app.diff.removed);
+    }
+    switch (g_app.history) {
+    case HIST_BASELINE:
+        APPEND(L"첫 스캔: 기준으로 저장했습니다(다음 스캔부터 변화를 비교)");
+        break;
+    case HIST_CANCELLED:
+        APPEND(L"%ls취소되어 기록하지 않았습니다", g_app.has_diff ? L" · " : L"");
+        break;
+    case HIST_FAILED:
+        APPEND(L"%ls변화 기록을 저장하지 못했습니다(오류 %lu)", g_app.has_diff ? L" · " : L"",
+               g_app.history_error);
+        break;
+    default:
+        break;
+    }
+#undef APPEND
+    SetWindowTextW(g_app.analysis, text);
+}
+
+/*
+ * 직전 스냅숏과 비교하고, 취소되지 않았으면 새 스냅숏을 저장한다.
+ * 기록 위치: BYTESIEVE_HISTORY_DIR 또는 %LOCALAPPDATA%\ByteSieve\history.
+ */
+static void track_history(void)
+{
+    wchar_t dir[MAX_PATH * 2], *file;
+    HistorySnapshot prev, cur;
+    size_t i;
+
+    g_app.history = HIST_NONE;
+    g_app.history_error = 0;
+    if (g_app.model.status == SCAN_FATAL || g_app.model.len == 0) {
+        return;
+    }
+    history_snapshot_init(&prev);
+    history_snapshot_init(&cur);
+    if (history_default_dir(dir, sizeof(dir) / sizeof(dir[0])) != 0 ||
+        (file = history_file_for(dir, g_app.model.nodes[0].name)) == NULL) {
+        g_app.history = HIST_FAILED;
+        g_app.history_error = ERROR_PATH_NOT_FOUND;
+        return;
+    }
+    if (history_snapshot_from_model(&cur, &g_app.model) != 0) {
+        g_app.history = HIST_FAILED;
+        g_app.history_error = ERROR_NOT_ENOUGH_MEMORY;
+        free(file);
+        return;
+    }
+    if (history_load(&prev, file) == 0 && history_diff(&prev, &cur, &g_app.diff) == 0) {
+        g_app.has_diff = 1;
+        g_app.change_of_node = malloc(g_app.model.len * sizeof(*g_app.change_of_node));
+        if (g_app.change_of_node != NULL) {
+            for (i = 0; i < g_app.model.len; i++) {
+                g_app.change_of_node[i] = SCAN_NODE_NONE;
+            }
+            for (i = 0; i < g_app.diff.len; i++) {
+                if (g_app.diff.items[i].node < g_app.model.len) {
+                    g_app.change_of_node[g_app.diff.items[i].node] = i;
+                }
+            }
+        }
+    }
+    if (g_app.model.report.cancelled) {
+        g_app.history = HIST_CANCELLED;
+    } else if (history_ensure_dir(dir) != 0 ||
+               history_save(&cur, file, &g_app.history_error) != 0) {
+        g_app.history = HIST_FAILED;
+        if (g_app.history_error == 0) {
+            g_app.history_error = GetLastError();
+        }
+    } else {
+        g_app.history = g_app.has_diff ? HIST_COMPARED : HIST_BASELINE;
+    }
+    free(file);
+    history_snapshot_free(&prev);
+    history_snapshot_free(&cur);
 }
 
 static void clear_results(void)
@@ -349,6 +597,12 @@ static void clear_results(void)
     ListView_DeleteAllItems(g_app.list);
     scan_model_free(&g_app.model);
     g_app.has_model = 0;
+    history_diff_free(&g_app.diff);
+    g_app.has_diff = 0;
+    free(g_app.change_of_node);
+    g_app.change_of_node = NULL;
+    g_app.history = HIST_NONE;
+    SetWindowTextW(g_app.analysis, L"");
 }
 
 static void show_results(void)
@@ -548,6 +802,8 @@ static void finish_scan(void)
     }
     set_status(text);
     set_scanning(0);
+    track_history();
+    update_analysis();
     show_results();
 }
 
@@ -597,6 +853,72 @@ static int count_tree_children(HTREEITEM item)
         }                                                                    \
     } while (0)
 
+/* 보기 콤보 상자: 디스크 사용 순위·변화 순위 목록이 모델·비교 결과와 맞는지. 실패 수. */
+static int verify_views(void)
+{
+    int failures = 0, rows;
+    size_t top, i, expect;
+    LVITEMW lv;
+    wchar_t cell[96], want[96];
+
+    SELF_CHECK(current_view() == VIEW_SIZE);
+
+    SendMessageW(g_app.view, CB_SETCURSEL, VIEW_ALLOC, 0);
+    fill_rank();
+    rows = ListView_GetItemCount(g_app.list);
+    expect = g_app.model.len > 0 ? g_app.model.len - 1 : 0;
+    SELF_CHECK(rows == (int)(expect < RANK_COUNT ? expect : RANK_COUNT));
+    if (rows > 0) {
+        memset(&lv, 0, sizeof(lv));
+        lv.mask = LVIF_PARAM;
+        lv.iItem = 0;
+        SendMessageW(g_app.list, LVM_GETITEMW, 0, (LPARAM)&lv);
+        SELF_CHECK(scan_model_rank(&g_app.model, SCAN_RANK_TOTAL_ALLOC, &top, 1) == 1 &&
+                   (size_t)lv.lParam == top);
+    }
+
+    SendMessageW(g_app.view, CB_SETCURSEL, VIEW_CHANGE, 0);
+    fill_rank();
+    rows = ListView_GetItemCount(g_app.list);
+    expect = g_app.has_diff ? (g_app.diff.len < RANK_COUNT ? g_app.diff.len : RANK_COUNT) : 0;
+    SELF_CHECK(rows == (int)expect);
+    for (i = 0; i < expect && (int)i < rows; i++) {
+        const HistoryChange *c = &g_app.diff.items[i];
+        memset(&lv, 0, sizeof(lv));
+        lv.mask = LVIF_PARAM;
+        lv.iItem = (int)i;
+        SendMessageW(g_app.list, LVM_GETITEMW, 0, (LPARAM)&lv);
+        SELF_CHECK((size_t)lv.lParam == c->node);
+        ListView_GetItemText(g_app.list, (int)i, COL_CHANGE, cell, 96);
+        change_text(c, want, 96);
+        SELF_CHECK(wcscmp(cell, want) == 0);
+        if (c->node != SCAN_NODE_NONE) {
+            SELF_CHECK(g_app.change_of_node == NULL || g_app.change_of_node[c->node] == i);
+        }
+    }
+
+    SendMessageW(g_app.view, CB_SETCURSEL, VIEW_SIZE, 0);
+    fill_rank();
+    return failures;
+}
+
+/* --self-test-changes: 변화 목록을 stdout 에 쓴다(검사 스크립트가 확인). */
+static void print_changes(void)
+{
+    size_t i;
+    wchar_t delta[48];
+
+    for (i = 0; i < g_app.diff.len; i++) {
+        const HistoryChange *c = &g_app.diff.items[i];
+        format_delta(c->delta, delta, 48);
+        wprintf(L"change: %ls %ls %ls\n", history_kind_name(c->kind), delta, c->rel);
+    }
+    wprintf(L"changes: grown %u shrunk %u added %u removed %u\n", (unsigned)g_app.diff.grown,
+            (unsigned)g_app.diff.shrunk, (unsigned)g_app.diff.added,
+            (unsigned)g_app.diff.removed);
+    fflush(stdout);
+}
+
 /* 스캔이 끝난 뒤 화면 상태가 모델과 맞는지 확인하고 종료 코드를 정한다. */
 static int verify_screen(void)
 {
@@ -642,11 +964,37 @@ static int verify_screen(void)
         SELF_CHECK(tree_item_index(TreeView_GetSelection(g_app.tree)) == (size_t)lv.lParam);
     }
 
-    if (g_app.self_test == SELF_TEST_SCAN) {
+    if (rows > 0) {
+        /* 디스크 사용 열 */
+        wchar_t cell[64], expect[64];
+        LVITEMW lv;
+        memset(&lv, 0, sizeof(lv));
+        lv.mask = LVIF_PARAM;
+        lv.iItem = 0;
+        SendMessageW(g_app.list, LVM_GETITEMW, 0, (LPARAM)&lv);
+        ListView_GetItemText(g_app.list, 0, COL_ALLOC, cell, 64);
+        format_size(g_app.model.nodes[(size_t)lv.lParam].total_alloc, expect, 64);
+        SELF_CHECK(wcscmp(cell, expect) == 0);
+    }
+    failures += verify_views();
+
+    if (g_app.self_test == SELF_TEST_SCAN || g_app.self_test == SELF_TEST_CHANGES) {
+        wchar_t text[512];
         SELF_CHECK(g_app.model.report.cancelled == 0);
         SELF_CHECK(g_app.model.status != SCAN_FATAL);
         SELF_CHECK(pos == PROGRESS_RANGE);
+        /* 직전 스냅숏이 없으면 기준으로, 있으면 비교한 뒤 저장한다. */
+        SELF_CHECK(g_app.history == HIST_BASELINE || g_app.history == HIST_COMPARED);
+        SELF_CHECK((g_app.history == HIST_COMPARED) == (g_app.has_diff != 0));
+        GetWindowTextW(g_app.analysis, text, 512);
+        SELF_CHECK(wcsstr(text, L"디스크 사용 ") == text);
+        SELF_CHECK(wcsstr(text, g_app.has_diff ? L"직전 스캔(" : L"첫 스캔") != NULL);
+        if (g_app.self_test == SELF_TEST_CHANGES) {
+            SELF_CHECK(g_app.has_diff);
+            print_changes();
+        }
     } else if (g_app.model.report.cancelled) {
+        SELF_CHECK(g_app.history == HIST_CANCELLED);
         size_t i;
         /* 취소 직후라면 열거하지 못한 폴더가 남는다. */
         SELF_CHECK(g_app.model.status == SCAN_PARTIAL);
@@ -725,10 +1073,12 @@ static void create_controls(void)
         int fmt;
     } cols[COL_COUNT] = {
         {L"순위", 48, LVCFMT_RIGHT},
-        {L"폴더", 360, LVCFMT_LEFT},
-        {L"용량", 90, LVCFMT_RIGHT},
-        {L"파일 수", 80, LVCFMT_RIGHT},
-        {L"비율", 64, LVCFMT_RIGHT},
+        {L"폴더", 220, LVCFMT_LEFT},
+        {L"용량", 80, LVCFMT_RIGHT},
+        {L"변화", 110, LVCFMT_RIGHT},
+        {L"디스크 사용", 84, LVCFMT_RIGHT},
+        {L"파일 수", 64, LVCFMT_RIGHT},
+        {L"비율", 56, LVCFMT_RIGHT},
     };
     NONCLIENTMETRICSW ncm;
     int i;
@@ -762,6 +1112,19 @@ static void create_controls(void)
     g_app.progress = make_child(PROGRESS_CLASSW, L"", PBS_SMOOTH, 0, IDC_PROGRESS);
     g_app.status = make_child(L"STATIC", L"폴더를 선택하고 [스캔]을 누르세요.",
                               SS_LEFTNOWORDWRAP | SS_PATHELLIPSIS, 0, IDC_STATUS);
+    g_app.analysis = make_child(L"STATIC", L"", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 0,
+                                IDC_ANALYSIS);
+    g_app.view = make_child(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0,
+                            IDC_VIEW);
+    {
+        static const wchar_t *const views[VIEW_COUNT] = {L"용량 순위", L"디스크 사용 순위",
+                                                         L"변화 순위(직전 스캔 대비)"};
+        int v;
+        for (v = 0; v < VIEW_COUNT; v++) {
+            SendMessageW(g_app.view, CB_ADDSTRING, 0, (LPARAM)views[v]);
+        }
+        SendMessageW(g_app.view, CB_SETCURSEL, VIEW_SIZE, 0);
+    }
     g_app.tree = make_child(WC_TREEVIEWW, L"",
                             TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT |
                                 TVS_SHOWSELALWAYS | WS_TABSTOP,
@@ -814,7 +1177,9 @@ static LRESULT on_notify(NMHDR *hdr)
             lv.mask = LVIF_PARAM;
             lv.iItem = row;
             SendMessageW(g_app.list, LVM_GETITEMW, 0, (LPARAM)&lv);
-            reveal_in_tree((size_t)lv.lParam);
+            if ((size_t)lv.lParam < g_app.model.len) {
+                reveal_in_tree((size_t)lv.lParam);
+            }
         }
         return 0;
     }
@@ -850,6 +1215,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case IDC_CANCEL:
             cancel_scan();
+            return 0;
+        case IDC_VIEW:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                fill_rank();
+            }
             return 0;
         case IDC_DRIVES:
             if (HIWORD(wp) == DPN_REFRESHED && g_app.self_test == SELF_TEST_DRIVES) {
@@ -945,6 +1315,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  *   bytesieve-gui --self-test-trash <dir>          탐지 후 옮길 수 있는 항목을 모두 휴지통으로
  *                                                  옮기고(확인 창 없음) 결과 화면을 검증하고 종료
  *   bytesieve-gui --self-test-monitor     시스템 탭에서 RAM·CPU 를 몇 번 측정한 뒤 화면을 검증하고 종료
+ *   bytesieve-gui --self-test-changes <dir> 스캔 후 직전 스냅숏과 비교한 변화 보기를 검증하고
+ *                                          변화 목록을 stdout 에 쓴 뒤 종료(직전 스냅숏 필요)
  */
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
@@ -963,6 +1335,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test") == 0) {
         g_app.self_test = SELF_TEST_SCAN;
+        target = argv[2];
+    } else if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test-changes") == 0) {
+        g_app.self_test = SELF_TEST_CHANGES;
         target = argv[2];
     } else if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test-cancel") == 0) {
         g_app.self_test = SELF_TEST_CANCEL;

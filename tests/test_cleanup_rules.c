@@ -80,6 +80,80 @@ static void test_markers(void)
     CHECK(!cleanup_is_project_marker(NULL));
 }
 
+static void test_dir_rules(void)
+{
+    CleanupDirRule rule;
+
+    /* 이름만으로 환경이 정해지는 폴더 */
+    CHECK(cleanup_dir_rule(L"node_modules", &rule) && rule.eco == CLEANUP_ECO_NODE &&
+          rule.require == 0);
+    CHECK(cleanup_dir_rule(L".Next", &rule) && rule.category == CLEANUP_CACHE &&
+          rule.eco == CLEANUP_ECO_NODE);
+    CHECK(cleanup_dir_rule(L".svelte-kit", &rule) && rule.eco == CLEANUP_ECO_NODE);
+    CHECK(cleanup_dir_rule(L"__pycache__", &rule) && rule.category == CLEANUP_CACHE &&
+          rule.eco == CLEANUP_ECO_PYTHON && rule.require == 0);
+    CHECK(cleanup_dir_rule(L".pytest_cache", &rule) && rule.eco == CLEANUP_ECO_PYTHON);
+    CHECK(cleanup_dir_rule(L".tox", &rule) && rule.eco == CLEANUP_ECO_PYTHON);
+    CHECK(cleanup_dir_rule(L"cmake-build-debug", &rule) && rule.category == CLEANUP_BUILD &&
+          rule.eco == CLEANUP_ECO_CPP);
+    CHECK(cleanup_dir_rule(L"CMake-Build-Release", &rule) && rule.eco == CLEANUP_ECO_CPP);
+    CHECK(!cleanup_dir_rule(L"cmake-build-", &rule)); /* 접두사만 */
+
+    /* 표시 파일이 있어야만 후보인 폴더 */
+    CHECK(cleanup_dir_rule(L"target", &rule) && rule.category == CLEANUP_BUILD &&
+          rule.require == (CLEANUP_ECO_BIT(CLEANUP_ECO_RUST) | CLEANUP_ECO_BIT(CLEANUP_ECO_JAVA)));
+    CHECK(cleanup_dir_rule(L"bin", &rule) && rule.require == CLEANUP_ECO_BIT(CLEANUP_ECO_DOTNET));
+    CHECK(cleanup_dir_rule(L"OBJ", &rule) && rule.eco == CLEANUP_ECO_DOTNET);
+    CHECK(cleanup_dir_rule(L".vs", &rule) && rule.category == CLEANUP_CACHE &&
+          rule.require == CLEANUP_ECO_BIT(CLEANUP_ECO_DOTNET));
+    CHECK(cleanup_dir_rule(L".gradle", &rule) && rule.eco == CLEANUP_ECO_JAVA &&
+          rule.require == CLEANUP_ECO_BIT(CLEANUP_ECO_JAVA));
+    CHECK(cleanup_classify_dir(L"target") == CLEANUP_BUILD);
+
+    /* 표시 파일로 환경 고르기 */
+    CHECK(cleanup_dir_rule(L"build", &rule));
+    CHECK(cleanup_resolve_eco(&rule, 0) == CLEANUP_ECO_GENERIC);
+    CHECK(cleanup_resolve_eco(&rule, CLEANUP_ECO_BIT(CLEANUP_ECO_NODE)) == CLEANUP_ECO_NODE);
+    /* build 는 Gradle 이 C/C++·Node.js 보다 앞선다. */
+    CHECK(cleanup_resolve_eco(&rule, CLEANUP_ECO_BIT(CLEANUP_ECO_NODE) |
+                                         CLEANUP_ECO_BIT(CLEANUP_ECO_JAVA)) == CLEANUP_ECO_JAVA);
+    CHECK(cleanup_resolve_eco(&rule, CLEANUP_ECO_BIT(CLEANUP_ECO_CPP) |
+                                         CLEANUP_ECO_BIT(CLEANUP_ECO_NODE)) == CLEANUP_ECO_CPP);
+    /* 고를 수 있는 환경이 아니면 일반 */
+    CHECK(cleanup_resolve_eco(&rule, CLEANUP_ECO_BIT(CLEANUP_ECO_RUST)) == CLEANUP_ECO_GENERIC);
+    CHECK(cleanup_dir_rule(L"dist", &rule));
+    CHECK(cleanup_resolve_eco(&rule, CLEANUP_ECO_BIT(CLEANUP_ECO_PYTHON)) == CLEANUP_ECO_PYTHON);
+    CHECK(cleanup_dir_rule(L"target", &rule));
+    CHECK(cleanup_resolve_eco(&rule, CLEANUP_ECO_BIT(CLEANUP_ECO_JAVA)) == CLEANUP_ECO_JAVA);
+    CHECK(cleanup_resolve_eco(&rule, CLEANUP_ECO_BIT(CLEANUP_ECO_RUST) |
+                                         CLEANUP_ECO_BIT(CLEANUP_ECO_JAVA)) == CLEANUP_ECO_RUST);
+    /* 이름으로 정해진 환경은 표시 파일과 상관없다. */
+    CHECK(cleanup_dir_rule(L"node_modules", &rule));
+    CHECK(cleanup_resolve_eco(&rule, CLEANUP_ECO_BIT(CLEANUP_ECO_PYTHON)) == CLEANUP_ECO_NODE);
+    CHECK(cleanup_resolve_eco(NULL, 0) == CLEANUP_ECO_GENERIC);
+
+    /* 표시 파일 → 환경 */
+    CHECK(cleanup_marker_ecos(L"package.json") == CLEANUP_ECO_BIT(CLEANUP_ECO_NODE));
+    CHECK(cleanup_marker_ecos(L"requirements.txt") == CLEANUP_ECO_BIT(CLEANUP_ECO_PYTHON));
+    CHECK(cleanup_marker_ecos(L"PYPROJECT.TOML") == CLEANUP_ECO_BIT(CLEANUP_ECO_PYTHON));
+    CHECK(cleanup_marker_ecos(L"Cargo.toml") == CLEANUP_ECO_BIT(CLEANUP_ECO_RUST));
+    CHECK(cleanup_marker_ecos(L"pom.xml") == CLEANUP_ECO_BIT(CLEANUP_ECO_JAVA));
+    CHECK(cleanup_marker_ecos(L"settings.gradle.kts") == CLEANUP_ECO_BIT(CLEANUP_ECO_JAVA));
+    CHECK(cleanup_marker_ecos(L"App.fsproj") == CLEANUP_ECO_BIT(CLEANUP_ECO_DOTNET));
+    CHECK(cleanup_marker_ecos(L"x.sln") == CLEANUP_ECO_BIT(CLEANUP_ECO_DOTNET));
+    CHECK(cleanup_marker_ecos(L".sln") == 0);
+    CHECK(cleanup_marker_ecos(L"Makefile") == CLEANUP_ECO_BIT(CLEANUP_ECO_CPP));
+    CHECK(cleanup_marker_ecos(L"go.mod") == CLEANUP_ECO_BIT(CLEANUP_ECO_GO));
+    CHECK(cleanup_marker_ecos(L"go.sum") == 0);
+    CHECK(cleanup_marker_ecos(NULL) == 0);
+    CHECK(cleanup_is_project_marker(L"setup.py"));
+
+    CHECK(wcscmp(cleanup_eco_name(CLEANUP_ECO_PYTHON), L"python") == 0);
+    CHECK(wcscmp(cleanup_eco_name(CLEANUP_ECO_DOTNET), L"dotnet") == 0);
+    CHECK(wcscmp(cleanup_eco_name(CLEANUP_ECO_GENERIC), L"generic") == 0);
+    CHECK(CLEANUP_ECO_MASK_ALL == 0xFFu);
+}
+
 static void test_names(void)
 {
     CHECK(wcscmp(cleanup_category_name(CLEANUP_NODE_MODULES), L"node_modules") == 0);
@@ -164,6 +238,7 @@ int main(void)
     test_classify_dir();
     test_classify_file();
     test_markers();
+    test_dir_rules();
     test_names();
     test_protect_match();
     test_protect_contains();

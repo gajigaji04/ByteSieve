@@ -30,7 +30,7 @@ enum {
 };
 
 typedef struct {
-    wchar_t *name;   /* 루트는 표시용 전체 경로, 나머지는 폴더 이름 */
+    wchar_t *name;   /* 루트는 표시용 전체 경로, 나머지는 폴더 이름(모델이 소유, 읽기 전용) */
     size_t parent;   /* 루트는 SCAN_NODE_NONE */
     size_t first_child;
     size_t last_child;
@@ -44,6 +44,8 @@ typedef struct {
     uint64_t total_files; /* 하위 트리 전체(자신 포함) */
     uint64_t total_dirs;  /* 하위 폴더 수(자신 제외) */
     uint64_t total_bytes;
+    uint64_t own_alloc;   /* 바로 아래 파일의 디스크 할당 크기(ScanEntry.alloc_size 합) */
+    uint64_t total_alloc; /* 하위 트리 전체의 디스크 할당 크기 */
 } ScanNode;
 
 /* 진행률 스냅샷(콜백 호출 동안만 유효). 전체 양은 미리 알 수 없으므로 비율은 추정치다. */
@@ -65,10 +67,14 @@ typedef void (*scan_progress_fn)(const ScanProgress *progress, void *ctx);
 /* 0 이 아니면 스캔을 멈춘다. 스캔 스레드에서 호출되므로 다른 스레드가 세운 플래그를 읽으면 된다. */
 typedef int (*scan_cancel_fn)(void *ctx);
 
+/* 폴더 이름 저장소(내부용). 이름을 노드마다 따로 할당하지 않고 큰 덩어리에 이어 담는다. */
+typedef struct ScanNameChunk ScanNameChunk;
+
 typedef struct {
     ScanNode *nodes;
     size_t len;
     size_t cap;
+    ScanNameChunk *names; /* 내부용 */
     ScanReport report; /* 전체 집계·오류(scanner 와 같은 의미) */
     ScanStatus status;
     uint32_t max_depth;
@@ -121,7 +127,8 @@ wchar_t *scan_model_path(const ScanModel *model, size_t index);
 
 typedef enum {
     SCAN_RANK_TOTAL_BYTES = 0, /* 하위 트리 포함 용량 */
-    SCAN_RANK_OWN_BYTES        /* 폴더 바로 아래 파일 용량 */
+    SCAN_RANK_OWN_BYTES,       /* 폴더 바로 아래 파일 용량 */
+    SCAN_RANK_TOTAL_ALLOC      /* 하위 트리 포함 디스크 할당 크기 */
 } ScanRankKey;
 
 /*

@@ -329,9 +329,136 @@ static void test_print_fatal(void)
     CHECK_HAS(err, "error: C:\\x\\locked: access_denied (Windows error 5)\n");
 }
 
+static void test_parse_track_threads(void)
+{
+    CliOptions o;
+    wchar_t err[256];
+
+    {
+        wchar_t *a[] = {L"disk-scanner", L"x"};
+        CHECK(parse(ARGC(a), a, &o, err) == CLI_PARSE_OK);
+        CHECK(o.track == 0 && o.history_dir == NULL && o.threads == -1);
+    }
+    {
+        wchar_t *a[] = {L"disk-scanner", L"--track", L"x", L"--history-dir", L"C:\\h",
+                        L"--threads=4"};
+        CHECK(parse(ARGC(a), a, &o, err) == CLI_PARSE_OK);
+        CHECK(o.track == 1 && o.threads == 4);
+        CHECK_WSTR(o.history_dir, L"C:\\h");
+        CHECK_WSTR(o.target, L"x");
+    }
+    {
+        wchar_t *a[] = {L"disk-scanner", L"--threads", L"0", L"--history-dir=D:\\hist",
+                        L"--track", L"--jsonl", L"x"};
+        CHECK(parse(ARGC(a), a, &o, err) == CLI_PARSE_OK);
+        CHECK(o.threads == 0 && o.track && o.jsonl);
+        CHECK_WSTR(o.history_dir, L"D:\\hist");
+    }
+    {
+        wchar_t *a[] = {L"disk-scanner", L"--track", L"--track", L"x"};
+        check_error(ARGC(a), a, L"--track given more than once");
+    }
+    {
+        wchar_t *a[] = {L"disk-scanner", L"--history-dir", L"C:\\h", L"x"};
+        check_error(ARGC(a), a, L"--history-dir requires --track");
+    }
+    {
+        wchar_t *a[] = {L"disk-scanner", L"--track", L"x", L"--history-dir"};
+        check_error(ARGC(a), a, L"--history-dir requires a value");
+    }
+    {
+        wchar_t *a[] = {L"disk-scanner", L"--track", L"--history-dir=", L"x"};
+        check_error(ARGC(a), a, L"--history-dir must not be empty");
+    }
+    {
+        wchar_t *a[] = {L"disk-scanner", L"--threads", L"9", L"x"};
+        check_error(ARGC(a), a, L"invalid --threads value: '9'");
+    }
+    {
+        wchar_t *a[] = {L"disk-scanner", L"--threads=-1", L"x"};
+        check_error(ARGC(a), a, L"invalid --threads value");
+    }
+    {
+        wchar_t *a[] = {L"disk-scanner", L"--threads=1", L"--threads=2", L"x"};
+        check_error(ARGC(a), a, L"--threads given more than once");
+    }
+}
+
+static void test_print_disk_usage(void)
+{
+    ScanReport r;
+    char out[4096], err[2048];
+
+    make_report(&r, 0, 0);
+    r.alloc_bytes = 1536;
+    render(&r, SCAN_COMPLETE, SCAN_DEPTH_UNLIMITED, out, sizeof(out), err, sizeof(err));
+    CHECK_HAS(out, "Total size:     1.50 KiB (1536 bytes)\nOn disk:        1.50 KiB (1536 bytes)\n");
+    /* 원인이 없으면 세부 줄을 쓰지 않는다. */
+    CHECK(strstr(out, "Slack:") == NULL && strstr(out, "Compressed:") == NULL);
+
+    r.alloc_bytes = 8192;
+    r.slack_bytes = 8192 - 1536 + 2048;
+    r.cluster_bytes = 4096;
+    r.compressed_saved_bytes = 2048;
+    r.compressed_files = 1;
+    r.cloud_saved_bytes = 5000;
+    r.cloud_files = 2;
+    r.alloc_unknown_files = 3;
+    render(&r, SCAN_COMPLETE, SCAN_DEPTH_UNLIMITED, out, sizeof(out), err, sizeof(err));
+    CHECK_HAS(out, "On disk:        8.00 KiB (8192 bytes)\n");
+    CHECK_HAS(out, "  Slack:        +8.50 KiB (8704 bytes) (cluster size 4.00 KiB)\n");
+    CHECK_HAS(out, "  Compressed:   -2.00 KiB (2048 bytes) in 1 file(s)\n");
+    CHECK_HAS(out, "  Cloud-only:   -4.88 KiB (5000 bytes) in 2 file(s) (not stored locally)\n");
+    CHECK_HAS(out, "  Unknown:      3 file(s)");
+    CHECK(strstr(out, "Sparse:") == NULL && strstr(out, "Other:") == NULL);
+}
+
+static void test_print_changes(void)
+{
+    HistoryDiff d;
+    HistoryChange items[2];
+    FILE *f = tmpfile();
+    char out[4096];
+
+    CHECK(f != NULL);
+    if (f == NULL) {
+        return;
+    }
+    history_diff_init(&d);
+    memset(items, 0, sizeof(items));
+    items[0].rel = L"proj\\node_modules";
+    items[0].kind = HISTORY_GROWN;
+    items[0].delta = 1024 * 1024;
+    items[1].rel = L"old";
+    items[1].kind = HISTORY_REMOVED;
+    items[1].delta = -300;
+    items[1].uncertain = 1;
+    d.items = items;
+    d.len = 2;
+    d.grown = 1;
+    d.removed = 1;
+    d.old_total = 1000;
+    d.new_total = 1000 + 1024 * 1024 - 300;
+    /* 2026-01-02 03:04 UTC 근처(지역 시각으로 바뀌므로 날짜 형식만 본다) */
+    d.old_time = 134116730400000000ULL;
+    cli_print_changes(f, &d, 1);
+    read_back(f, out, sizeof(out));
+    fclose(f);
+    CHECK_HAS(out, "Changes since 20");
+    CHECK_HAS(out, ": +1023.7 KiB (1000 B -> 1.00 MiB)\n");
+    CHECK_HAS(out, "  grown 1, shrunk 0, added 0, removed 1\n");
+    CHECK_HAS(out, "    +1.00 MiB  grown    proj\\node_modules\n");
+    /* limit 1: 나머지는 한 줄로 */
+    CHECK(strstr(out, "removed  old") == NULL);
+    CHECK_HAS(out, "  ... and 1 more folder(s)\n");
+}
+
 int main(void)
 {
     test_parse_ok();
+    test_parse_track_threads();
+    test_print_disk_usage();
+    test_print_changes();
     test_parse_help();
     test_parse_errors();
     test_exit_code();

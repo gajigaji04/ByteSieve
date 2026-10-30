@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <wchar.h>
 
+#include "scan_history.h"
 #include "scanner.h"
 
 enum {
@@ -17,6 +18,9 @@ enum {
 /* 오류 요약에서 개별 오류를 이만큼만 나열한다. */
 #define CLI_MAX_LISTED_ERRORS 20
 
+/* --track 변화 목록에서 폴더를 이만큼만 나열한다. */
+#define CLI_MAX_LISTED_CHANGES 20
+
 typedef enum {
     CLI_PARSE_OK = 0,
     CLI_PARSE_HELP,
@@ -27,6 +31,9 @@ typedef struct {
     const wchar_t *target; /* argv 안의 문자열(복사하지 않음) */
     uint32_t max_depth;
     int jsonl;             /* --jsonl: stdout 에 JSON Lines 이벤트 출력 */
+    int track;             /* --track: 직전 스캔과 폴더별 용량을 비교하고 스냅숏 저장 */
+    const wchar_t *history_dir; /* --history-dir: 스냅숏 폴더(NULL 이면 기본 위치) */
+    int threads;           /* --threads: 폴더 열거 작업 스레드 수(-1 이면 지정 안 함) */
 } CliOptions;
 
 /*
@@ -34,6 +41,9 @@ typedef struct {
  *   -h, --help                 도움말(다른 인자보다 우선)
  *   --max-depth N, --max-depth=N
  *   --jsonl
+ *   --track
+ *   --history-dir DIR, --history-dir=DIR
+ *   --threads N, --threads=N   (0~SCAN_MAX_THREADS)
  *   --                         이후 인자는 모두 대상으로 취급
  * CLI_PARSE_ERROR 이면 err 에 사람이 읽을 메시지를 쓴다.
  */
@@ -50,9 +60,12 @@ void cli_count_error_kinds(const ScanReport *report, uint64_t *counts);
 
 void cli_print_usage(FILE *out);
 
-/* 집계·상태·오류 요약을 out 에, 개별 오류 목록을 err 에 쓴다. */
+/* 집계·디스크 사용량·상태·오류 요약을 out 에, 개별 오류 목록을 err 에 쓴다. */
 void cli_print_report(FILE *out, FILE *err, const wchar_t *target,
                       uint32_t max_depth, const ScanReport *report,
                       ScanStatus status);
+
+/* 직전 스캔 대비 변화를 쓴다(폴더는 최대 limit 개). */
+void cli_print_changes(FILE *out, const HistoryDiff *diff, size_t limit);
 
 #endif /* BYTESIEVE_CLI_H */
