@@ -172,7 +172,9 @@ static int setup_fixture(void)
      *   a.txt          5 B
      *   한글.bin        0 B
      *   big.dat        5 GiB + 3 B (희소)
-     *   sub\inner.txt  (비재귀이므로 집계 제외)
+     *   sub\inner.txt          7 B (깊이 1)
+     *   sub\d1\mid.txt         2 B (깊이 2)
+     *   sub\d1\d2\leaf.txt     3 B (깊이 3)
      *   link\  -> sub  (정션, 하위 탐색 제외)
      *   denied\        (접근 거부)
      */
@@ -181,6 +183,10 @@ static int setup_fixture(void)
            make_sparse_file(L"big.dat", BIG_SIZE) &&
            make_dir(L"sub") &&
            write_file(L"sub\\inner.txt", "ignored", 7) &&
+           make_dir(L"sub\\d1") &&
+           write_file(L"sub\\d1\\mid.txt", "ab", 2) &&
+           make_dir(L"sub\\d1\\d2") &&
+           write_file(L"sub\\d1\\d2\\leaf.txt", "xyz", 3) &&
            make_junction(L"link", L"sub") &&
            make_dir(L"denied") &&
            set_deny_all(L"denied", 1);
@@ -313,6 +319,151 @@ static void test_invalid_targets(void)
     free(sub);
 }
 
+static void test_tree_unlimited(void)
+{
+    ScanReport r;
+    VisitLog log = {0};
+
+    /* denied 는 열지 못해 부분 성공, link 는 따라가지 않아 inner.txt 는 한 번만. */
+    scan_report_init(&r);
+    CHECK(scan_tree(g_root, SCAN_DEPTH_UNLIMITED, &r, visit, &log) == SCAN_PARTIAL);
+    CHECK_U64(r.file_count, 6);
+    CHECK_U64(r.dir_count, 5);
+    CHECK_U64(r.total_bytes, 5 + 0 + BIG_SIZE + 7 + 2 + 3);
+    CHECK_U64(r.reparse_count, 1);
+    CHECK_U64(r.error_count, 1);
+    if (r.errors_len == 1) {
+        wchar_t *denied = fixture(L"denied");
+        CHECK(r.errors[0].code == ERROR_ACCESS_DENIED);
+        CHECK(r.errors[0].path != NULL && wcscmp(r.errors[0].path, denied) == 0);
+        free(denied);
+    }
+    CHECK(log.seen_sub == 1 && log.seen_link == 1 && log.seen_inner == 1);
+    CHECK(log.seen_dot == 0);
+    scan_report_free(&r);
+}
+
+static void test_tree_max_depth(void)
+{
+    static const struct {
+        uint32_t depth;
+        unsigned long long files, dirs, bytes;
+    } cases[] = {
+        {0, 3, 3, 5 + BIG_SIZE},
+        {1, 4, 4, 5 + BIG_SIZE + 7},
+        {2, 5, 5, 5 + BIG_SIZE + 7 + 2},
+        {3, 6, 5, 5 + BIG_SIZE + 7 + 2 + 3},
+        {100, 6, 5, 5 + BIG_SIZE + 7 + 2 + 3},
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ScanReport r;
+        ScanStatus st;
+
+        scan_report_init(&r);
+        st = scan_tree(g_root, cases[i].depth, &r, NULL, NULL);
+        /* 깊이 0 에서는 denied 를 열지 않으므로 오류가 없다. */
+        CHECK(st == (cases[i].depth == 0 ? SCAN_COMPLETE : SCAN_PARTIAL));
+        CHECK_U64(r.file_count, cases[i].files);
+        CHECK_U64(r.dir_count, cases[i].dirs);
+        CHECK_U64(r.total_bytes, cases[i].bytes);
+        scan_report_free(&r);
+    }
+
+    /* 오류 없는 하위 트리는 SCAN_COMPLETE. */
+    {
+        ScanReport r;
+        wchar_t *sub = fixture(L"sub");
+
+        scan_report_init(&r);
+        CHECK(scan_tree(sub, SCAN_DEPTH_UNLIMITED, &r, NULL, NULL) == SCAN_COMPLETE);
+        CHECK_U64(r.file_count, 3);
+        CHECK_U64(r.dir_count, 2);
+        CHECK_U64(r.total_bytes, 12);
+        CHECK_U64(r.error_count, 0);
+        scan_report_free(&r);
+        free(sub);
+    }
+}
+
+static void test_tree_invalid_root(void)
+{
+    ScanReport r;
+    wchar_t *missing = fixture(L"does-not-exist");
+    wchar_t *denied = fixture(L"denied");
+
+    scan_report_init(&r);
+    CHECK(scan_tree(missing, SCAN_DEPTH_UNLIMITED, &r, NULL, NULL) == SCAN_FAILED);
+    CHECK(scan_tree(denied, SCAN_DEPTH_UNLIMITED, &r, NULL, NULL) == SCAN_FAILED);
+    CHECK(scan_tree(NULL, SCAN_DEPTH_UNLIMITED, &r, NULL, NULL) == SCAN_FAILED);
+    CHECK(scan_tree(g_root, SCAN_DEPTH_UNLIMITED, NULL, NULL, NULL) == SCAN_FAILED);
+    CHECK_U64(r.error_count, 3);
+    CHECK_U64(r.file_count, 0);
+    scan_report_free(&r);
+    free(missing);
+    free(denied);
+}
+
+/* MAX_PATH 를 넘는 깊은 체인: 동적 스택과 긴 경로로 끝까지 내려가야 한다. */
+static void test_tree_deep_chain(void)
+{
+    enum { LEVELS = 200 };
+    wchar_t base[MAX_PATH + 8];
+    wchar_t *root, *cur;
+    int i, ok = 1;
+
+    swprintf(base, sizeof(base) / sizeof(base[0]), L"%ls_deep", g_root);
+    root = path_to_extended(base);
+    CHECK(root != NULL);
+    if (root == NULL) {
+        return;
+    }
+    remove_tree(root);
+    cur = path_dup(root);
+    ok = cur != NULL && CreateDirectoryW(cur, NULL);
+    for (i = 0; ok && i < LEVELS; i++) {
+        wchar_t *next = path_join(cur, L"d");
+        free(cur);
+        cur = next;
+        ok = cur != NULL && CreateDirectoryW(cur, NULL);
+    }
+    if (ok) {
+        wchar_t *leaf = path_join(cur, L"leaf.txt");
+        HANDLE h = leaf ? CreateFileW(leaf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                      FILE_ATTRIBUTE_NORMAL, NULL)
+                        : INVALID_HANDLE_VALUE;
+        ok = h != INVALID_HANDLE_VALUE;
+        if (ok) {
+            CloseHandle(h);
+        }
+        free(leaf);
+    }
+    CHECK(ok);
+    CHECK(cur != NULL && wcslen(cur) > MAX_PATH);
+    free(cur);
+
+    if (ok) {
+        ScanReport r;
+
+        scan_report_init(&r);
+        CHECK(scan_tree(base, SCAN_DEPTH_UNLIMITED, &r, NULL, NULL) == SCAN_COMPLETE);
+        CHECK_U64(r.dir_count, LEVELS);
+        CHECK_U64(r.file_count, 1);
+        CHECK_U64(r.error_count, 0);
+        scan_report_free(&r);
+
+        scan_report_init(&r);
+        CHECK(scan_tree(base, 49, &r, NULL, NULL) == SCAN_COMPLETE);
+        CHECK_U64(r.dir_count, 50);
+        CHECK_U64(r.file_count, 0);
+        scan_report_free(&r);
+    }
+
+    remove_tree(root);
+    free(root);
+}
+
 int main(void)
 {
     test_combine_size();
@@ -326,6 +477,10 @@ int main(void)
     test_scan_fixture();
     test_access_denied_continues();
     test_invalid_targets();
+    test_tree_unlimited();
+    test_tree_max_depth();
+    test_tree_invalid_root();
+    test_tree_deep_chain();
     teardown_fixture();
 
     if (g_failures != 0) {

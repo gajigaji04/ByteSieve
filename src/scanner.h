@@ -7,7 +7,7 @@
 
 typedef enum {
     SCAN_COMPLETE = 0, /* 오류 없이 끝까지 열거했다. */
-    SCAN_PARTIAL = 1,  /* 열거 도중 오류가 있었지만 읽은 항목은 집계했다. */
+    SCAN_PARTIAL = 1,  /* 열거 도중(하위 디렉터리 포함) 오류가 있었지만 읽은 항목은 집계했다. */
     SCAN_FAILED = 2    /* 디렉터리를 열지 못했다(인자 오류 포함). */
 } ScanStatus;
 
@@ -61,5 +61,18 @@ int scan_should_descend(uint32_t attributes);
  */
 ScanStatus scan_directory(const wchar_t *dir, ScanReport *report,
                           scan_visit_fn visit, void *ctx);
+
+/* scan_tree 의 max_depth 로 깊이 제한 없음을 나타낸다. */
+#define SCAN_DEPTH_UNLIMITED UINT32_MAX
+
+/*
+ * dir 아래 모든 하위 디렉터리를 동적 스택 기반 DFS 로 탐색해 report 에 누적한다.
+ * dir 자신의 항목은 깊이 0 이며, 깊이가 max_depth 인 디렉터리까지 열거한다
+ * (max_depth 0 은 scan_directory 와 같다). 재분석 지점 디렉터리는 집계만 하고
+ * 하위로 들어가지 않는다. 하위 디렉터리를 열지 못하면 오류를 기록하고 계속하며
+ * SCAN_PARTIAL 을 반환한다. dir 자체를 열지 못하면 SCAN_FAILED.
+ */
+ScanStatus scan_tree(const wchar_t *dir, uint32_t max_depth, ScanReport *report,
+                     scan_visit_fn visit, void *ctx);
 
 #endif /* BYTESIEVE_SCANNER_H */
