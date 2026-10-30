@@ -42,6 +42,7 @@ typedef struct {
     uint64_t reparse_count; /* 하위 탐색에서 제외한 재분석 지점 디렉터리 */
     uint64_t error_count;
     uint64_t skipped_dir_count; /* 열거하지 못해 건너뛴 디렉터리(하위 트리 포함 누락) */
+    uint64_t excluded_dir_count; /* should_skip_dir 훅이 제외한 디렉터리(오류 아님) */
     int aborted;                /* SCAN_FATAL 로 중단된 스캔이 있었으면 1 */
     int cancelled;              /* should_cancel 로 도중에 멈춘 스캔이 있었으면 1(상태는 SCAN_PARTIAL) */
     ScanError *errors;
@@ -123,6 +124,10 @@ typedef struct {
  *                 호출한다. 0 이 아니면 탐색을 멈추고 SCAN_PARTIAL 을 반환하며
  *                 report->cancelled 를 1 로, 열거하지 못한 디렉터리를 skipped_dir_count 에
  *                 더한다. 다른 스레드에서 멈추게 할 때 쓴다.
+ *   should_skip_dir
+ *                 하위 탐색 대상 디렉터리마다 on_entry 보다 먼저 호출한다. parent 는 그 항목을
+ *                 담은 디렉터리. 0 이 아니면 들어가지 않고(on_entry 의 will_descend 가 0)
+ *                 report->excluded_dir_count 를 늘린다. 오류로 치지 않는다.
  * 스택에 넣지 못한 하위 디렉터리(경로 초과·메모리 부족)는 begin/end 없이 끝난다.
  */
 typedef struct {
@@ -131,6 +136,7 @@ typedef struct {
     void (*on_dir_begin)(const ScanDirInfo *dir, void *ctx);
     void (*on_dir_end)(const ScanDirInfo *dir, ScanStatus result, void *ctx);
     int (*should_cancel)(void *ctx);
+    int (*should_skip_dir)(const ScanEntry *entry, const ScanDirInfo *parent, void *ctx);
 } ScanHooks;
 
 /* 한 디렉터리 안에서 should_cancel 을 확인하는 항목 간격. */

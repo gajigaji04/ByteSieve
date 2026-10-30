@@ -655,6 +655,56 @@ static void test_status_fatal(void)
     free(too_long);
 }
 
+typedef struct {
+    int skip_calls;
+    int bad_parent;
+    int sub_will_descend;
+} SkipLog;
+
+/* sub 와 denied 는 들어가지 않는다. 부모는 항상 깊이 0 의 루트여야 한다. */
+static int skip_hook(const ScanEntry *entry, const ScanDirInfo *parent, void *ctx)
+{
+    SkipLog *log = ctx;
+
+    log->skip_calls++;
+    if (parent->depth != 0 || parent->id != 7 || !path_is_extended(parent->path)) {
+        log->bad_parent++;
+    }
+    return wcscmp(entry->name, L"sub") == 0 || wcscmp(entry->name, L"denied") == 0;
+}
+
+static uintptr_t skip_on_entry(const ScanEntry *entry, uintptr_t parent, int will_descend,
+                               void *ctx)
+{
+    SkipLog *log = ctx;
+
+    (void)parent;
+    if (wcscmp(entry->name, L"sub") == 0) {
+        log->sub_will_descend = will_descend;
+    }
+    return 0;
+}
+
+static void test_skip_dir_hook(void)
+{
+    ScanReport r;
+    ScanHooks hooks = {skip_on_entry, NULL, NULL, NULL, skip_hook};
+    SkipLog log = {0, 0, -1};
+
+    scan_report_init(&r);
+    CHECK(scan_tree_ex(g_root, SCAN_DEPTH_UNLIMITED, 7, &r, &hooks, &log) == SCAN_COMPLETE);
+    /* 정션(link)은 원래 하위 탐색 대상이 아니므로 훅을 부르지 않는다. */
+    CHECK(log.skip_calls == 2);
+    CHECK(log.bad_parent == 0);
+    CHECK(log.sub_will_descend == 0);
+    CHECK_U64(r.excluded_dir_count, 2);
+    CHECK_U64(r.file_count, 3); /* sub 아래 파일은 세지 않는다 */
+    CHECK_U64(r.dir_count, 3);
+    CHECK_U64(r.error_count, 0); /* 제외는 오류가 아니다(denied 도 열지 않음) */
+    CHECK_U64(r.skipped_dir_count, 0);
+    scan_report_free(&r);
+}
+
 int main(void)
 {
     test_combine_size();
@@ -676,6 +726,7 @@ int main(void)
     test_status_complete();
     test_status_partial_continues();
     test_status_fatal();
+    test_skip_dir_hook();
     teardown_fixture();
 
     if (g_failures != 0) {

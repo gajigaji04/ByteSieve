@@ -275,6 +275,17 @@ static ScanStatus enumerate_dir(const DirFrame *frame, uint32_t max_depth,
         }
         account_entry(&fd, report, &entry);
         will_descend = frame->depth < max_depth && entry.descend;
+        if (will_descend && hooks->should_skip_dir != NULL) {
+            ScanDirInfo parent;
+            parent.id = frame->id;
+            parent.path = frame->path;
+            parent.depth = frame->depth;
+            parent.pending = stack->len;
+            if (hooks->should_skip_dir(&entry, &parent, ctx)) {
+                report->excluded_dir_count++;
+                will_descend = 0;
+            }
+        }
         if (hooks->on_entry != NULL) {
             child_id = hooks->on_entry(&entry, frame->id, will_descend, ctx);
         }

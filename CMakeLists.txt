@@ -43,6 +43,24 @@ target_include_directories(bytesieve_job PUBLIC src)
 target_link_libraries(bytesieve_job PUBLIC bytesieve_model)
 bytesieve_configure(bytesieve_job)
 
+# 정리 후보 탐지 규칙(이름 분류·프로젝트 표시 파일·시스템 보호 경로). 파일 시스템에 접근하지 않는다.
+add_library(bytesieve_cleanup_rules STATIC src/cleanup_rules.c)
+target_include_directories(bytesieve_cleanup_rules PUBLIC src)
+target_link_libraries(bytesieve_cleanup_rules PUBLIC bytesieve_path)
+bytesieve_configure(bytesieve_cleanup_rules)
+
+# 정리 후보 탐지 엔진(scan_tree_ex 기반). 읽기 전용이며 아무것도 삭제·수정하지 않는다.
+add_library(bytesieve_cleanup STATIC src/cleanup_scan.c)
+target_include_directories(bytesieve_cleanup PUBLIC src)
+target_link_libraries(bytesieve_cleanup PUBLIC bytesieve_scanner bytesieve_cleanup_rules)
+bytesieve_configure(bytesieve_cleanup)
+
+# 탐지를 별도 스레드에서 돌리는 작업(진행률 스냅샷·취소).
+add_library(bytesieve_cleanup_job STATIC src/cleanup_job.c)
+target_include_directories(bytesieve_cleanup_job PUBLIC src)
+target_link_libraries(bytesieve_cleanup_job PUBLIC bytesieve_cleanup)
+bytesieve_configure(bytesieve_cleanup_job)
+
 # 용량 표시 문자열("1.50 KiB"). GUI 의 스캔 화면과 드라이브 대시보드가 함께 쓴다.
 add_library(bytesieve_format STATIC src/size_format.c)
 target_include_directories(bytesieve_format PUBLIC src)
@@ -53,10 +71,11 @@ add_library(bytesieve_drive STATIC src/drive.c)
 target_include_directories(bytesieve_drive PUBLIC src)
 bytesieve_configure(bytesieve_drive)
 
-# Win32 GUI: 폴더 스캔 탭(진행률 표시줄, 폴더 트리, 용량 순위)과 드라이브 대시보드 탭.
-add_executable(bytesieve-gui WIN32 src/gui_main.c src/gui_drives.c)
+# Win32 GUI: 폴더 스캔 탭(진행률 표시줄, 폴더 트리, 용량 순위), 드라이브 대시보드 탭,
+# 정리 후보 탭(개발 캐시·빌드 결과물·임시·로그 탐지).
+add_executable(bytesieve-gui WIN32 src/gui_main.c src/gui_drives.c src/gui_cleanup.c)
 target_link_libraries(bytesieve-gui PRIVATE bytesieve_job bytesieve_drive bytesieve_format
-                      comctl32 shell32 ole32)
+                      bytesieve_cleanup_job comctl32 shell32 ole32)
 bytesieve_configure(bytesieve-gui)
 
 add_executable(disk-scanner src/main.c)
@@ -172,6 +191,16 @@ target_link_libraries(test_size_format PRIVATE bytesieve_format)
 bytesieve_configure(test_size_format)
 add_test(NAME size_format COMMAND test_size_format)
 
+add_executable(test_cleanup_rules tests/test_cleanup_rules.c)
+target_link_libraries(test_cleanup_rules PRIVATE bytesieve_cleanup_rules)
+bytesieve_configure(test_cleanup_rules)
+add_test(NAME cleanup_rules COMMAND test_cleanup_rules)
+
+add_executable(test_cleanup_scan tests/test_cleanup_scan.c)
+target_link_libraries(test_cleanup_scan PRIVATE bytesieve_cleanup_job)
+bytesieve_configure(test_cleanup_scan)
+add_test(NAME cleanup_scan COMMAND test_cleanup_scan)
+
 # GUI 자체 검사: 창(숨김)에서 스캔을 끝까지 돌리거나 시작 직후 취소한 뒤
 # 진행률·트리·순위 화면이 모델과 맞는지 확인하고 종료 코드로 알린다.
 add_test(NAME gui_scan COMMAND bytesieve-gui --self-test ${CMAKE_CURRENT_SOURCE_DIR})
@@ -180,4 +209,9 @@ add_test(NAME gui_missing_dir COMMAND bytesieve-gui --self-test ${CMAKE_CURRENT_
 set_tests_properties(gui_missing_dir PROPERTIES WILL_FAIL TRUE)
 # 드라이브 탭으로 전환해 조회를 마친 뒤 목록이 시스템 드라이브 정보와 맞는지 확인한다.
 add_test(NAME gui_drives COMMAND bytesieve-gui --self-test-drives)
-set_tests_properties(gui_scan gui_cancel gui_missing_dir gui_drives PROPERTIES TIMEOUT 120)
+# 정리 후보 탭: 소스 트리(빌드 폴더 포함)를 탐지해 목록·합계·정렬·필터를 확인한다.
+add_test(NAME gui_cleanup COMMAND bytesieve-gui --self-test-cleanup ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME gui_cleanup_cancel
+         COMMAND bytesieve-gui --self-test-cleanup-cancel ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(gui_scan gui_cancel gui_missing_dir gui_drives gui_cleanup
+                     gui_cleanup_cancel PROPERTIES TIMEOUT 120)

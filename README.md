@@ -2,7 +2,8 @@
 
 Windows용 디스크 사용량 분석 도구입니다. 지정한 폴더 아래의 파일 수·폴더 수·총 용량을 집계하고,
 CLI(텍스트·JSON Lines)와 Win32 GUI(진행률·폴더 트리·용량 순위)로 결과를 보여 줍니다.
-GUI의 드라이브 탭에서는 시스템의 모든 논리 드라이브 용량과 사용률을 한눈에 볼 수 있습니다.
+GUI의 드라이브 탭에서는 시스템의 모든 논리 드라이브 용량과 사용률을 한눈에 볼 수 있고,
+정리 후보 탭에서는 `node_modules`·빌드 결과물·개발 캐시·임시·로그 파일을 찾아 예상 확보 용량을 보여 줍니다.
 C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니다.
 
 ## 진행 현황
@@ -19,6 +20,8 @@ C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니�
 | 대시보드 | 내용 | 상태 |
 |---|---|---|
 | Phase 1 | 드라이브 사용량: 논리 드라이브 목록, 전체·사용·여유 용량, 사용률 막대, 새로고침 | 완료 |
+| Phase 2 | 정리 후보 탐지: 개발 캐시·빌드 결과물·임시·로그, 예상 확보 용량, 유형 필터, 취소 (읽기 전용) | 완료 |
+| Phase 3 | 정리 후보 삭제 | 예정 |
 
 ## 구현된 기능
 
@@ -33,6 +36,7 @@ C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니�
   - `partial`: 일부 폴더를 읽지 못했거나 취소됨
   - `fatal`: 대상 폴더 자체를 열지 못함
 - 취소 요청은 폴더를 열기 직전과, 폴더 하나를 읽는 도중 256개 항목마다 확인합니다.
+- 선택 훅 `should_skip_dir`로 특정 하위 폴더에 들어가지 않게 할 수 있습니다. 제외한 폴더는 오류가 아니라 `excluded_dir_count`로 셉니다(정리 후보 탐지가 시스템 폴더를 건너뛸 때 사용).
 
 ### 데이터 모델 (`scan_model`)
 - 스캔 결과를 폴더 트리로 만듭니다. 파일은 노드로 만들지 않고 소속 폴더에만 집계합니다.
@@ -63,13 +67,36 @@ C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니�
   | `error` | 그 밖의 오류 | 조회 실패 |
 - 조회 함수를 주입할 수 있어(`drive_list_build`) 이동식 드라이브 오류 같은 경우를 실제 장치 없이 테스트합니다.
 
+### 정리 후보 탐지 (`cleanup_rules`, `cleanup_scan`, `cleanup_job`)
+**읽기 전용입니다.** 디렉터리 열거(`FindFirstFileW`/`FindNextFileW`)로 얻은 이름·크기·속성만 쓰며, 파일을 열거나 내용을 읽지 않고, 삭제·이동·수정하지 않습니다. 실제 삭제는 다음 단계에서 따로 구현합니다.
+
+탐지 규칙(이름은 대소문자 무시, 정확히 일치):
+
+| 유형 | 폴더 | 파일 |
+|---|---|---|
+| Node.js | `node_modules` | – |
+| 빌드 결과물 | `dist`, `build`, `out` | – |
+| 개발 캐시 | `.cache`, `.next`, `.vite` | – |
+| 임시 파일 | `.tmp`, `.temp` | `*.tmp` |
+| 로그 | – | `*.log` |
+
+탐지 정책:
+- **중첩**: 위에서부터 처음 맞은 폴더가 그 아래 전체를 차지합니다. `node_modules\pkg\dist`나 `build\app.log`는 따로 나오지 않고 바깥 항목 용량에 포함되므로, 항목 용량의 합(예상 확보 용량)에 중복이 없습니다.
+- **용량**: 폴더는 하위 전체 파일의 논리 크기 합이며 스캐너와 같은 기준입니다(실제 디스크 점유량은 6단계).
+- **신뢰도**: `node_modules`·`dist`·`build`·`out`은 흔한 이름이라, 같은 폴더에 프로젝트 표시 파일(`package.json`, `CMakeLists.txt`, `Makefile`, `Cargo.toml`, `pom.xml`, `build.gradle(.kts)`, `pyproject.toml`, `go.mod`, `*.csproj`, `*.sln`)이 있으면 **확인됨**, 없으면 **추정**으로 표시합니다.
+- **시스템 보호 경로**: Windows 폴더, `Program Files`, `Program Files (x86)`, `ProgramData`와 볼륨 루트의 `$Recycle.Bin`, `System Volume Information`, `Recovery`, `Config.Msi`는 탐색 중 만나면 들어가지 않습니다. 사용자가 보호 경로 안을 직접 고르면 탐지는 하되 빨간 경고를 띄우고 모든 항목에 **시스템 경로** 표시를 붙입니다. `AppData`는 캐시·임시 파일이 많은 곳이라 제외하지 않습니다.
+- **링크**: 정션·심볼릭 링크는 폴더든 파일이든 따라가지 않고 항목으로도 만들지 않습니다(순환 방지, pnpm 링크 중복 계산 방지).
+- **선택한 경로 자체**는 탐색 범위일 뿐 항목이 되지 않습니다.
+- **오류·취소**: 스캐너 정책 그대로입니다(접근 거부·긴 경로 등은 기록하고 계속). 하위를 다 읽지 못한 항목은 **일부 누락**으로 표시하며, 취소하면 그때까지 찾은 결과를 보여 줍니다.
+- 탐지는 별도 스레드(`cleanup_job`)에서 하며 진행률 알림은 100ms 간격으로 제한합니다. 폴더마다 메모리를 잡지 않고 후보 항목만 저장합니다.
+
 ### CLI (`disk-scanner`)
 - 사람이 읽는 요약을 출력합니다. 오류는 종류별 개수와 함께 최대 20개까지 나열합니다.
 - `--jsonl`을 주면 표준 출력에 UTF-8 JSON Lines 이벤트를 출력합니다. 이벤트 순서는 `start` → `progress`(1,000개 항목마다) → `result` → `complete`입니다.
 - 종료 코드: `0` 완료, `1` 일부 실패, `2` 스캔 불가 또는 잘못된 인자.
 
 ### GUI (`bytesieve-gui`)
-창은 **폴더 스캔**과 **드라이브** 두 탭으로 나뉩니다.
+창은 **폴더 스캔**, **드라이브**, **정리 후보** 세 탭으로 나뉩니다.
 
 **폴더 스캔 탭**
 - 경로 입력, 찾아보기, 스캔, 취소 버튼이 있습니다.
@@ -83,6 +110,13 @@ C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니�
 - 조회에 실패한 드라이브는 막대 대신 상태와 오류 코드(예: `미디어 없음/준비 안 됨 (오류 21)`)를 표시합니다.
 - 상단 줄에 드라이브 수, 정상 조회된 드라이브의 용량 합계, 조회 실패 수, 조회 시각을 보여 줍니다.
 - 탭을 처음 열 때와 **[새로고침]**(Alt+R)을 누를 때 조회합니다. 조회는 작업 스레드에서 하므로 응답이 느린 네트워크·이동식 드라이브가 있어도 창이 멈추지 않습니다.
+
+**정리 후보 탭 (`gui_cleanup`)**
+- 경로를 입력하거나 [찾아보기]로 고른 뒤 [탐지](또는 Enter)를 누릅니다. 탐지 중에는 [취소]로 멈출 수 있습니다.
+- 진행률 표시줄과 상태 줄에 폴더·파일 수, 지금까지 찾은 후보 수와 용량, 오류 수, 현재 폴더를 보여 줍니다. 끝나면 오류·건너뛴 폴더·제외한 시스템 폴더·링크 수와 걸린 시간을 보여 줍니다.
+- 목록은 **용량 내림차순**으로 용량·유형·경로·파일 수·비고(확인됨/추정, 일부 누락, 시스템 경로)를 보여 줍니다. 수만 개 항목도 가볍게 그리도록 가상 목록을 씁니다.
+- **유형** 콤보 상자로 전체·Node.js·빌드 결과물·개발 캐시·임시 파일·로그 중 하나만 볼 수 있습니다. 요약 줄에 `표시 n개 · 용량 / 전체 n개 · 예상 확보 용량`을 보여 줍니다.
+- 탐지 중에 창을 닫으면 탐지를 취소하고 스레드가 끝날 때까지 기다린 뒤 종료합니다.
 
 ## 디렉터리 구조
 
@@ -99,9 +133,13 @@ ByteSieve/
 │   ├── jsonl.c/.h          JSON Lines 이벤트 출력
 │   ├── drive.c/.h          논리 드라이브 목록·용량 조회, 오류 분류, 사용률
 │   ├── size_format.c/.h    용량 표시 문자열("1.50 KiB")
+│   ├── cleanup_rules.c/.h  정리 후보 이름 규칙, 프로젝트 표시 파일, 시스템 보호 경로
+│   ├── cleanup_scan.c/.h   정리 후보 탐지 엔진(중첩·용량 집계·필터·정렬)
+│   ├── cleanup_job.c/.h    탐지 작업 스레드, 진행률 사본, 취소
 │   ├── main.c              CLI 진입점(disk-scanner)
 │   ├── gui_main.c          Win32 GUI 진입점(bytesieve-gui), 탭 전환
-│   └── gui_drives.c/.h     드라이브 대시보드 패널(목록·사용률 막대·새로고침)
+│   ├── gui_drives.c/.h     드라이브 대시보드 패널(목록·사용률 막대·새로고침)
+│   └── gui_cleanup.c/.h    정리 후보 패널(탐지·취소·유형 필터·용량순 목록)
 └── tests/
     ├── test_path.c         경로 유틸리티
     ├── test_scanner.c      스캐너(권한 거부·정션·긴 경로 등)
@@ -111,10 +149,12 @@ ByteSieve/
     ├── test_cli.c          인자 파싱·출력 형식
     ├── test_drive.c        드라이브 조회·오류 분류·사용률 계산
     ├── test_size_format.c  용량 표시 문자열
+    ├── test_cleanup_rules.c 탐지 규칙·보호 경로 판정
+    ├── test_cleanup_scan.c 탐지 엔진·필터·취소·작업 스레드(픽스처 폴더)
     └── cli_check.cmake     CLI 종료 코드·출력 검사 스크립트
 ```
 
-CMake 대상은 다음과 같습니다. 정적 라이브러리는 `bytesieve_path` → `bytesieve_scanner` → `bytesieve_model` → `bytesieve_job` 순서로 의존하고, `bytesieve_cli`와 `bytesieve_jsonl`은 `bytesieve_scanner`에 의존합니다. `bytesieve_drive`(드라이브 조회)와 `bytesieve_format`(용량 표시)은 다른 라이브러리에 의존하지 않습니다. 실행 파일은 `disk-scanner`(CLI)와 `bytesieve-gui`(GUI)입니다.
+CMake 대상은 다음과 같습니다. 정적 라이브러리는 `bytesieve_path` → `bytesieve_scanner` → `bytesieve_model` → `bytesieve_job` 순서로 의존하고, `bytesieve_cli`와 `bytesieve_jsonl`은 `bytesieve_scanner`에 의존합니다. `bytesieve_drive`(드라이브 조회)와 `bytesieve_format`(용량 표시)은 다른 라이브러리에 의존하지 않습니다. 정리 후보 탐지는 `bytesieve_cleanup_rules`(→ `bytesieve_path`) ← `bytesieve_cleanup`(+ `bytesieve_scanner`) ← `bytesieve_cleanup_job` 순서로 의존합니다. 실행 파일은 `disk-scanner`(CLI)와 `bytesieve-gui`(GUI)입니다.
 
 ## 빌드
 
@@ -176,12 +216,16 @@ build\Debug\bytesieve-gui.exe
 build\Debug\bytesieve-gui.exe C:\Users\me\Projects
 ```
 
+정리 후보를 찾으려면 **정리 후보** 탭에서 경로(예: `C:\Users\me\Projects`)를 고르고 [탐지]를 누릅니다. 유형 콤보 상자로 원하는 유형만 볼 수 있습니다. 이 단계에서는 아무것도 삭제하지 않으므로, 정리는 목록을 보고 직접 하세요. **추정**이나 **시스템 경로** 표시가 붙은 항목은 특히 조심해야 합니다.
+
 자동 검사용 옵션도 있습니다. 창을 숨긴 채 스캔하고 화면 상태를 검증한 뒤 종료 코드로 결과를 알립니다(0 성공, 1 실패).
 
 ```powershell
 build\Debug\bytesieve-gui.exe --self-test C:\some\dir
 build\Debug\bytesieve-gui.exe --self-test-cancel C:\some\dir   # 시작 직후 취소
 build\Debug\bytesieve-gui.exe --self-test-drives               # 드라이브 탭 조회 후 목록 검증
+build\Debug\bytesieve-gui.exe --self-test-cleanup C:\some\dir         # 정리 후보 탐지 후 목록·필터 검증
+build\Debug\bytesieve-gui.exe --self-test-cleanup-cancel C:\some\dir  # 탐지 시작 직후 취소
 ```
 
 ## 테스트
@@ -190,11 +234,13 @@ build\Debug\bytesieve-gui.exe --self-test-drives               # 드라이브 �
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-현재 테스트는 35개입니다.
-- 단위 테스트: `path`, `scanner`, `scan_model`, `scan_job`, `jsonl`, `cli`, `drive`, `size_format`
+현재 테스트는 39개입니다.
+- 단위 테스트: `path`, `scanner`, `scan_model`, `scan_job`, `jsonl`, `cli`, `drive`, `size_format`, `cleanup_rules`, `cleanup_scan`
 - CLI 종료 코드·출력 검사: `cli_*` 및 인자 검사 테스트들
-- GUI 자체 검사: `gui_scan`, `gui_cancel`, `gui_missing_dir`, `gui_drives`
+- GUI 자체 검사: `gui_scan`, `gui_cancel`, `gui_missing_dir`, `gui_drives`, `gui_cleanup`, `gui_cleanup_cancel`
 
 `drive` 테스트는 가짜 조회 함수로 이동식 드라이브 오류·분리·잘못된 값을 재현하고, 실제 시스템에서는 Windows가 설치된 드라이브가 정상 조회되는지와 없는 드라이브 문자가 실패 상태로 처리되는지 확인합니다.
+
+`cleanup_scan` 테스트는 임시 폴더에 픽스처를 만들어 중첩된 `node_modules`·`dist`, 확인됨/추정, 비슷하지만 해당하지 않는 이름(`report.log.bak`, `buildx`), 정션과 정션 순환, 접근 거부 폴더, 260자를 넘는 경로, 보호 경로 제외와 보호 경로 안에서의 경고, 유형 필터와 정렬, 취소, 작업 스레드를 확인합니다.
 
 `ctest`가 PATH에 없으면 Visual Studio 개발자 PowerShell에서 실행하거나 Visual Studio에 포함된 CMake 경로(`...\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin`)를 사용하세요.

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <wchar.h>
 
+#include "gui_cleanup.h"
 #include "gui_drives.h"
 #include "path.h"
 #include "scan_job.h"
@@ -40,11 +41,12 @@ enum {
     IDC_TREE,
     IDC_LIST,
     IDC_TABS,
-    IDC_DRIVES
+    IDC_DRIVES,
+    IDC_CLEANUP
 };
 
 /* 탭 순서. */
-enum { TAB_SCAN, TAB_DRIVES };
+enum { TAB_SCAN, TAB_DRIVES, TAB_CLEANUP };
 
 /* 순위 목록 열. */
 enum { COL_RANK, COL_PATH, COL_SIZE, COL_FILES, COL_SHARE, COL_COUNT };
@@ -53,13 +55,15 @@ typedef enum {
     SELF_TEST_NONE = 0,
     SELF_TEST_SCAN,  /* 스캔 → 화면 검증 → 종료 */
     SELF_TEST_CANCEL, /* 스캔 시작 직후 취소 → 화면 검증 → 종료 */
-    SELF_TEST_DRIVES  /* 드라이브 탭 새로고침 → 화면 검증 → 종료 */
+    SELF_TEST_DRIVES, /* 드라이브 탭 새로고침 → 화면 검증 → 종료 */
+    SELF_TEST_CLEANUP,       /* 정리 후보 탭 탐지 → 화면 검증 → 종료 */
+    SELF_TEST_CLEANUP_CANCEL /* 정리 후보 탐지 시작 직후 취소 → 화면 검증 → 종료 */
 } SelfTest;
 
 typedef struct {
     HWND hwnd;
     HWND path, browse, scan, cancel, progress, status, tree, list;
-    HWND tabs, drives;
+    HWND tabs, drives, cleanup;
     HFONT font;
     int dpi;
 
@@ -153,6 +157,8 @@ static void layout(void)
     body_h = rc.bottom - rc.top - 2 * m;
     MoveWindow(g_app.drives, x + m, rc.top + m, w - 2 * m > 0 ? w - 2 * m : 0,
                body_h > 0 ? body_h : 0, TRUE);
+    MoveWindow(g_app.cleanup, x + m, rc.top + m, w - 2 * m > 0 ? w - 2 * m : 0,
+               body_h > 0 ? body_h : 0, TRUE);
 }
 
 /* ---- 탭 ---- */
@@ -176,8 +182,9 @@ static void show_tab(int tab)
     for (i = 0; i < sizeof(scan_controls) / sizeof(scan_controls[0]); i++) {
         ShowWindow(scan_controls[i], show_scan ? SW_SHOW : SW_HIDE);
     }
-    ShowWindow(g_app.drives, show_scan ? SW_HIDE : SW_SHOW);
-    if (!show_scan && !drive_panel_loaded(g_app.drives)) {
+    ShowWindow(g_app.drives, tab == TAB_DRIVES ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_app.cleanup, tab == TAB_CLEANUP ? SW_SHOW : SW_HIDE);
+    if (tab == TAB_DRIVES && !drive_panel_loaded(g_app.drives)) {
         drive_panel_refresh(g_app.drives);
     }
 }
@@ -658,6 +665,21 @@ static int verify_drive_tab(void)
     return failures == 0 ? 0 : 1;
 }
 
+/* 정리 후보 탐지가 끝난 뒤 탭 전환 상태와 패널 내용을 확인한다. */
+static int verify_cleanup_tab(void)
+{
+    int failures =
+        cleanup_panel_verify(g_app.cleanup, g_app.self_test == SELF_TEST_CLEANUP_CANCEL);
+
+    SELF_CHECK(current_tab() == TAB_CLEANUP);
+    SELF_CHECK(is_shown(g_app.cleanup) && !is_shown(g_app.drives));
+    SELF_CHECK(!is_shown(g_app.tree) && !is_shown(g_app.list) && !is_shown(g_app.path));
+    SELF_CHECK(GetWindow(g_app.tabs, GW_HWNDNEXT) == NULL);
+    /* 폴더 스캔은 건드리지 않는다. */
+    SELF_CHECK(g_app.job == NULL && !g_app.has_model);
+    return failures == 0 ? 0 : 1;
+}
+
 /* ---- 창 프로시저 ---- */
 
 static HWND make_child(const wchar_t *cls, const wchar_t *text, DWORD style, DWORD ex,
@@ -699,6 +721,8 @@ static void create_controls(void)
         SendMessageW(g_app.tabs, TCM_INSERTITEMW, TAB_SCAN, (LPARAM)&tab);
         tab.pszText = L"드라이브";
         SendMessageW(g_app.tabs, TCM_INSERTITEMW, TAB_DRIVES, (LPARAM)&tab);
+        tab.pszText = L"정리 후보";
+        SendMessageW(g_app.tabs, TCM_INSERTITEMW, TAB_CLEANUP, (LPARAM)&tab);
     }
 
     g_app.path = make_child(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE,
@@ -733,6 +757,7 @@ static void create_controls(void)
     set_scanning(0);
 
     g_app.drives = drive_panel_create(g_app.hwnd, IDC_DRIVES, g_app.font, g_app.dpi);
+    g_app.cleanup = cleanup_panel_create(g_app.hwnd, IDC_CLEANUP, g_app.font, g_app.dpi);
     /* 새 자식 창은 Z 순서 맨 아래에 붙으므로, 모두 만든 뒤 탭 컨트롤을 맨 아래로 보내
      * 탭 위의 컨트롤이 가려지지 않게 한다. */
     SetWindowPos(g_app.tabs, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -790,6 +815,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDOK: /* 경로 칸에서 Enter */
             if (current_tab() == TAB_SCAN) {
                 start_scan();
+            } else if (current_tab() == TAB_CLEANUP) {
+                cleanup_panel_start(g_app.cleanup, NULL);
             }
             return 0;
         case IDC_CANCEL:
@@ -799,6 +826,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (HIWORD(wp) == DPN_REFRESHED && g_app.self_test == SELF_TEST_DRIVES) {
                 KillTimer(hwnd, TIMER_SELF_TEST);
                 g_app.self_test_exit = verify_drive_tab();
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        case IDC_CLEANUP:
+            if (HIWORD(wp) == CPN_FINISHED && (g_app.self_test == SELF_TEST_CLEANUP ||
+                                               g_app.self_test == SELF_TEST_CLEANUP_CANCEL)) {
+                KillTimer(hwnd, TIMER_SELF_TEST);
+                g_app.self_test_exit = verify_cleanup_tab();
                 DestroyWindow(hwnd);
             }
             return 0;
@@ -851,6 +886,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  *   bytesieve-gui --self-test <dir>       스캔 후 화면을 검증하고 종료(0 성공, 1 실패)
  *   bytesieve-gui --self-test-cancel <dir> 시작 직후 취소한 뒤 화면을 검증하고 종료
  *   bytesieve-gui --self-test-drives      드라이브 탭을 조회한 뒤 화면을 검증하고 종료
+ *   bytesieve-gui --self-test-cleanup <dir>        정리 후보를 탐지한 뒤 화면을 검증하고 종료
+ *   bytesieve-gui --self-test-cleanup-cancel <dir> 탐지 시작 직후 취소한 뒤 화면을 검증하고 종료
  */
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
@@ -860,6 +897,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     HDC screen;
     wchar_t **argv;
     const wchar_t *target = NULL;
+    const wchar_t *cleanup_target = NULL;
     int argc = 0;
 
     (void)prev;
@@ -874,6 +912,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         target = argv[2];
     } else if (argv != NULL && argc >= 2 && wcscmp(argv[1], L"--self-test-drives") == 0) {
         g_app.self_test = SELF_TEST_DRIVES;
+    } else if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test-cleanup") == 0) {
+        g_app.self_test = SELF_TEST_CLEANUP;
+        cleanup_target = argv[2];
+    } else if (argv != NULL && argc >= 3 &&
+               wcscmp(argv[1], L"--self-test-cleanup-cancel") == 0) {
+        g_app.self_test = SELF_TEST_CLEANUP_CANCEL;
+        cleanup_target = argv[2];
     } else if (argv != NULL && argc >= 2) {
         target = argv[1];
     }
@@ -899,6 +944,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
                 ICC_STANDARD_CLASSES | ICC_TAB_CLASSES;
     InitCommonControlsEx(&icc);
     drive_panel_register(inst);
+    cleanup_panel_register(inst);
 
     memset(&wc, 0, sizeof(wc));
     wc.cbSize = sizeof(wc);
@@ -944,6 +990,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         } else {
             SetTimer(g_app.hwnd, TIMER_SELF_TEST, SELF_TEST_TIMEOUT_MS, NULL);
             show_tab(TAB_DRIVES);
+        }
+    }
+    if (cleanup_target != NULL) {
+        show_tab(TAB_CLEANUP);
+        if (!cleanup_panel_start(g_app.cleanup, cleanup_target)) {
+            fwprintf(stderr, L"self-test failed: cleanup detection did not start\n");
+            g_app.self_test_exit = 1;
+            DestroyWindow(g_app.hwnd);
+        } else {
+            if (g_app.self_test == SELF_TEST_CLEANUP_CANCEL) {
+                cleanup_panel_cancel(g_app.cleanup);
+            }
+            SetTimer(g_app.hwnd, TIMER_SELF_TEST, SELF_TEST_TIMEOUT_MS, NULL);
         }
     }
     LocalFree(argv);
