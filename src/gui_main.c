@@ -57,7 +57,8 @@ typedef enum {
     SELF_TEST_CANCEL, /* 스캔 시작 직후 취소 → 화면 검증 → 종료 */
     SELF_TEST_DRIVES, /* 드라이브 탭 새로고침 → 화면 검증 → 종료 */
     SELF_TEST_CLEANUP,       /* 정리 후보 탭 탐지 → 화면 검증 → 종료 */
-    SELF_TEST_CLEANUP_CANCEL /* 정리 후보 탐지 시작 직후 취소 → 화면 검증 → 종료 */
+    SELF_TEST_CLEANUP_CANCEL, /* 정리 후보 탐지 시작 직후 취소 → 화면 검증 → 종료 */
+    SELF_TEST_TRASH /* 정리 후보 탐지 → 모두 선택 → 휴지통 이동(확인 창 없이) → 화면 검증 → 종료 */
 } SelfTest;
 
 typedef struct {
@@ -74,6 +75,7 @@ typedef struct {
 
     SelfTest self_test;
     int self_test_exit;
+    size_t trash_expect; /* SELF_TEST_TRASH: 선택해 옮기기 시작한 항목 수 */
 } App;
 
 static App g_app;
@@ -835,6 +837,22 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 KillTimer(hwnd, TIMER_SELF_TEST);
                 g_app.self_test_exit = verify_cleanup_tab();
                 DestroyWindow(hwnd);
+            } else if (HIWORD(wp) == CPN_FINISHED && g_app.self_test == SELF_TEST_TRASH) {
+                /* 탐지 화면을 확인한 뒤, 옮길 수 있는 항목을 모두 체크해 휴지통으로 옮긴다. */
+                g_app.trash_expect = cleanup_panel_check_all(g_app.cleanup, 1);
+                if (verify_cleanup_tab() != 0 || g_app.trash_expect == 0 ||
+                    !cleanup_panel_trash(g_app.cleanup, 0)) {
+                    fwprintf(stderr, L"self-test failed: trash did not start (%u selected)\n",
+                             (unsigned)g_app.trash_expect);
+                    KillTimer(hwnd, TIMER_SELF_TEST);
+                    g_app.self_test_exit = 1;
+                    DestroyWindow(hwnd);
+                }
+            } else if (HIWORD(wp) == CPN_TRASHED && g_app.self_test == SELF_TEST_TRASH) {
+                KillTimer(hwnd, TIMER_SELF_TEST);
+                g_app.self_test_exit =
+                    cleanup_panel_verify_trash(g_app.cleanup, g_app.trash_expect) == 0 ? 0 : 1;
+                DestroyWindow(hwnd);
             }
             return 0;
         }
@@ -888,6 +906,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  *   bytesieve-gui --self-test-drives      드라이브 탭을 조회한 뒤 화면을 검증하고 종료
  *   bytesieve-gui --self-test-cleanup <dir>        정리 후보를 탐지한 뒤 화면을 검증하고 종료
  *   bytesieve-gui --self-test-cleanup-cancel <dir> 탐지 시작 직후 취소한 뒤 화면을 검증하고 종료
+ *   bytesieve-gui --self-test-trash <dir>          탐지 후 옮길 수 있는 항목을 모두 휴지통으로
+ *                                                  옮기고(확인 창 없음) 결과 화면을 검증하고 종료
  */
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
@@ -918,6 +938,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     } else if (argv != NULL && argc >= 3 &&
                wcscmp(argv[1], L"--self-test-cleanup-cancel") == 0) {
         g_app.self_test = SELF_TEST_CLEANUP_CANCEL;
+        cleanup_target = argv[2];
+    } else if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test-trash") == 0) {
+        g_app.self_test = SELF_TEST_TRASH;
         cleanup_target = argv[2];
     } else if (argv != NULL && argc >= 2) {
         target = argv[1];

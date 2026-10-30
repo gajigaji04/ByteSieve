@@ -61,6 +61,13 @@ target_include_directories(bytesieve_cleanup_job PUBLIC src)
 target_link_libraries(bytesieve_cleanup_job PUBLIC bytesieve_cleanup)
 bytesieve_configure(bytesieve_cleanup_job)
 
+# 정리 후보를 휴지통으로 옮기기(삭제 보호 판정·직전 확인·IFileOperation·작업 스레드).
+# 영구 삭제는 하지 않는다.
+add_library(bytesieve_cleanup_trash STATIC src/cleanup_trash.c)
+target_include_directories(bytesieve_cleanup_trash PUBLIC src)
+target_link_libraries(bytesieve_cleanup_trash PUBLIC bytesieve_cleanup ole32 shell32 uuid)
+bytesieve_configure(bytesieve_cleanup_trash)
+
 # 용량 표시 문자열("1.50 KiB"). GUI 의 스캔 화면과 드라이브 대시보드가 함께 쓴다.
 add_library(bytesieve_format STATIC src/size_format.c)
 target_include_directories(bytesieve_format PUBLIC src)
@@ -72,10 +79,10 @@ target_include_directories(bytesieve_drive PUBLIC src)
 bytesieve_configure(bytesieve_drive)
 
 # Win32 GUI: 폴더 스캔 탭(진행률 표시줄, 폴더 트리, 용량 순위), 드라이브 대시보드 탭,
-# 정리 후보 탭(개발 캐시·빌드 결과물·임시·로그 탐지).
+# 정리 후보 탭(개발 캐시·빌드 결과물·임시·로그 탐지, 선택 항목 휴지통 이동).
 add_executable(bytesieve-gui WIN32 src/gui_main.c src/gui_drives.c src/gui_cleanup.c)
 target_link_libraries(bytesieve-gui PRIVATE bytesieve_job bytesieve_drive bytesieve_format
-                      bytesieve_cleanup_job comctl32 shell32 ole32)
+                      bytesieve_cleanup_job bytesieve_cleanup_trash comctl32 shell32 ole32)
 bytesieve_configure(bytesieve-gui)
 
 add_executable(disk-scanner src/main.c)
@@ -201,6 +208,12 @@ target_link_libraries(test_cleanup_scan PRIVATE bytesieve_cleanup_job)
 bytesieve_configure(test_cleanup_scan)
 add_test(NAME cleanup_scan COMMAND test_cleanup_scan)
 
+# 실제로 임시 폴더의 픽스처를 휴지통으로 옮긴 뒤, 테스트가 넣은 휴지통 항목만 지운다.
+add_executable(test_cleanup_trash tests/test_cleanup_trash.c)
+target_link_libraries(test_cleanup_trash PRIVATE bytesieve_cleanup_trash)
+bytesieve_configure(test_cleanup_trash)
+add_test(NAME cleanup_trash COMMAND test_cleanup_trash)
+
 # GUI 자체 검사: 창(숨김)에서 스캔을 끝까지 돌리거나 시작 직후 취소한 뒤
 # 진행률·트리·순위 화면이 모델과 맞는지 확인하고 종료 코드로 알린다.
 add_test(NAME gui_scan COMMAND bytesieve-gui --self-test ${CMAKE_CURRENT_SOURCE_DIR})
@@ -213,5 +226,11 @@ add_test(NAME gui_drives COMMAND bytesieve-gui --self-test-drives)
 add_test(NAME gui_cleanup COMMAND bytesieve-gui --self-test-cleanup ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME gui_cleanup_cancel
          COMMAND bytesieve-gui --self-test-cleanup-cancel ${CMAKE_CURRENT_SOURCE_DIR})
+# 정리 후보 탭: 임시 픽스처를 탐지해 옮길 수 있는 항목을 모두 휴지통으로 옮기고(확인 창 없이)
+# 결과 화면·파일 상태를 확인한다. 보호 대상(접근 거부로 일부 누락)은 남아야 한다.
+add_test(NAME gui_trash
+         COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bytesieve-gui>
+                 -DFIXTURE=${CMAKE_CURRENT_BINARY_DIR}/gui_trash_fixture
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/gui_trash_check.cmake)
 set_tests_properties(gui_scan gui_cancel gui_missing_dir gui_drives gui_cleanup
-                     gui_cleanup_cancel PROPERTIES TIMEOUT 120)
+                     gui_cleanup_cancel gui_trash PROPERTIES TIMEOUT 120)
