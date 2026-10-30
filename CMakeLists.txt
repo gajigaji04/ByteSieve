@@ -38,6 +38,11 @@ add_test(NAME scan_source_dir COMMAND disk-scanner ${CMAKE_CURRENT_SOURCE_DIR}/s
 add_test(NAME scan_missing_dir COMMAND disk-scanner ${CMAKE_CURRENT_SOURCE_DIR}/no-such-dir)
 set_tests_properties(scan_missing_dir PROPERTIES WILL_FAIL TRUE)
 
+# --max-depth 는 0 이상의 정수만 허용한다.
+add_test(NAME scan_max_depth COMMAND disk-scanner --max-depth 0 ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME scan_bad_max_depth COMMAND disk-scanner --max-depth -1 ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_tests_properties(scan_bad_max_depth PROPERTIES WILL_FAIL TRUE)
+
 add_executable(test_path tests/test_path.c)
 target_link_libraries(test_path PRIVATE bytesieve_path)
 bytesieve_configure(test_path)
