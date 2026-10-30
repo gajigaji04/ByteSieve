@@ -39,6 +39,23 @@ typedef struct {
     uint64_t file_count;
     uint64_t dir_count;
     uint64_t total_bytes;   /* 파일 논리 크기의 합 */
+    /*
+     * 디스크 사용량(파일 할당 크기) 분석. 할당 크기는 폴더 열거 결과(AllocationSize)에서 얻으며
+     * 파일을 열지 않는다. 압축·스파스 파일만 GetCompressedFileSizeW 로 실제 점유량을 다시 구한다.
+     * 할당 크기를 얻지 못한 파일(대체 열거)은 논리 크기로 alloc_bytes 에 더한다.
+     */
+    uint64_t alloc_bytes;          /* 파일 할당 크기의 합 */
+    uint64_t alloc_unknown_files;  /* 할당 크기를 얻지 못한 파일 */
+    uint64_t slack_bytes;          /* 할당 > 논리 인 파일의 차이 합(클러스터 단위 반올림 낭비) */
+    uint64_t compressed_files;     /* NTFS 압축으로 할당 < 논리 인 파일 */
+    uint64_t compressed_saved_bytes;
+    uint64_t sparse_files;         /* 스파스 파일 */
+    uint64_t sparse_saved_bytes;
+    uint64_t cloud_files;          /* 클라우드 전용·오프라인(OneDrive 자리표시자 등) */
+    uint64_t cloud_saved_bytes;
+    uint64_t other_saved_files;    /* 그 밖에 할당 < 논리(MFT 상주 작은 파일, 중복 제거 등) */
+    uint64_t other_saved_bytes;
+    uint32_t cluster_bytes;        /* 첫 대상 볼륨의 클러스터 크기(모르면 0) */
     uint64_t reparse_count; /* 하위 탐색에서 제외한 재분석 지점 디렉터리 */
     uint64_t error_count;
     uint64_t skipped_dir_count; /* 열거하지 못해 건너뛴 디렉터리(하위 트리 포함 누락) */
@@ -58,6 +75,8 @@ typedef struct {
     int is_dir;
     int is_reparse;
     int descend;         /* 하위 탐색 대상인지(디렉터리이면서 재분석 지점이 아님) */
+    uint64_t alloc_size; /* 디스크 할당 크기. alloc_known 이 0 이면 size 와 같다(디렉터리는 0) */
+    int alloc_known;     /* 할당 크기를 얻었으면 1 */
 } ScanEntry;
 
 typedef void (*scan_visit_fn)(const ScanEntry *entry, void *ctx);
@@ -76,6 +95,25 @@ uint64_t scan_combine_size(uint32_t high, uint32_t low);
 
 /* 재분석 지점(정션·심볼릭 링크 등)이 아닌 디렉터리만 하위 탐색 대상이다. */
 int scan_should_descend(uint32_t attributes);
+
+/*
+ * 파일 하나의 논리 크기·할당 크기를 report 의 디스크 사용량 분석에 더한다(file_count·
+ * total_bytes 는 건드리지 않는다). 할당 < 논리 이면 속성으로 원인을 나눈다:
+ * 클라우드 전용(OFFLINE·RECALL_ON_*) > 압축 > 스파스 > 기타 순.
+ */
+void scan_report_account_alloc(ScanReport *report, uint64_t size, uint64_t alloc,
+                               int alloc_known, uint32_t attributes);
+
+/*
+ * 폴더 열거를 미리 해 두는 병렬 작업 스레드 수(프로세스 전체 기본값).
+ * 0 = 자동(논리 프로세서 수, 최대 SCAN_MAX_THREADS), 1 = 병렬 없이 호출 스레드에서만 열거.
+ * 훅은 언제나 scan_tree_ex 를 부른 스레드에서, 병렬 여부와 상관없이 같은 순서로 호출된다.
+ */
+#define SCAN_MAX_THREADS 8
+void scan_set_threads(unsigned threads);
+
+/* 실제로 쓸 작업 스레드 수(1 이면 병렬 없음). */
+unsigned scan_effective_threads(void);
 
 /*
  * dir 바로 아래의 파일·폴더를 열거해 report 에 누적한다("."/".." 제외, 비재귀).
@@ -129,6 +167,11 @@ typedef struct {
  *                 담은 디렉터리. 0 이 아니면 들어가지 않고(on_entry 의 will_descend 가 0)
  *                 report->excluded_dir_count 를 늘린다. 오류로 치지 않는다.
  * 스택에 넣지 못한 하위 디렉터리(경로 초과·메모리 부족)는 begin/end 없이 끝난다.
+ *
+ * 열거: 폴더 핸들로 GetFileInformationByHandleEx(FileFullDirectoryInfo)를 써서 이름·크기·
+ * 속성·할당 크기를 한 번에 받는다. 지원하지 않는 파일 시스템에서는 FindFirstFileExW 로
+ * 대신한다(할당 크기 모름). 작업 스레드가 스택에 쌓인 폴더를 미리 열거해 두지만, 훅 호출
+ * 순서(깊이 우선, 폴더 안은 열거 순서)는 병렬이 아닐 때와 같다.
  */
 typedef struct {
     uintptr_t (*on_entry)(const ScanEntry *entry, uintptr_t parent,

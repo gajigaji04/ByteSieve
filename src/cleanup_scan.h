@@ -22,6 +22,10 @@
  *   - 보호 경로(CleanupProtect)와 같은 폴더는 들어가지 않는다(excluded_dir_count).
  *     단, root 자체가 보호 경로 안이면 제외하지 않고 root_protected 를 1 로 둔다.
  *   - root 자체는 탐색 범위일 뿐 항목이 되지 않는다.
+ *   - 개발 환경(eco)은 폴더 이름 규칙과 같은 폴더의 프로젝트 표시 파일로 정한다
+ *     (cleanup_dir_rule, cleanup_resolve_eco). target·bin·obj·.vs·.gradle 처럼 표시 파일이
+ *     있어야만 후보인 폴더는 같은 폴더에 해당 표시 파일이 없으면 항목에서 빠지고, 그 안은
+ *     일반 폴더처럼 계속 탐지한다.
  *   - 오류 처리는 scanner 와 같다(접근 거부 등은 기록하고 계속, root 를 못 열면 SCAN_FATAL).
  */
 
@@ -36,6 +40,7 @@ enum {
 typedef struct {
     wchar_t *path; /* 표시용 전체 경로(확장 접두사 없음) */
     CleanupCategory category;
+    CleanupEco eco; /* 개발 환경 */
     uint32_t flags;
     uint64_t bytes; /* 폴더는 하위 전체 파일의 논리 크기 합 */
     uint64_t files; /* 폴더는 하위 파일 수, 파일은 1 */
@@ -50,6 +55,8 @@ typedef struct {
     uint64_t total_bytes; /* 예상 확보 용량(모든 항목 용량 합) */
     uint64_t category_bytes[CLEANUP_CATEGORY_COUNT];
     size_t category_count[CLEANUP_CATEGORY_COUNT];
+    uint64_t eco_bytes[CLEANUP_ECO_COUNT];
+    size_t eco_count[CLEANUP_ECO_COUNT];
     ScanReport report; /* 전체 탐색 집계·오류(scanner 와 같은 의미) */
     ScanStatus status;
     wchar_t *root;     /* 표시용 전체 경로 */
@@ -94,5 +101,9 @@ ScanStatus cleanup_scan(CleanupResult *out, const wchar_t *root, const CleanupPr
  */
 size_t cleanup_select(const CleanupResult *r, unsigned mask, size_t *out, size_t cap,
                       uint64_t *bytes);
+
+/* cleanup_select 에 개발 환경 필터(CLEANUP_ECO_BIT 조합)를 더한 판. 두 조건을 모두 만족해야 한다. */
+size_t cleanup_select_ex(const CleanupResult *r, unsigned mask, unsigned eco_mask, size_t *out,
+                         size_t cap, uint64_t *bytes);
 
 #endif /* BYTESIEVE_CLEANUP_SCAN_H */

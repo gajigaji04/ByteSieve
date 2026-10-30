@@ -11,6 +11,40 @@
 #define ID_OF(index) ((uintptr_t)(index) + 1)
 #define INDEX_OF(id) ((size_t)(id) - 1)
 
+/* 이름 덩어리 하나의 기본 크기(문자 수). 이보다 긴 이름은 따로 덩어리를 만든다. */
+#define NAME_CHUNK_CHARS 32768
+
+struct ScanNameChunk {
+    ScanNameChunk *next;
+    size_t used;
+    size_t cap;
+    wchar_t data[];
+};
+
+/* name 의 앞 len 문자를 이름 저장소에 복사한다. 메모리가 부족하면 NULL. */
+static wchar_t *name_dup(ScanModel *m, const wchar_t *name, size_t len)
+{
+    ScanNameChunk *c = m->names;
+    wchar_t *dst;
+
+    if (c == NULL || c->cap - c->used < len + 1) {
+        size_t cap = len + 1 > NAME_CHUNK_CHARS ? len + 1 : NAME_CHUNK_CHARS;
+        c = malloc(sizeof(*c) + cap * sizeof(wchar_t));
+        if (c == NULL) {
+            return NULL;
+        }
+        c->next = m->names;
+        c->used = 0;
+        c->cap = cap;
+        m->names = c;
+    }
+    dst = c->data + c->used;
+    memcpy(dst, name, len * sizeof(wchar_t));
+    dst[len] = L'\0';
+    c->used += len + 1;
+    return dst;
+}
+
 void scan_model_init(ScanModel *model)
 {
     memset(model, 0, sizeof(*model));
@@ -20,45 +54,53 @@ void scan_model_init(ScanModel *model)
 
 void scan_model_free(ScanModel *model)
 {
-    size_t i;
+    ScanNameChunk *c;
 
     if (model == NULL) {
         return;
     }
-    for (i = 0; i < model->len; i++) {
-        free(model->nodes[i].name);
+    for (c = model->names; c != NULL;) {
+        ScanNameChunk *next = c->next;
+        free(c);
+        c = next;
     }
     free(model->nodes);
     scan_report_free(&model->report);
     scan_model_init(model);
 }
 
-/* name 의 소유권을 가져간다. 실패하면 name 을 해제하고 SCAN_NODE_NONE. */
-static size_t add_node(ScanModel *m, wchar_t *name, size_t parent, uint32_t flags)
+/* name 을 이름 저장소에 복사해 노드를 붙인다. 실패하면 SCAN_NODE_NONE. */
+static size_t add_node(ScanModel *m, const wchar_t *name, size_t parent, uint32_t flags)
 {
     ScanNode *node;
     size_t index;
+    wchar_t *copy;
 
     if (name == NULL) {
         m->out_of_memory = 1;
         return SCAN_NODE_NONE;
     }
     if (m->len == m->cap) {
-        size_t cap = m->cap ? m->cap * 2 : 64;
+        /* 1.5배씩 늘려 큰 트리에서 재할당 순간의 최대 메모리를 줄인다. */
+        size_t cap = m->cap ? m->cap + m->cap / 2 : 64;
         ScanNode *grown = realloc(m->nodes, cap * sizeof(*grown));
         if (grown == NULL) {
-            free(name);
             m->out_of_memory = 1;
             return SCAN_NODE_NONE;
         }
         m->nodes = grown;
         m->cap = cap;
     }
+    copy = name_dup(m, name, wcslen(name));
+    if (copy == NULL) {
+        m->out_of_memory = 1;
+        return SCAN_NODE_NONE;
+    }
 
     index = m->len++;
     node = &m->nodes[index];
     memset(node, 0, sizeof(*node));
-    node->name = name;
+    node->name = copy;
     node->parent = parent;
     node->first_child = SCAN_NODE_NONE;
     node->last_child = SCAN_NODE_NONE;
@@ -116,6 +158,7 @@ static uintptr_t on_entry(const ScanEntry *entry, uintptr_t parent_id,
     if (!entry->is_dir) {
         m->nodes[parent].own_files++;
         m->nodes[parent].own_bytes += entry->size;
+        m->nodes[parent].own_alloc += entry->alloc_size;
         return 0;
     }
 
@@ -124,7 +167,7 @@ static uintptr_t on_entry(const ScanEntry *entry, uintptr_t parent_id,
     } else if (!will_descend) {
         flags |= SCAN_NODE_DEPTH_LIMIT;
     }
-    index = add_node(m, path_dup(entry->name), parent, flags);
+    index = add_node(m, entry->name, parent, flags);
     return index == SCAN_NODE_NONE ? 0 : ID_OF(index);
 }
 
@@ -185,6 +228,7 @@ static void finalize(ScanModel *m)
         n->flags &= ~NODE_BEGUN;
         n->total_files = n->own_files;
         n->total_bytes = n->own_bytes;
+        n->total_alloc = n->own_alloc;
         n->total_dirs = 0;
     }
 
@@ -194,6 +238,7 @@ static void finalize(ScanModel *m)
         ScanNode *p = &m->nodes[n->parent];
         p->total_files += n->total_files;
         p->total_bytes += n->total_bytes;
+        p->total_alloc += n->total_alloc;
         p->total_dirs += n->total_dirs + 1;
     }
 }
@@ -218,7 +263,9 @@ ScanStatus scan_model_build_ex(ScanModel *model, const wchar_t *root, uint32_t m
 
     full = root != NULL && root[0] != L'\0' ? path_full(root) : NULL;
     if (full != NULL) {
-        root_index = add_node(model, path_strip_extended(full), SCAN_NODE_NONE, 0);
+        wchar_t *display = path_strip_extended(full);
+        root_index = add_node(model, display, SCAN_NODE_NONE, 0);
+        free(display);
         free(full);
     }
 
@@ -396,7 +443,9 @@ size_t scan_model_rank(const ScanModel *model, ScanRankKey key, size_t *out, siz
     }
     for (i = 0; i < count; i++) {
         const ScanNode *node = &model->nodes[i + 1];
-        items[i].key = key == SCAN_RANK_OWN_BYTES ? node->own_bytes : node->total_bytes;
+        items[i].key = key == SCAN_RANK_OWN_BYTES     ? node->own_bytes
+                       : key == SCAN_RANK_TOTAL_ALLOC ? node->total_alloc
+                                                      : node->total_bytes;
         items[i].index = i + 1;
     }
     qsort(items, count, sizeof(*items), cmp_rank);

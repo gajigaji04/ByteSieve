@@ -47,11 +47,13 @@ enum {
     IDC_C_CHECK_ALL,
     IDC_C_CHECK_NONE,
     IDC_C_TRASH,
-    IDC_C_SELECTION
+    IDC_C_SELECTION,
+    IDC_C_ECO_LABEL,
+    IDC_C_ECO
 };
 
 /* 목록 열. 첫 열(용량)에 체크 상자가 붙는다. */
-enum { COL_SIZE, COL_TYPE, COL_PATH, COL_FILES, COL_NOTE, COL_CLEAN, COL_COUNT };
+enum { COL_SIZE, COL_TYPE, COL_ECO, COL_PATH, COL_FILES, COL_NOTE, COL_CLEAN, COL_COUNT };
 
 /* 유형 필터 콤보 상자의 항목 순서와 비트. */
 static const struct {
@@ -60,12 +62,29 @@ static const struct {
 } g_filters[] = {
     {L"전체", CLEANUP_MASK_ALL},
     {L"Node.js (node_modules)", CLEANUP_MASK(CLEANUP_NODE_MODULES)},
-    {L"빌드 결과물 (dist·build·out)", CLEANUP_MASK(CLEANUP_BUILD)},
-    {L"개발 캐시 (.cache·.next·.vite)", CLEANUP_MASK(CLEANUP_CACHE)},
+    {L"빌드 결과물 (dist·build·target·bin·obj 등)", CLEANUP_MASK(CLEANUP_BUILD)},
+    {L"개발 캐시 (.cache·.next·__pycache__ 등)", CLEANUP_MASK(CLEANUP_CACHE)},
     {L"임시 파일 (.tmp·.temp·*.tmp)", CLEANUP_MASK(CLEANUP_TEMP)},
     {L"로그 (*.log)", CLEANUP_MASK(CLEANUP_LOG)},
 };
 #define FILTER_COUNT (sizeof(g_filters) / sizeof(g_filters[0]))
+
+/* 개발 환경 필터 콤보 상자의 항목 순서와 비트. */
+static const struct {
+    const wchar_t *label;
+    unsigned mask;
+} g_eco_filters[] = {
+    {L"전체", CLEANUP_ECO_MASK_ALL},
+    {L"Node.js", CLEANUP_ECO_BIT(CLEANUP_ECO_NODE)},
+    {L"Python", CLEANUP_ECO_BIT(CLEANUP_ECO_PYTHON)},
+    {L"Rust", CLEANUP_ECO_BIT(CLEANUP_ECO_RUST)},
+    {L"Java·Kotlin", CLEANUP_ECO_BIT(CLEANUP_ECO_JAVA)},
+    {L".NET·Visual Studio", CLEANUP_ECO_BIT(CLEANUP_ECO_DOTNET)},
+    {L"C/C++", CLEANUP_ECO_BIT(CLEANUP_ECO_CPP)},
+    {L"Go", CLEANUP_ECO_BIT(CLEANUP_ECO_GO)},
+    {L"일반", CLEANUP_ECO_BIT(CLEANUP_ECO_GENERIC)},
+};
+#define ECO_FILTER_COUNT (sizeof(g_eco_filters) / sizeof(g_eco_filters[0]))
 
 /* CreateWindowExW 로 넘기는 생성 인자. */
 typedef struct {
@@ -85,7 +104,7 @@ typedef struct {
 typedef struct {
     HWND hwnd;
     HWND path, browse, start, cancel, progress, status, warn, filter_label, filter, summary,
-        list, check_all, check_none, trash_btn, selection;
+        list, check_all, check_none, trash_btn, selection, eco_label, eco;
     HFONT font;
     int dpi;
 
@@ -139,6 +158,28 @@ static const wchar_t *category_label(CleanupCategory category)
         return L"로그";
     default:
         return L"";
+    }
+}
+
+static const wchar_t *eco_label(CleanupEco eco)
+{
+    switch (eco) {
+    case CLEANUP_ECO_NODE:
+        return L"Node.js";
+    case CLEANUP_ECO_PYTHON:
+        return L"Python";
+    case CLEANUP_ECO_RUST:
+        return L"Rust";
+    case CLEANUP_ECO_JAVA:
+        return L"Java·Kotlin";
+    case CLEANUP_ECO_DOTNET:
+        return L".NET";
+    case CLEANUP_ECO_CPP:
+        return L"C/C++";
+    case CLEANUP_ECO_GO:
+        return L"Go";
+    default:
+        return L"일반";
     }
 }
 
@@ -304,6 +345,16 @@ static unsigned current_mask(const CleanupPanel *p)
     return g_filters[sel].mask;
 }
 
+static unsigned current_eco_mask(const CleanupPanel *p)
+{
+    LRESULT sel = SendMessageW(p->eco, CB_GETCURSEL, 0, 0);
+
+    if (sel < 0 || (size_t)sel >= ECO_FILTER_COUNT) {
+        sel = 0;
+    }
+    return g_eco_filters[sel].mask;
+}
+
 static void update_summary(CleanupPanel *p)
 {
     wchar_t text[256], shown[32], total[32];
@@ -323,7 +374,7 @@ static void update_summary(CleanupPanel *p)
 /* 필터를 적용해 목록을 다시 만든다(가상 목록이라 개수만 바꾼다). */
 static void apply_filter(CleanupPanel *p)
 {
-    unsigned mask = current_mask(p);
+    unsigned mask = current_mask(p), eco_mask = current_eco_mask(p);
     size_t count;
 
     free(p->view);
@@ -331,12 +382,13 @@ static void apply_filter(CleanupPanel *p)
     p->view_len = 0;
     p->view_bytes = 0;
     if (p->has_result) {
-        count = cleanup_select(&p->result, mask, NULL, 0, NULL);
+        count = cleanup_select_ex(&p->result, mask, eco_mask, NULL, 0, NULL);
         if (count > 0) {
             p->view = malloc(count * sizeof(*p->view));
         }
         if (p->view != NULL) {
-            p->view_len = cleanup_select(&p->result, mask, p->view, count, &p->view_bytes);
+            p->view_len =
+                cleanup_select_ex(&p->result, mask, eco_mask, p->view, count, &p->view_bytes);
         }
     }
     ListView_SetItemCountEx(p->list, (int)p->view_len, 0);
@@ -725,6 +777,9 @@ static void on_get_dispinfo(CleanupPanel *p, NMLVDISPINFOW *di)
     case COL_TYPE:
         di->item.pszText = (wchar_t *)category_label(item->category);
         break;
+    case COL_ECO:
+        di->item.pszText = (wchar_t *)eco_label(item->eco);
+        break;
     case COL_PATH:
         /* 결과가 바뀌기 전까지 유효한 문자열을 그대로 넘긴다. */
         di->item.pszText = item->path;
@@ -753,7 +808,8 @@ static void panel_layout(CleanupPanel *p)
 {
     RECT rc;
     int h = pscale(p, 24), bw = pscale(p, 84), gap = pscale(p, 6);
-    int w, y, path_w, label_w = pscale(p, 40), combo_w = pscale(p, 230), list_h, sum_x;
+    int w, y, path_w, label_w = pscale(p, 40), combo_w = pscale(p, 260), list_h, sum_x;
+    int eco_x, eco_w = pscale(p, 150);
     int trash_w = pscale(p, 140);
 
     GetClientRect(p->hwnd, &rc);
@@ -780,7 +836,10 @@ static void panel_layout(CleanupPanel *p)
     MoveWindow(p->filter_label, 0, y + pscale(p, 4), label_w, pscale(p, 20), TRUE);
     /* 콤보 상자 높이는 펼친 목록 높이까지 포함한다. */
     MoveWindow(p->filter, label_w, y, combo_w, pscale(p, 200), TRUE);
-    sum_x = label_w + combo_w + gap * 2;
+    eco_x = label_w + combo_w + gap * 2;
+    MoveWindow(p->eco_label, eco_x, y + pscale(p, 4), label_w, pscale(p, 20), TRUE);
+    MoveWindow(p->eco, eco_x + label_w, y, eco_w, pscale(p, 240), TRUE);
+    sum_x = eco_x + label_w + eco_w + gap * 2;
     MoveWindow(p->summary, sum_x, y + pscale(p, 4), w - sum_x > 0 ? w - sum_x : 0,
                pscale(p, 20), TRUE);
     y += h + gap;
@@ -816,7 +875,8 @@ static void panel_create_controls(CleanupPanel *p)
     } cols[COL_COUNT] = {
         {L"용량", 90, LVCFMT_RIGHT},
         {L"유형", 90, LVCFMT_LEFT},
-        {L"경로", 480, LVCFMT_LEFT},
+        {L"개발 환경", 90, LVCFMT_LEFT},
+        {L"경로", 440, LVCFMT_LEFT},
         {L"파일 수", 80, LVCFMT_RIGHT},
         {L"비고", 150, LVCFMT_LEFT},
         {L"정리", 220, LVCFMT_LEFT},
@@ -836,6 +896,9 @@ static void panel_create_controls(CleanupPanel *p)
     p->filter_label = panel_child(p, L"STATIC", L"유형:", SS_LEFT, 0, IDC_C_FILTER_LABEL);
     p->filter = panel_child(p, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0,
                             IDC_C_FILTER);
+    p->eco_label = panel_child(p, L"STATIC", L"환경:", SS_LEFT, 0, IDC_C_ECO_LABEL);
+    p->eco = panel_child(p, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0,
+                         IDC_C_ECO);
     p->summary = panel_child(p, L"STATIC", L"", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 0,
                              IDC_C_SUMMARY);
     p->check_all = panel_child(p, L"BUTTON", L"모두 선택", BS_PUSHBUTTON | WS_TABSTOP, 0,
@@ -856,6 +919,10 @@ static void panel_create_controls(CleanupPanel *p)
         SendMessageW(p->filter, CB_ADDSTRING, 0, (LPARAM)g_filters[i].label);
     }
     SendMessageW(p->filter, CB_SETCURSEL, 0, 0);
+    for (i = 0; i < ECO_FILTER_COUNT; i++) {
+        SendMessageW(p->eco, CB_ADDSTRING, 0, (LPARAM)g_eco_filters[i].label);
+    }
+    SendMessageW(p->eco, CB_SETCURSEL, 0, 0);
     /* 가상 목록이라 체크 상태는 패널이 갖고 LVN_GETDISPINFO 로 알려 준다. */
     ListView_SetExtendedListViewStyle(p->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER |
                                                    LVS_EX_CHECKBOXES);
@@ -921,6 +988,7 @@ static LRESULT CALLBACK panel_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             cleanup_panel_trash(hwnd, 1);
             return 0;
         case IDC_C_FILTER:
+        case IDC_C_ECO:
             if (HIWORD(wp) == CBN_SELCHANGE) {
                 apply_filter(p);
             }
@@ -1221,6 +1289,7 @@ int cleanup_panel_verify(HWND panel, int expect_cancelled)
     PANEL_CHECK(p->job == NULL && p->has_result);
     PANEL_CHECK(IsWindowEnabled(p->start) && !IsWindowEnabled(p->cancel));
     PANEL_CHECK(SendMessageW(p->filter, CB_GETCURSEL, 0, 0) == 0);
+    PANEL_CHECK(SendMessageW(p->eco, CB_GETCURSEL, 0, 0) == 0);
 
     if (expect_cancelled) {
         if (p->result.report.cancelled) {
@@ -1249,6 +1318,8 @@ int cleanup_panel_verify(HWND panel, int expect_cancelled)
         PANEL_CHECK(wcscmp(buf, expect) == 0);
         cell_text(p, 0, COL_TYPE, buf, 64);
         PANEL_CHECK(wcscmp(buf, category_label(top->category)) == 0);
+        cell_text(p, 0, COL_ECO, buf, 64);
+        PANEL_CHECK(wcscmp(buf, eco_label(top->eco)) == 0);
     }
 
     /* 유형별 필터: 개수·합계가 결과의 유형별 집계와 같고, 다른 유형은 없다 */
@@ -1271,6 +1342,40 @@ int cleanup_panel_verify(HWND panel, int expect_cancelled)
         }
     }
     SendMessageW(p->filter, CB_SETCURSEL, 0, 0);
+    apply_filter(p);
+    PANEL_CHECK(ListView_GetItemCount(p->list) == (int)p->result.len);
+
+    /* 개발 환경 필터: 개수·합계가 결과의 환경별 집계와 같고, 유형 필터와 함께 걸린다 */
+    for (f = 1; f < ECO_FILTER_COUNT; f++) {
+        CleanupEco eco = CLEANUP_ECO_COUNT;
+        size_t e, k;
+
+        for (e = 0; e < CLEANUP_ECO_COUNT; e++) {
+            if (g_eco_filters[f].mask == CLEANUP_ECO_BIT(e)) {
+                eco = (CleanupEco)e;
+            }
+        }
+        PANEL_CHECK(eco != CLEANUP_ECO_COUNT);
+        if (eco == CLEANUP_ECO_COUNT) {
+            continue;
+        }
+        SendMessageW(p->eco, CB_SETCURSEL, f, 0);
+        apply_filter(p);
+        PANEL_CHECK(ListView_GetItemCount(p->list) == (int)p->result.eco_count[eco]);
+        PANEL_CHECK(p->view_bytes == p->result.eco_bytes[eco]);
+        for (k = 0; k < p->view_len; k++) {
+            PANEL_CHECK(p->result.items[p->view[k]].eco == eco);
+        }
+        /* 유형(빌드 결과물) × 환경 */
+        SendMessageW(p->filter, CB_SETCURSEL, 2, 0);
+        apply_filter(p);
+        for (k = 0; k < p->view_len; k++) {
+            PANEL_CHECK(p->result.items[p->view[k]].eco == eco &&
+                        p->result.items[p->view[k]].category == CLEANUP_BUILD);
+        }
+        SendMessageW(p->filter, CB_SETCURSEL, 0, 0);
+    }
+    SendMessageW(p->eco, CB_SETCURSEL, 0, 0);
     apply_filter(p);
     PANEL_CHECK(ListView_GetItemCount(p->list) == (int)p->result.len);
     return failures;
