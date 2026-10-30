@@ -3,7 +3,8 @@
 Windows용 디스크 사용량 분석 도구입니다. 지정한 폴더 아래의 파일 수·폴더 수·총 용량을 집계하고,
 CLI(텍스트·JSON Lines)와 Win32 GUI(진행률·폴더 트리·용량 순위)로 결과를 보여 줍니다.
 GUI의 드라이브 탭에서는 시스템의 모든 논리 드라이브 용량과 사용률을 한눈에 볼 수 있고,
-정리 후보 탭에서는 `node_modules`·빌드 결과물·개발 캐시·임시·로그 파일을 찾아 예상 확보 용량을 보여 줍니다.
+정리 후보 탭에서는 `node_modules`·빌드 결과물·개발 캐시·임시·로그 파일을 찾아 예상 확보 용량을 보여 주고,
+고른 항목을 확인을 거쳐 **Windows 휴지통으로** 옮깁니다(영구 삭제 없음, 시스템·중요 폴더 보호).
 C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니다.
 
 ## 진행 현황
@@ -21,7 +22,7 @@ C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니�
 |---|---|---|
 | Phase 1 | 드라이브 사용량: 논리 드라이브 목록, 전체·사용·여유 용량, 사용률 막대, 새로고침 | 완료 |
 | Phase 2 | 정리 후보 탐지: 개발 캐시·빌드 결과물·임시·로그, 예상 확보 용량, 유형 필터, 취소 (읽기 전용) | 완료 |
-| Phase 3 | 정리 후보 삭제 | 예정 |
+| Phase 3 | 안전한 정리: 항목 선택, 확인 창, 휴지통 이동(영구 삭제 없음), 시스템·중요 경로 보호, 성공·실패 표시 | 완료 |
 
 ## 구현된 기능
 
@@ -68,7 +69,7 @@ C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니�
 - 조회 함수를 주입할 수 있어(`drive_list_build`) 이동식 드라이브 오류 같은 경우를 실제 장치 없이 테스트합니다.
 
 ### 정리 후보 탐지 (`cleanup_rules`, `cleanup_scan`, `cleanup_job`)
-**읽기 전용입니다.** 디렉터리 열거(`FindFirstFileW`/`FindNextFileW`)로 얻은 이름·크기·속성만 쓰며, 파일을 열거나 내용을 읽지 않고, 삭제·이동·수정하지 않습니다. 실제 삭제는 다음 단계에서 따로 구현합니다.
+**읽기 전용입니다.** 디렉터리 열거(`FindFirstFileW`/`FindNextFileW`)로 얻은 이름·크기·속성만 쓰며, 파일을 열거나 내용을 읽지 않고, 삭제·이동·수정하지 않습니다. 정리(휴지통 이동)는 사용자가 고르고 확인한 항목에 대해서만 `cleanup_trash`가 따로 합니다.
 
 탐지 규칙(이름은 대소문자 무시, 정확히 일치):
 
@@ -89,6 +90,31 @@ C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니�
 - **선택한 경로 자체**는 탐색 범위일 뿐 항목이 되지 않습니다.
 - **오류·취소**: 스캐너 정책 그대로입니다(접근 거부·긴 경로 등은 기록하고 계속). 하위를 다 읽지 못한 항목은 **일부 누락**으로 표시하며, 취소하면 그때까지 찾은 결과를 보여 줍니다.
 - 탐지는 별도 스레드(`cleanup_job`)에서 하며 진행률 알림은 100ms 간격으로 제한합니다. 폴더마다 메모리를 잡지 않고 후보 항목만 저장합니다.
+
+### 안전한 정리 (`cleanup_trash`)
+탐지 결과에서 **사용자가 체크하고 확인한 항목만** Windows 휴지통으로 옮깁니다. 파일을 영구 삭제하는 코드 경로는 없습니다.
+
+옮기는 방법: 셸의 `IFileOperation`에 `FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE`(확인·오류 창 없음)를 주고 항목마다 따로 실행합니다.
+- 휴지통 용량 초과·휴지통 끄기 설정 등으로 셸이 **영구 삭제로 바꾸려 하면**, 진행 싱크의 `PreDeleteItem`에서 `TSF_DELETE_RECYCLE_IF_POSSIBLE`이 없는 것을 보고 거부합니다(`no_recycle`, 항목은 그대로).
+- `PostDeleteItem`으로 휴지통 안의 실제 위치를 받고, 원래 경로가 남아 있으면(사용 중인 파일 등으로 일부만 옮겨진 경우 포함) 실패로 봅니다.
+
+삭제 보호(하나라도 걸리면 그 항목은 건드리지 않음):
+
+| 단계 | 거부 조건 | 상태 |
+|---|---|---|
+| 경로 판정 (탐지 직후·옮기기 직전) | 네트워크(UNC)·상대 경로, 260자 이상(휴지통 미지원) | `deny_path` |
+| | 탐지 경로 밖이거나 탐지 경로 자체 | `deny_outside` |
+| | Windows·`Program Files`·`ProgramData`, 볼륨 루트의 `$Recycle.Bin`·`System Volume Information` 등과 같거나 그 아래, 보호 경로 안에서 탐지한 항목 | `deny_protected` |
+| | 볼륨 루트, `Users`, 사용자 프로필·공용 프로필, 바탕 화면·문서·다운로드·사진·음악·동영상·`AppData`(Roaming/Local/LocalLow), **실행 중인 프로그램 폴더**, 위 보호 경로와 같거나 **그 상위** | `deny_critical` |
+| | 하위를 다 읽지 못한 항목(접근 거부·취소로 **일부 누락**) — 내용과 용량을 확신할 수 없음 | `deny_incomplete` |
+| 옮기기 직전 확인 | 고정 디스크가 아님(이동식·네트워크·광학 드라이브는 휴지통이 없어 영구 삭제 위험) | `deny_drive` |
+| | 이미 없음 | `missing` |
+| | 탐지 때와 종류(폴더/파일)가 다름, 항목이 링크(정션·심볼릭 링크), `GetFinalPathNameByHandleW`로 구한 실제 위치가 표시 경로와 다름(중간 폴더가 정션으로 바뀐 경우, `subst` 드라이브 등) | `changed` |
+| 옮기는 중 | 휴지통에 넣을 수 없어 영구 삭제될 상황 | `no_recycle` |
+| | 사용 중·접근 거부 등 셸 오류(HRESULT 기록) | `failed` |
+
+- 작업은 STA로 초기화한 별도 스레드(`CleanupTrashJob`)에서 하므로 큰 `node_modules`를 옮겨도 창이 멈추지 않습니다. 취소하면 옮기고 있던 항목만 끝까지 옮기고 나머지는 `cancelled`로 남깁니다.
+- 보호 판정(`cleanup_guard_check`)은 문자열만 보는 순수 함수라, 실제 시스템 폴더를 건드리지 않고 단위 테스트합니다.
 
 ### CLI (`disk-scanner`)
 - 사람이 읽는 요약을 출력합니다. 오류는 종류별 개수와 함께 최대 20개까지 나열합니다.
@@ -116,7 +142,13 @@ C11과 Win32 API만 사용하며 외부 라이브러리 의존성은 없습니�
 - 진행률 표시줄과 상태 줄에 폴더·파일 수, 지금까지 찾은 후보 수와 용량, 오류 수, 현재 폴더를 보여 줍니다. 끝나면 오류·건너뛴 폴더·제외한 시스템 폴더·링크 수와 걸린 시간을 보여 줍니다.
 - 목록은 **용량 내림차순**으로 용량·유형·경로·파일 수·비고(확인됨/추정, 일부 누락, 시스템 경로)를 보여 줍니다. 수만 개 항목도 가볍게 그리도록 가상 목록을 씁니다.
 - **유형** 콤보 상자로 전체·Node.js·빌드 결과물·개발 캐시·임시 파일·로그 중 하나만 볼 수 있습니다. 요약 줄에 `표시 n개 · 용량 / 전체 n개 · 예상 확보 용량`을 보여 줍니다.
-- 탐지 중에 창을 닫으면 탐지를 취소하고 스레드가 끝날 때까지 기다린 뒤 종료합니다.
+- **정리**: 목록의 체크 상자로 항목을 고릅니다(클릭 또는 선택한 행에서 Space). [모두 선택]은 지금 필터에 보이는 항목 중 옮길 수 있는 것만 고르고, [선택 해제]는 보이는 항목을 해제합니다. 다른 필터에서 고른 항목도 선택이 유지됩니다.
+  - 선택 줄에 `선택 n개 · 예상 확보 용량`과 지금까지 휴지통으로 옮긴 개수·용량을 보여 줍니다.
+  - 보호 대상은 체크 상자가 없고 **정리** 열에 `보호: 시스템 보호 경로`처럼 사유가 나옵니다.
+  - **[휴지통으로 이동...]**(Alt+D)을 누르면 선택한 항목의 유형·용량·경로(최대 12개, 나머지는 "외 n개")와 예상 확보 용량, '추정' 항목 수 경고를 담은 확인 창이 뜹니다. 기본 버튼은 **[아니요]**이며 [예]를 눌러야만 시작합니다.
+  - 옮기는 동안 진행률·성공·실패 수를 보여 주고 [취소]로 남은 항목을 멈출 수 있습니다. 탐지·찾아보기·선택 변경은 막힙니다.
+  - 끝나면 상태 줄에 `성공 n개(확보 용량) · 실패 n개 · 취소 n개`를, **정리** 열에 항목별로 `휴지통으로 이동됨`, `건너뜀: 탐지 후 바뀜(...)`, `실패: <Windows 오류 설명> (0x...)`을 표시합니다. 실패가 있으면 경로와 사유를 나열한 요약 창도 띄웁니다. 실패·취소한 항목은 선택이 남아 다시 시도할 수 있습니다.
+- 탐지나 휴지통 이동 중에 창을 닫으면 작업을 취소하고 스레드가 끝날 때까지 기다린 뒤 종료합니다.
 
 ## 디렉터리 구조
 
@@ -136,10 +168,11 @@ ByteSieve/
 │   ├── cleanup_rules.c/.h  정리 후보 이름 규칙, 프로젝트 표시 파일, 시스템 보호 경로
 │   ├── cleanup_scan.c/.h   정리 후보 탐지 엔진(중첩·용량 집계·필터·정렬)
 │   ├── cleanup_job.c/.h    탐지 작업 스레드, 진행률 사본, 취소
+│   ├── cleanup_trash.c/.h  삭제 보호 판정, 직전 확인, 휴지통 이동(IFileOperation), 작업 스레드
 │   ├── main.c              CLI 진입점(disk-scanner)
 │   ├── gui_main.c          Win32 GUI 진입점(bytesieve-gui), 탭 전환
 │   ├── gui_drives.c/.h     드라이브 대시보드 패널(목록·사용률 막대·새로고침)
-│   └── gui_cleanup.c/.h    정리 후보 패널(탐지·취소·유형 필터·용량순 목록)
+│   └── gui_cleanup.c/.h    정리 후보 패널(탐지·취소·유형 필터·체크 목록·확인·휴지통 이동·결과)
 └── tests/
     ├── test_path.c         경로 유틸리티
     ├── test_scanner.c      스캐너(권한 거부·정션·긴 경로 등)
@@ -151,10 +184,12 @@ ByteSieve/
     ├── test_size_format.c  용량 표시 문자열
     ├── test_cleanup_rules.c 탐지 규칙·보호 경로 판정
     ├── test_cleanup_scan.c 탐지 엔진·필터·취소·작업 스레드(픽스처 폴더)
+    ├── test_cleanup_trash.c 삭제 보호 판정, 실제 휴지통 이동·거부, 작업 스레드·취소
+    ├── gui_trash_check.cmake GUI 휴지통 이동 자체 검사(픽스처 생성·결과 확인·휴지통 정리)
     └── cli_check.cmake     CLI 종료 코드·출력 검사 스크립트
 ```
 
-CMake 대상은 다음과 같습니다. 정적 라이브러리는 `bytesieve_path` → `bytesieve_scanner` → `bytesieve_model` → `bytesieve_job` 순서로 의존하고, `bytesieve_cli`와 `bytesieve_jsonl`은 `bytesieve_scanner`에 의존합니다. `bytesieve_drive`(드라이브 조회)와 `bytesieve_format`(용량 표시)은 다른 라이브러리에 의존하지 않습니다. 정리 후보 탐지는 `bytesieve_cleanup_rules`(→ `bytesieve_path`) ← `bytesieve_cleanup`(+ `bytesieve_scanner`) ← `bytesieve_cleanup_job` 순서로 의존합니다. 실행 파일은 `disk-scanner`(CLI)와 `bytesieve-gui`(GUI)입니다.
+CMake 대상은 다음과 같습니다. 정적 라이브러리는 `bytesieve_path` → `bytesieve_scanner` → `bytesieve_model` → `bytesieve_job` 순서로 의존하고, `bytesieve_cli`와 `bytesieve_jsonl`은 `bytesieve_scanner`에 의존합니다. `bytesieve_drive`(드라이브 조회)와 `bytesieve_format`(용량 표시)은 다른 라이브러리에 의존하지 않습니다. 정리 후보 탐지는 `bytesieve_cleanup_rules`(→ `bytesieve_path`) ← `bytesieve_cleanup`(+ `bytesieve_scanner`) ← `bytesieve_cleanup_job` 순서로 의존하고, 휴지통 이동 `bytesieve_cleanup_trash`는 `bytesieve_cleanup`과 `ole32`·`shell32`·`uuid`에 의존합니다. 실행 파일은 `disk-scanner`(CLI)와 `bytesieve-gui`(GUI)입니다.
 
 ## 빌드
 
@@ -216,7 +251,7 @@ build\Debug\bytesieve-gui.exe
 build\Debug\bytesieve-gui.exe C:\Users\me\Projects
 ```
 
-정리 후보를 찾으려면 **정리 후보** 탭에서 경로(예: `C:\Users\me\Projects`)를 고르고 [탐지]를 누릅니다. 유형 콤보 상자로 원하는 유형만 볼 수 있습니다. 이 단계에서는 아무것도 삭제하지 않으므로, 정리는 목록을 보고 직접 하세요. **추정**이나 **시스템 경로** 표시가 붙은 항목은 특히 조심해야 합니다.
+정리 후보를 찾으려면 **정리 후보** 탭에서 경로(예: `C:\Users\me\Projects`)를 고르고 [탐지]를 누릅니다. 유형 콤보 상자로 원하는 유형만 볼 수 있습니다. 정리하려면 항목을 체크하고 **[휴지통으로 이동...]**을 누른 뒤 확인 창의 경로·유형·용량을 보고 [예]를 누릅니다. 옮긴 항목은 Windows 휴지통에서 복원할 수 있습니다. **추정** 표시가 붙은 항목은 프로젝트 파일이 옆에 없어 빌드 결과물이 아닐 수 있으니 특히 확인하세요.
 
 자동 검사용 옵션도 있습니다. 창을 숨긴 채 스캔하고 화면 상태를 검증한 뒤 종료 코드로 결과를 알립니다(0 성공, 1 실패).
 
@@ -226,7 +261,10 @@ build\Debug\bytesieve-gui.exe --self-test-cancel C:\some\dir   # 시작 직후 �
 build\Debug\bytesieve-gui.exe --self-test-drives               # 드라이브 탭 조회 후 목록 검증
 build\Debug\bytesieve-gui.exe --self-test-cleanup C:\some\dir         # 정리 후보 탐지 후 목록·필터 검증
 build\Debug\bytesieve-gui.exe --self-test-cleanup-cancel C:\some\dir  # 탐지 시작 직후 취소
+build\Debug\bytesieve-gui.exe --self-test-trash C:\some\dir          # 주의: 옮길 수 있는 항목을 모두 휴지통으로 옮김
 ```
+
+`--self-test-trash`는 확인 창 없이 실제로 휴지통으로 옮기므로 테스트용 폴더에만 쓰세요. `gui_trash` 테스트는 빌드 폴더 안에 전용 픽스처를 만들어 이 옵션을 실행합니다.
 
 ## 테스트
 
@@ -234,13 +272,15 @@ build\Debug\bytesieve-gui.exe --self-test-cleanup-cancel C:\some\dir  # 탐지 �
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-현재 테스트는 39개입니다.
-- 단위 테스트: `path`, `scanner`, `scan_model`, `scan_job`, `jsonl`, `cli`, `drive`, `size_format`, `cleanup_rules`, `cleanup_scan`
+현재 테스트는 41개입니다.
+- 단위 테스트: `path`, `scanner`, `scan_model`, `scan_job`, `jsonl`, `cli`, `drive`, `size_format`, `cleanup_rules`, `cleanup_scan`, `cleanup_trash`
 - CLI 종료 코드·출력 검사: `cli_*` 및 인자 검사 테스트들
-- GUI 자체 검사: `gui_scan`, `gui_cancel`, `gui_missing_dir`, `gui_drives`, `gui_cleanup`, `gui_cleanup_cancel`
+- GUI 자체 검사: `gui_scan`, `gui_cancel`, `gui_missing_dir`, `gui_drives`, `gui_cleanup`, `gui_cleanup_cancel`, `gui_trash`
 
 `drive` 테스트는 가짜 조회 함수로 이동식 드라이브 오류·분리·잘못된 값을 재현하고, 실제 시스템에서는 Windows가 설치된 드라이브가 정상 조회되는지와 없는 드라이브 문자가 실패 상태로 처리되는지 확인합니다.
 
 `cleanup_scan` 테스트는 임시 폴더에 픽스처를 만들어 중첩된 `node_modules`·`dist`, 확인됨/추정, 비슷하지만 해당하지 않는 이름(`report.log.bak`, `buildx`), 정션과 정션 순환, 접근 거부 폴더, 260자를 넘는 경로, 보호 경로 제외와 보호 경로 안에서의 경고, 유형 필터와 정렬, 취소, 작업 스레드를 확인합니다.
+
+`cleanup_trash` 테스트는 보호 판정 규칙(보호 경로 아래, 중요 경로와 그 상위, 탐지 경로 밖·자체, 이름만 비슷한 형제 폴더, 일부 누락, UNC·상대·긴 경로, 대소문자·끝 구분자)과 현재 시스템의 보호 목록(Windows 폴더, 사용자 프로필, 테스트 실행 파일 폴더)을 확인합니다. 이어서 임시 폴더 픽스처의 탐지 결과를 **실제로 휴지통으로 옮겨** 원래 자리에 없고 휴지통 안에 있는지 확인하고, 보호 경로·종류가 바뀐 항목·정션 항목·정션을 거친 경로·없는 항목이 손대지 않은 채 거부되는지, 작업 스레드의 결과 순서·집계·취소를 확인합니다. `gui_trash`는 접근 거부 폴더가 든 `node_modules`(일부 누락 → 보호)를 포함한 픽스처로 GUI의 선택·이동·결과 표시를 확인합니다. 두 테스트 모두 **자신이 휴지통에 넣은 항목만** 지워 사용자 휴지통을 원래대로 둡니다.
 
 `ctest`가 PATH에 없으면 Visual Studio 개발자 PowerShell에서 실행하거나 Visual Studio에 포함된 CMake 경로(`...\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin`)를 사용하세요.
