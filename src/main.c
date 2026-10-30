@@ -3,124 +3,96 @@
 #include <stdio.h>
 #include <wchar.h>
 
+#include "cli.h"
 #include "jsonl.h"
 #include "scanner.h"
 
 /* JSON Lines 모드에서 progress 이벤트를 내는 항목 간격. */
 #define JSONL_PROGRESS_INTERVAL 1000
 
-enum {
-    EXIT_COMPLETE = 0,
-    EXIT_PARTIAL = 1,
-    EXIT_FATAL = 2
-};
-
-static void print_usage(FILE *out)
+/*
+ * 이후 wide 출력 함수만 사용한다(printf와 혼용 금지).
+ * 콘솔은 UTF-16 으로 써야 한글이 깨지지 않고, 파이프·파일로 넘길 때는 UTF-8 로 쓴다.
+ */
+static void set_wide_mode(FILE *stream)
 {
-    fwprintf(out,
-             L"Usage: disk-scanner [--max-depth N] <directory>\n"
-             L"       disk-scanner -h | --help\n"
-             L"\n"
-             L"Counts files, directories and total size under <directory>,\n"
-             L"including all subdirectories.\n"
-             L"\n"
-             L"  --max-depth N  descend at most N levels below <directory>\n"
-             L"                 (0 = only <directory> itself; default: unlimited)\n");
+    int fd = _fileno(stream);
+    _setmode(fd, _isatty(fd) ? _O_U16TEXT : _O_U8TEXT);
 }
 
-static int is_help(const wchar_t *arg)
-{
-    return wcscmp(arg, L"-h") == 0 || wcscmp(arg, L"--help") == 0;
-}
-
-/* 0 이상의 10진 정수만 허용한다. */
-static int parse_depth(const wchar_t *arg, uint32_t *out)
-{
-    wchar_t *end;
-    unsigned long long value;
-
-    if (arg[0] < L'0' || arg[0] > L'9') {
-        return 0;
-    }
-    value = wcstoull(arg, &end, 10);
-    if (*end != L'\0' || value >= SCAN_DEPTH_UNLIMITED) {
-        return 0;
-    }
-    *out = (uint32_t)value;
-    return 1;
-}
-
-static int run_scan(const wchar_t *target, uint32_t max_depth)
+static int run_scan(const CliOptions *opts)
 {
     ScanReport report;
     ScanStatus status;
-    size_t i;
 
     scan_report_init(&report);
-    status = scan_tree(target, max_depth, &report, NULL, NULL);
-
-    for (i = 0; i < report.errors_len; i++) {
-        fwprintf(stderr, L"error: %ls: %ls (Windows error %lu)\n",
-                 report.errors[i].path ? report.errors[i].path : target,
-                 scan_error_kind_name(report.errors[i].kind),
-                 (unsigned long)report.errors[i].code);
-    }
-    if (report.error_count > report.errors_len) {
-        fwprintf(stderr, L"error: %llu more error(s) not recorded (out of memory)\n",
-                 (unsigned long long)(report.error_count - report.errors_len));
-    }
-
-    wprintf(L"Target:         %ls\n", target);
-    if (max_depth == SCAN_DEPTH_UNLIMITED) {
-        wprintf(L"Max depth:      unlimited\n");
-    } else {
-        wprintf(L"Max depth:      %lu\n", (unsigned long)max_depth);
-    }
-    wprintf(L"Files:          %llu\n", (unsigned long long)report.file_count);
-    wprintf(L"Directories:    %llu\n", (unsigned long long)report.dir_count);
-    wprintf(L"Total size:     %llu bytes\n", (unsigned long long)report.total_bytes);
-    wprintf(L"Reparse points: %llu (not descended)\n",
-            (unsigned long long)report.reparse_count);
-    wprintf(L"Errors:         %llu\n", (unsigned long long)report.error_count);
-    wprintf(L"Skipped dirs:   %llu\n", (unsigned long long)report.skipped_dir_count);
-    wprintf(L"Aborted:        %ls\n", report.aborted ? L"yes" : L"no");
-    wprintf(L"Status:         %ls\n", scan_status_name(status));
-
+    status = scan_tree(opts->target, opts->max_depth, &report, NULL, NULL);
+    cli_print_report(stdout, stderr, opts->target, opts->max_depth, &report, status);
     scan_report_free(&report);
-    return exit_code_for(status);
+    return cli_exit_code(status);
+}
+
+/* stdout 은 바이너리 모드여야 한다(UTF-8 바이트를 그대로, 줄바꿈은 LF). */
+static int run_scan_jsonl(const CliOptions *opts)
+{
+    ScanReport report;
+    ScanStatus status;
+    JsonBuf buf;
+    JsonlProgress progress;
+    int code;
+
+    scan_report_init(&report);
+    jsonl_buf_init(&buf);
+
+    jsonl_start(&buf, opts->target);
+    jsonl_buf_flush(&buf, stdout);
+
+    progress.buf = &buf;
+    progress.report = &report;
+    progress.out = stdout;
+    progress.interval = JSONL_PROGRESS_INTERVAL;
+    progress.seen = 0;
+    status = scan_tree(opts->target, opts->max_depth, &report,
+                       jsonl_progress_visit, &progress);
+    code = cli_exit_code(status);
+
+    jsonl_result(&buf, opts->target, &report);
+    jsonl_complete(&buf, status, code);
+    if (!jsonl_buf_flush(&buf, stdout)) {
+        fwprintf(stderr, L"error: failed to write JSON output\n");
+        code = EXIT_FATAL;
+    }
+
+    jsonl_buf_free(&buf);
+    scan_report_free(&report);
+    return code;
 }
 
 int wmain(int argc, wchar_t **argv)
 {
-    uint32_t max_depth = SCAN_DEPTH_UNLIMITED;
-    int i = 1;
+    CliOptions opts;
+    wchar_t err[512];
+    CliParseResult parsed;
 
-    /* 이후 wide 출력 함수만 사용한다(printf와 혼용 금지). */
-    _setmode(_fileno(stdout), _O_U16TEXT);
-    _setmode(_fileno(stderr), _O_U16TEXT);
+    set_wide_mode(stderr);
+    parsed = cli_parse_args(argc, argv, &opts, err, sizeof(err) / sizeof(err[0]));
 
-    if (argc == 2 && is_help(argv[1])) {
-        print_usage(stdout);
+    /* JSON Lines 모드의 stdout 은 UTF-8 바이트를 fwrite 로만 쓴다. */
+    if (parsed == CLI_PARSE_OK && opts.jsonl) {
+        _setmode(_fileno(stdout), _O_BINARY);
+        return run_scan_jsonl(&opts);
+    }
+    set_wide_mode(stdout);
+
+    switch (parsed) {
+    case CLI_PARSE_HELP:
+        cli_print_usage(stdout);
         return EXIT_COMPLETE;
-    }
-
-    if (argc == 4 && wcscmp(argv[1], L"--max-depth") == 0) {
-        if (!parse_depth(argv[2], &max_depth)) {
-            fwprintf(stderr, L"error: invalid --max-depth value: %ls\n", argv[2]);
-            print_usage(stderr);
-            return EXIT_FATAL;
-        }
-        i = 3;
-    } else if (argc != 2) {
-        print_usage(stderr);
+    case CLI_PARSE_ERROR:
+        fwprintf(stderr, L"error: %ls\n\n", err);
+        cli_print_usage(stderr);
         return EXIT_FATAL;
+    default:
+        return run_scan(&opts);
     }
-
-    if (argv[i][0] == L'-') {
-        fwprintf(stderr, L"error: unknown option: %ls\n", argv[i]);
-        print_usage(stderr);
-        return EXIT_FATAL;
-    }
-
-    return run_scan(argv[i], max_depth);
 }
