@@ -181,6 +181,7 @@ unsigned scan_effective_threads(void)
 
 /*
  * 열거된 항목 하나. 8바이트 단위로 이어 붙이며 이름(NUL 포함)이 바로 뒤따른다.
+ * REC_HAS_ID 이면 이름 앞에 파일 ID(RecId, 16바이트)가 끼어 있다(정밀 스캔에서만).
  * "." 와 ".." 는 담지 않는다.
  */
 typedef struct {
@@ -192,7 +193,14 @@ typedef struct {
     uint32_t reserved;
 } EntryRec;
 
+/* 파일 ID(FILE_ID_128). NTFS 의 64비트 ID 는 hi 가 0 이다. */
+typedef struct {
+    uint64_t lo;
+    uint64_t hi;
+} RecId;
+
 #define REC_ALLOC_KNOWN 1u
+#define REC_HAS_ID 2u
 
 typedef enum { TASK_QUEUED = 0, TASK_RUNNING, TASK_DONE } TaskState;
 
@@ -217,6 +225,7 @@ typedef struct DirTask {
     DWORD open_error;   /* 0 이 아니면 폴더를 열지 못함 */
     DWORD enum_error;   /* 0 이 아니면 열거 도중 오류(그때까지의 항목은 유효) */
     uint32_t depth;
+    uint64_t volume;    /* 정밀 스캔: 이 폴더가 있는 볼륨의 일련번호(모르면 0) */
     /*
      * 깊이 우선 처리 순서 키의 길이. 키는 루트에서 이 폴더까지 각 단계의 (형제 수 - 1 - 열거 순번)
      * 이다. 호출 스레드는 마지막 자식부터 내려가므로 키를 사전순으로 비교하면 처리 순서와 같다.
@@ -233,14 +242,28 @@ typedef struct DirTask {
 /* GetFileInformationByHandleEx 버퍼(FIND_FIRST_EX_LARGE_FETCH 와 비슷한 크기). */
 #define FETCH_BUFFER_BYTES (64 * 1024)
 
-static size_t rec_bytes(size_t name_len)
+static size_t rec_bytes(size_t name_len, int has_id)
 {
-    return (sizeof(EntryRec) + (name_len + 1) * sizeof(wchar_t) + 7) & ~(size_t)7;
+    return (sizeof(EntryRec) + (has_id ? sizeof(RecId) : 0) + (name_len + 1) * sizeof(wchar_t) +
+            7) &
+           ~(size_t)7;
+}
+
+/* 기록 하나의 전체 크기(다음 기록까지의 거리). */
+static size_t rec_size(const EntryRec *rec)
+{
+    return rec_bytes(rec->name_len, (rec->flags & REC_HAS_ID) != 0);
+}
+
+static const RecId *rec_id(const EntryRec *rec)
+{
+    return (rec->flags & REC_HAS_ID) ? (const RecId *)(rec + 1) : NULL;
 }
 
 static const wchar_t *rec_name(const EntryRec *rec)
 {
-    return (const wchar_t *)(rec + 1);
+    return (const wchar_t *)((const unsigned char *)(rec + 1) +
+                             ((rec->flags & REC_HAS_ID) ? sizeof(RecId) : 0));
 }
 
 /*
@@ -361,11 +384,11 @@ static int task_reserve(DirTask *t, size_t extra)
     return 1;
 }
 
-/* 항목을 하나 붙인다. 메모리가 부족하면 0. */
+/* 항목을 하나 붙인다. id 가 NULL 이 아니면 파일 ID도 담는다. 메모리가 부족하면 0. */
 static int task_append(DirTask *t, const wchar_t *name, size_t name_len, uint64_t size,
-                       uint64_t alloc, uint32_t attributes, uint32_t flags)
+                       uint64_t alloc, uint32_t attributes, uint32_t flags, const RecId *id)
 {
-    size_t need = rec_bytes(name_len);
+    size_t need = rec_bytes(name_len, id != NULL);
     EntryRec *rec;
     wchar_t *dst;
 
@@ -387,9 +410,12 @@ static int task_append(DirTask *t, const wchar_t *name, size_t name_len, uint64_
     rec->alloc = alloc;
     rec->attributes = attributes;
     rec->name_len = (uint32_t)name_len;
-    rec->flags = flags;
+    rec->flags = flags | (id != NULL ? REC_HAS_ID : 0u);
     rec->reserved = 0;
-    dst = (wchar_t *)(rec + 1);
+    if (id != NULL) {
+        memcpy(rec + 1, id, sizeof(*id));
+    }
+    dst = (wchar_t *)rec_name(rec);
     memcpy(dst, name, name_len * sizeof(wchar_t));
     dst[name_len] = L'\0';
     t->len += need;
@@ -470,7 +496,7 @@ static void fetch_records_find(DirTask *t)
         size = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
                    ? 0
                    : scan_combine_size((uint32_t)fd.nFileSizeHigh, (uint32_t)fd.nFileSizeLow);
-        if (!task_append(t, fd.cFileName, len, size, size, fd.dwFileAttributes, 0)) {
+        if (!task_append(t, fd.cFileName, len, size, size, fd.dwFileAttributes, 0, NULL)) {
             t->enum_error = ERROR_NOT_ENOUGH_MEMORY;
             FindClose(find);
             return;
@@ -490,8 +516,76 @@ static int fetch_unsupported(DWORD err)
            err == ERROR_CALL_NOT_IMPLEMENTED;
 }
 
-static void fetch_records(DirTask *t, unsigned char *scratch)
+/* 열거 정보 종류 하나에서 꺼낸 항목(정보 종류마다 구조가 달라 한곳에서 읽는다). */
+typedef struct {
+    DWORD next;          /* 다음 항목까지의 거리(0 이면 마지막) */
+    const wchar_t *name;
+    size_t name_len;
+    uint32_t attributes;
+    uint64_t size;
+    uint64_t alloc;
+    RecId id;
+    int has_id;
+} DirView;
+
+static void view_entry(FILE_INFO_BY_HANDLE_CLASS cls, const void *p, DirView *v)
 {
+    memset(v, 0, sizeof(*v));
+    if (cls == FileIdExtdDirectoryInfo) {
+        const FILE_ID_EXTD_DIR_INFO *d = p;
+        v->next = d->NextEntryOffset;
+        v->name = d->FileName;
+        v->name_len = d->FileNameLength / sizeof(wchar_t);
+        v->attributes = (uint32_t)d->FileAttributes;
+        v->size = (uint64_t)d->EndOfFile.QuadPart;
+        v->alloc = (uint64_t)d->AllocationSize.QuadPart;
+        memcpy(&v->id.lo, d->FileId.Identifier, 8);
+        memcpy(&v->id.hi, d->FileId.Identifier + 8, 8);
+        v->has_id = 1;
+    } else if (cls == FileIdBothDirectoryInfo) {
+        const FILE_ID_BOTH_DIR_INFO *d = p;
+        v->next = d->NextEntryOffset;
+        v->name = d->FileName;
+        v->name_len = d->FileNameLength / sizeof(wchar_t);
+        v->attributes = (uint32_t)d->FileAttributes;
+        v->size = (uint64_t)d->EndOfFile.QuadPart;
+        v->alloc = (uint64_t)d->AllocationSize.QuadPart;
+        v->id.lo = (uint64_t)d->FileId.QuadPart;
+        v->has_id = 1;
+    } else {
+        const FILE_FULL_DIR_INFO *d = p;
+        v->next = d->NextEntryOffset;
+        v->name = d->FileName;
+        v->name_len = d->FileNameLength / sizeof(wchar_t);
+        v->attributes = (uint32_t)d->FileAttributes;
+        v->size = (uint64_t)d->EndOfFile.QuadPart;
+        v->alloc = (uint64_t)d->AllocationSize.QuadPart;
+    }
+}
+
+/* 폴더 핸들로 볼륨 일련번호를 구한다(모르면 0). */
+static uint64_t handle_volume(HANDLE h)
+{
+    FILE_ID_INFO fi;
+    BY_HANDLE_FILE_INFORMATION bh;
+
+    if (GetFileInformationByHandleEx(h, FileIdInfo, &fi, sizeof(fi))) {
+        return fi.VolumeSerialNumber;
+    }
+    if (GetFileInformationByHandle(h, &bh)) {
+        return bh.dwVolumeSerialNumber;
+    }
+    return 0;
+}
+
+/*
+ * 폴더 하나를 열거해 t 에 담는다. 정밀 스캔(SCAN_OPT_HARDLINKS)이면 파일 ID를 함께 받는
+ * FileIdExtdDirectoryInfo(128비트 ID), 안 되면 FileIdBothDirectoryInfo(64비트 ID)를 쓰고
+ * 폴더 핸들로 볼륨 일련번호를 구한다. 둘 다 안 되면 ID 없이 열거한다.
+ */
+static void fetch_records(DirTask *t, unsigned char *scratch, unsigned options)
+{
+    FILE_INFO_BY_HANDLE_CLASS cls = FileFullDirectoryInfo;
     HANDLE h;
     int first = 1;
 
@@ -503,16 +597,29 @@ static void fetch_records(DirTask *t, unsigned char *scratch)
         t->open_error = err != 0 ? err : ERROR_GEN_FAILURE;
         return;
     }
+    if (options & SCAN_OPT_HARDLINKS) {
+        cls = FileIdExtdDirectoryInfo;
+        t->volume = handle_volume(h);
+    }
     for (;;) {
-        const FILE_FULL_DIR_INFO *d;
-        if (!GetFileInformationByHandleEx(h, FileFullDirectoryInfo, scratch,
-                                          FETCH_BUFFER_BYTES)) {
+        const unsigned char *p;
+        DirView v;
+        if (!GetFileInformationByHandleEx(h, cls, scratch, FETCH_BUFFER_BYTES)) {
             DWORD err = GetLastError();
             /* 빈 볼륨 루트는 "." 도 없어 첫 호출이 FILE_NOT_FOUND 다. */
             if (err == ERROR_NO_MORE_FILES || (first && err == ERROR_FILE_NOT_FOUND)) {
                 break;
             }
             if (first && fetch_unsupported(err)) {
+                /* ID 를 주는 정보 종류를 차례로 낮춘다. */
+                if (cls == FileIdExtdDirectoryInfo) {
+                    cls = FileIdBothDirectoryInfo;
+                    continue;
+                }
+                if (cls == FileIdBothDirectoryInfo) {
+                    cls = FileFullDirectoryInfo;
+                    continue;
+                }
                 CloseHandle(h);
                 fetch_records_find(t);
                 return;
@@ -524,40 +631,40 @@ static void fetch_records(DirTask *t, unsigned char *scratch)
         /* 이 묶음에 필요한 만큼만 미리 늘린다(대부분의 폴더는 묶음 하나로 끝난다). */
         {
             size_t need = 0;
-            d = (const FILE_FULL_DIR_INFO *)scratch;
+            p = scratch;
             for (;;) {
-                need += rec_bytes(d->FileNameLength / sizeof(wchar_t));
-                if (d->NextEntryOffset == 0) {
+                view_entry(cls, p, &v);
+                need += rec_bytes(v.name_len, v.has_id);
+                if (v.next == 0) {
                     break;
                 }
-                d = (const FILE_FULL_DIR_INFO *)((const unsigned char *)d + d->NextEntryOffset);
+                p += v.next;
             }
             if (!task_reserve(t, need)) {
                 t->enum_error = ERROR_NOT_ENOUGH_MEMORY;
                 break;
             }
         }
-        d = (const FILE_FULL_DIR_INFO *)scratch;
+        p = scratch;
         for (;;) {
-            size_t len = d->FileNameLength / sizeof(wchar_t);
-            if (len > 0 && !is_dot_name(d->FileName, len)) {
-                uint32_t attrs = (uint32_t)d->FileAttributes;
+            view_entry(cls, p, &v);
+            if (v.name_len > 0 && !is_dot_name(v.name, v.name_len)) {
                 uint64_t size = 0, alloc = 0;
-                if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-                    size = (uint64_t)d->EndOfFile.QuadPart;
-                    alloc = refine_alloc(t, d->FileName, len, attrs,
-                                         (uint64_t)d->AllocationSize.QuadPart);
+                if (!(v.attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    size = v.size;
+                    alloc = refine_alloc(t, v.name, v.name_len, v.attributes, v.alloc);
                 }
-                if (!task_append(t, d->FileName, len, size, alloc, attrs, REC_ALLOC_KNOWN)) {
+                if (!task_append(t, v.name, v.name_len, size, alloc, v.attributes,
+                                 REC_ALLOC_KNOWN, v.has_id ? &v.id : NULL)) {
                     t->enum_error = ERROR_NOT_ENOUGH_MEMORY;
                     CloseHandle(h);
                     return;
                 }
             }
-            if (d->NextEntryOffset == 0) {
+            if (v.next == 0) {
                 break;
             }
-            d = (const FILE_FULL_DIR_INFO *)((const unsigned char *)d + d->NextEntryOffset);
+            p += v.next;
         }
     }
     CloseHandle(h);
@@ -573,12 +680,12 @@ static int rec_wants_descend(const DirTask *t, const EntryRec *rec, uint32_t max
  * 폴더 하나를 열거해 t 에 담고 자식 작업을 만든다. 어느 스레드에서나 부를 수 있다
  * (t 와 새로 만든 자식 외에는 건드리지 않음).
  */
-static void fetch_dir(DirTask *t, unsigned char *scratch, uint32_t max_depth)
+static void fetch_dir(DirTask *t, unsigned char *scratch, uint32_t max_depth, unsigned options)
 {
     size_t off, n = 0;
 
-    fetch_records(t, scratch);
-    for (off = 0; off < t->len; off += rec_bytes(((const EntryRec *)(t->buf + off))->name_len)) {
+    fetch_records(t, scratch, options);
+    for (off = 0; off < t->len; off += rec_size((const EntryRec *)(t->buf + off))) {
         n += rec_wants_descend(t, (const EntryRec *)(t->buf + off), max_depth);
     }
     if (n == 0) {
@@ -593,7 +700,7 @@ static void fetch_dir(DirTask *t, unsigned char *scratch, uint32_t max_depth)
     n = 0;
     for (off = 0; off < t->len;) {
         const EntryRec *rec = (const EntryRec *)(t->buf + off);
-        off += rec_bytes(rec->name_len);
+        off += rec_size(rec);
         if (rec_wants_descend(t, rec, max_depth)) {
             t->kids[n] = task_new(t->path, t->path_len, rec_name(rec), rec->name_len, t->key,
                                   t->key_len, 1, (uint32_t)(t->kid_count - 1 - n), t->depth + 1);
@@ -624,6 +731,7 @@ typedef struct {
     int throttled;      /* 상한 때문에 쉬는 작업 스레드가 있으면 1 */
     int stop;
     uint32_t max_depth;
+    unsigned options; /* SCAN_OPT_* */
     HANDLE threads[SCAN_MAX_THREADS];
     int nthreads;
 } Pool;
@@ -843,7 +951,7 @@ static unsigned __stdcall pool_worker(void *arg)
         t->by_worker = 1;
         ReleaseSRWLockExclusive(&p->lock);
 
-        fetch_dir(t, scratch, p->max_depth);
+        fetch_dir(t, scratch, p->max_depth, p->options);
 
         AcquireSRWLockExclusive(&p->lock);
         if (t->discard) {
@@ -866,7 +974,7 @@ static unsigned __stdcall pool_worker(void *arg)
 }
 
 /* 작업 스레드를 띄운다. 하나도 못 띄우면 0(호출 스레드가 모두 열거한다). */
-static int pool_start(Pool *p, unsigned threads, uint32_t max_depth)
+static int pool_start(Pool *p, unsigned threads, uint32_t max_depth, unsigned options)
 {
     unsigned i;
 
@@ -875,6 +983,7 @@ static int pool_start(Pool *p, unsigned threads, uint32_t max_depth)
     InitializeConditionVariable(&p->work_cv);
     InitializeConditionVariable(&p->done_cv);
     p->max_depth = max_depth;
+    p->options = options;
     for (i = 0; i < threads && i < SCAN_MAX_THREADS; i++) {
         HANDLE h = (HANDLE)_beginthreadex(NULL, 0, pool_worker, p, 0, NULL);
         if (h == NULL) {
@@ -904,6 +1013,106 @@ static void pool_stop(Pool *p)
     p->nthreads = 0;
 }
 
+/* ---- 정밀 스캔: 본 파일 ID 집합 ---- */
+
+/* (볼륨, 파일 ID) 하나. lo 와 hi 가 모두 0 이면 빈 칸(0 인 ID 는 넣지 않는다). */
+typedef struct {
+    uint64_t volume;
+    uint64_t lo;
+    uint64_t hi;
+} IdKey;
+
+typedef struct {
+    IdKey *slots; /* 개방 주소법, 크기는 2의 거듭제곱 */
+    size_t cap;
+    size_t len;
+    int failed;   /* 늘리지 못해 더 넣을 수 없음 */
+} IdSet;
+
+#define IDSET_MIN_CAP 4096
+
+static uint64_t idset_hash(const IdKey *k)
+{
+    uint64_t h = k->lo ^ (k->hi * 0x9E3779B97F4A7C15ULL) ^ (k->volume * 0xC2B2AE3D27D4EB4FULL);
+
+    /* splitmix64 마무리 */
+    h ^= h >> 30;
+    h *= 0xBF58476D1CE4E5B9ULL;
+    h ^= h >> 27;
+    h *= 0x94D049BB133111EBULL;
+    return h ^ (h >> 31);
+}
+
+/* 빈 칸 또는 같은 키가 있는 칸. */
+static IdKey *idset_slot(IdKey *slots, size_t cap, const IdKey *k)
+{
+    size_t i = (size_t)idset_hash(k) & (cap - 1);
+
+    for (;;) {
+        IdKey *s = &slots[i];
+        if ((s->lo == 0 && s->hi == 0) ||
+            (s->lo == k->lo && s->hi == k->hi && s->volume == k->volume)) {
+            return s;
+        }
+        i = (i + 1) & (cap - 1);
+    }
+}
+
+static int idset_grow(IdSet *set)
+{
+    size_t cap = set->cap ? set->cap * 2 : IDSET_MIN_CAP, i;
+    IdKey *slots;
+
+    if (cap > ((size_t)-1) / sizeof(IdKey) || (slots = calloc(cap, sizeof(IdKey))) == NULL) {
+        set->failed = 1;
+        return 0;
+    }
+    for (i = 0; i < set->cap; i++) {
+        const IdKey *k = &set->slots[i];
+        if (k->lo != 0 || k->hi != 0) {
+            *idset_slot(slots, cap, k) = *k;
+        }
+    }
+    free(set->slots);
+    set->slots = slots;
+    set->cap = cap;
+    return 1;
+}
+
+/* 넣는다. 이미 있었으면 1, 새로 넣었으면 0, 메모리가 부족해 넣지 못했으면 -1. */
+static int idset_add(IdSet *set, uint64_t volume, const RecId *id)
+{
+    IdKey k, *s;
+
+    k.volume = volume;
+    k.lo = id->lo;
+    k.hi = id->hi;
+    /* 70% 를 넘기 전에 늘린다. */
+    if ((set->len + 1) * 10 > set->cap * 7 && (set->failed || !idset_grow(set))) {
+        if (set->cap == 0) {
+            return -1;
+        }
+        /* 늘리지 못했어도 이미 있는지는 알 수 있다. 꽉 차기 전까지만 넣는다. */
+        s = idset_slot(set->slots, set->cap, &k);
+        if (s->lo != 0 || s->hi != 0) {
+            return 1;
+        }
+        if (set->len + 1 >= set->cap) {
+            return -1;
+        }
+        *s = k;
+        set->len++;
+        return 0;
+    }
+    s = idset_slot(set->slots, set->cap, &k);
+    if (s->lo != 0 || s->hi != 0) {
+        return 1;
+    }
+    *s = k;
+    set->len++;
+    return 0;
+}
+
 /* ---- 깊이 우선 탐색 ---- */
 
 typedef struct {
@@ -914,6 +1123,7 @@ typedef struct {
 
 typedef struct {
     uint32_t max_depth;
+    unsigned options; /* SCAN_OPT_*(하드 링크를 지원하지 않는 볼륨이면 HARDLINKS 를 뺀다) */
     ScanReport *report;
     const ScanHooks *hooks;
     void *ctx;
@@ -921,6 +1131,7 @@ typedef struct {
     Pool pool;
     int pooled; /* 작업 스레드가 동작 중이면 1 */
     unsigned char *scratch; /* 호출 스레드의 열거 버퍼 */
+    IdSet ids;  /* 정밀 스캔: 지금까지 센 파일 */
 } Walker;
 
 static int stack_push(DirStack *stack, DirTask *t)
@@ -978,7 +1189,7 @@ static void walker_obtain(Walker *w, DirTask *t)
     if (!self) {
         return;
     }
-    fetch_dir(t, w->scratch, w->max_depth);
+    fetch_dir(t, w->scratch, w->max_depth, w->options);
     if (w->pooled && t->kid_count > 0) {
         AcquireSRWLockExclusive(&w->pool.lock);
         submit_kids_locked(&w->pool, t);
@@ -988,8 +1199,34 @@ static void walker_obtain(Walker *w, DirTask *t)
     t->state = TASK_DONE;
 }
 
+/*
+ * 정밀 스캔: 파일이 이미 다른 경로로 센 실제 파일인지 확인한다(호출 스레드에서 훅 순서대로 부르므로
+ * 작업 스레드 수와 상관없이 같은 경로가 "처음"이 된다).
+ */
+static void account_hardlink(Walker *w, const DirTask *t, const EntryRec *rec, ScanEntry *entry)
+{
+    ScanReport *report = w->report;
+    const RecId *id = rec_id(rec);
+    int seen;
+
+    if (id == NULL || (id->lo == 0 && id->hi == 0)) {
+        report->hardlink_unknown_files++;
+        return;
+    }
+    seen = idset_add(&w->ids, t->volume, id);
+    if (seen < 0) {
+        report->hardlink_unknown_files++;
+    } else if (seen > 0) {
+        entry->hardlink_dup = 1;
+        report->hardlink_dup_files++;
+        report->hardlink_dup_bytes += entry->size;
+        report->hardlink_dup_alloc += entry->alloc_size;
+    }
+}
+
 static void account_entry(const EntryRec *rec, ScanReport *report, ScanEntry *entry)
 {
+    entry->hardlink_dup = 0;
     entry->name = rec_name(rec);
     entry->attributes = rec->attributes;
     entry->is_dir = (rec->attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -1050,7 +1287,7 @@ static ScanStatus process_dir(Walker *w, DirTask *t)
             int will_descend;
             DirTask *ct = NULL;
 
-            off += rec_bytes(rec->name_len);
+            off += rec_size(rec);
             /* 큰 디렉터리에서도 취소가 늦지 않도록 열거 도중에도 확인한다. */
             if (hooks->should_cancel != NULL && ++seen % SCAN_CANCEL_CHECK_INTERVAL == 0 &&
                 hooks->should_cancel(w->ctx)) {
@@ -1059,6 +1296,9 @@ static ScanStatus process_dir(Walker *w, DirTask *t)
                 break;
             }
             account_entry(rec, report, &entry);
+            if ((w->options & SCAN_OPT_HARDLINKS) && !entry.is_dir) {
+                account_hardlink(w, t, rec, &entry);
+            }
             will_descend = rec_wants_descend(t, rec, w->max_depth);
             if (will_descend) {
                 /* fetch_dir 가 같은 판단으로 만든 자식 작업(kids 를 못 만들었으면 없음). */
@@ -1181,10 +1421,35 @@ static void walker_finish(Walker *w)
     }
     free(w->stack.items);
     free(w->scratch);
+    free(w->ids.slots);
+}
+
+/* 폴더가 있는 볼륨이 하드 링크를 지원하는지(모르면 지원한다고 보고 ID 로 확인한다). */
+static int volume_supports_hardlinks(const wchar_t *ext)
+{
+    HANDLE h = CreateFileW(ext, FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    DWORD flags = 0;
+    BOOL ok;
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return 1;
+    }
+    ok = GetVolumeInformationByHandleW(h, NULL, 0, NULL, NULL, &flags, NULL, 0);
+    CloseHandle(h);
+    return !ok || (flags & FILE_SUPPORTS_HARD_LINKS) != 0;
 }
 
 ScanStatus scan_tree_ex(const wchar_t *dir, uint32_t max_depth, uintptr_t root_id,
                         ScanReport *report, const ScanHooks *hooks, void *ctx)
+{
+    return scan_tree_opts(dir, max_depth, root_id, report, hooks, ctx, 0);
+}
+
+ScanStatus scan_tree_opts(const wchar_t *dir, uint32_t max_depth, uintptr_t root_id,
+                          ScanReport *report, const ScanHooks *hooks, void *ctx,
+                          unsigned options)
 {
     static const ScanHooks no_hooks = {NULL, NULL, NULL, NULL, NULL};
     ScanStatus status = SCAN_COMPLETE;
@@ -1209,6 +1474,15 @@ ScanStatus scan_tree_ex(const wchar_t *dir, uint32_t max_depth, uintptr_t root_i
 
     memset(&w, 0, sizeof(w));
     w.max_depth = max_depth;
+    w.options = options;
+    if (options & SCAN_OPT_HARDLINKS) {
+        report->hardlinks_checked = 1;
+        /* FAT·exFAT 처럼 하드 링크가 없으면 ID 를 모을 필요가 없다(FAT 의 ID 는 믿을 수도 없다). */
+        if (!volume_supports_hardlinks(ext)) {
+            report->hardlinks_unsupported = 1;
+            w.options &= ~(unsigned)SCAN_OPT_HARDLINKS;
+        }
+    }
     w.report = report;
     w.hooks = hooks;
     w.ctx = ctx;
@@ -1227,9 +1501,9 @@ ScanStatus scan_tree_ex(const wchar_t *dir, uint32_t max_depth, uintptr_t root_i
     t->id = root_id;
 
     /* 루트는 직접 열거하고, 하위 폴더가 있을 때만 작업 스레드를 띄운다. */
-    fetch_dir(t, w.scratch, max_depth);
+    fetch_dir(t, w.scratch, max_depth, w.options);
     threads = scan_effective_threads();
-    if (t->kid_count > 0 && threads > 1 && pool_start(&w.pool, threads, max_depth)) {
+    if (t->kid_count > 0 && threads > 1 && pool_start(&w.pool, threads, max_depth, w.options)) {
         w.pooled = 1;
         AcquireSRWLockExclusive(&w.pool.lock);
         submit_kids_locked(&w.pool, t);

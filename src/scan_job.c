@@ -12,6 +12,7 @@ struct ScanJob {
     HANDLE thread;
     wchar_t *root;
     uint32_t max_depth;
+    unsigned options; /* SCAN_OPT_* */
     uint32_t interval_ms;
     scan_job_notify_fn notify;
     void *ctx;
@@ -77,8 +78,8 @@ static unsigned __stdcall job_thread(void *arg)
 {
     ScanJob *job = arg;
 
-    scan_model_build_ex(&job->model, job->root, job->max_depth, on_progress, on_cancel,
-                        job);
+    scan_model_build_opts(&job->model, job->root, job->max_depth, job->options, on_progress,
+                          on_cancel, job);
     if (job->notify != NULL) {
         job->notify(1, job->ctx);
     }
@@ -96,6 +97,12 @@ static void job_free(ScanJob *job)
 ScanJob *scan_job_start(const wchar_t *root, uint32_t max_depth, uint32_t interval_ms,
                         scan_job_notify_fn notify, void *ctx)
 {
+    return scan_job_start_ex(root, max_depth, 0, interval_ms, notify, ctx);
+}
+
+ScanJob *scan_job_start_ex(const wchar_t *root, uint32_t max_depth, unsigned options,
+                           uint32_t interval_ms, scan_job_notify_fn notify, void *ctx)
+{
     ScanJob *job = calloc(1, sizeof(*job));
 
     if (job == NULL) {
@@ -105,6 +112,7 @@ ScanJob *scan_job_start(const wchar_t *root, uint32_t max_depth, uint32_t interv
     scan_model_init(&job->model);
     job->root = path_dup(root != NULL ? root : L"");
     job->max_depth = max_depth;
+    job->options = options;
     job->interval_ms = interval_ms;
     job->notify = notify;
     job->ctx = ctx;

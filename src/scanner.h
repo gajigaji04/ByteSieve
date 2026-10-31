@@ -62,6 +62,19 @@ typedef struct {
     uint64_t excluded_dir_count; /* should_skip_dir 훅이 제외한 디렉터리(오류 아님) */
     int aborted;                /* SCAN_FATAL 로 중단된 스캔이 있었으면 1 */
     int cancelled;              /* should_cancel 로 도중에 멈춘 스캔이 있었으면 1(상태는 SCAN_PARTIAL) */
+    /*
+     * 하드 링크 중복 보정(정밀 스캔, SCAN_OPT_HARDLINKS 일 때만 채운다). 위의 file_count·
+     * total_bytes·alloc_bytes 는 기본 스캔과 똑같이 경로마다 센 값이고, 아래는 그중 같은 실제 파일을
+     * 다른 경로에서 이미 센 몫이다. 따라서
+     *   중복 제외 용량      = total_bytes - hardlink_dup_bytes
+     *   실제 디스크 사용량  = alloc_bytes - hardlink_dup_alloc
+     */
+    int hardlinks_checked;          /* 정밀 스캔으로 하드 링크를 확인했으면 1 */
+    int hardlinks_unsupported;      /* 파일 시스템이 하드 링크를 지원하지 않아 확인할 것이 없음 */
+    uint64_t hardlink_dup_files;    /* 이미 다른 경로로 센 실제 파일(하드 링크 중복 경로) 수 */
+    uint64_t hardlink_dup_bytes;    /* 그 논리 크기 합 */
+    uint64_t hardlink_dup_alloc;    /* 그 할당 크기 합 */
+    uint64_t hardlink_unknown_files; /* 파일 ID를 얻지 못해 중복인지 모르는 파일(경로마다 셈) */
     ScanError *errors;
     size_t errors_len;
     size_t errors_cap;
@@ -77,6 +90,7 @@ typedef struct {
     int descend;         /* 하위 탐색 대상인지(디렉터리이면서 재분석 지점이 아님) */
     uint64_t alloc_size; /* 디스크 할당 크기. alloc_known 이 0 이면 size 와 같다(디렉터리는 0) */
     int alloc_known;     /* 할당 크기를 얻었으면 1 */
+    int hardlink_dup;    /* 정밀 스캔에서 같은 실제 파일을 이미 다른 경로로 셌으면 1(하드 링크) */
 } ScanEntry;
 
 typedef void (*scan_visit_fn)(const ScanEntry *entry, void *ctx);
@@ -188,5 +202,27 @@ typedef struct {
 /* scan_tree 와 같지만 디렉터리 단위 훅을 받는다. hooks 가 NULL 이면 집계만 한다. */
 ScanStatus scan_tree_ex(const wchar_t *dir, uint32_t max_depth, uintptr_t root_id,
                         ScanReport *report, const ScanHooks *hooks, void *ctx);
+
+/* scan_tree_opts 의 options 비트. */
+enum {
+    /*
+     * 정밀 스캔(하드 링크 중복 보정). 폴더 열거로 파일마다 파일 ID(128비트)를 받고(파일을 열지 않음)
+     * 폴더 핸들로 볼륨 일련번호를 구해, (볼륨, 파일 ID)가 같은 파일은 같은 실제 파일로 본다.
+     *   - 처음 만난 경로(훅 호출 순서, 작업 스레드 수와 무관)만 실제 파일로 세고, 그 뒤 경로는
+     *     ScanEntry.hardlink_dup = 1 로 알리며 report 의 hardlink_dup_* 에 더한다.
+     *   - 경로마다 세는 기본 합계(file_count·total_bytes·alloc_bytes)는 그대로다.
+     *   - 탐색 시작 볼륨이 하드 링크를 지원하지 않으면(FAT 등) 확인하지 않고
+     *     hardlinks_unsupported 를 1 로 둔다. 파일 ID가 0 이거나 얻지 못한 파일은 중복으로 보지 않고
+     *     hardlink_unknown_files 로 센다.
+     *   - 지금까지 본 파일 ID를 모두 기억하므로 파일 하나에 약 40바이트를 더 쓴다. 메모리가 모자라면
+     *     그 뒤 파일은 hardlink_unknown_files 로 센다.
+     */
+    SCAN_OPT_HARDLINKS = 1u << 0
+};
+
+/* scan_tree_ex 에 옵션(SCAN_OPT_*)을 더한 판. options 0 은 scan_tree_ex 와 같다. */
+ScanStatus scan_tree_opts(const wchar_t *dir, uint32_t max_depth, uintptr_t root_id,
+                          ScanReport *report, const ScanHooks *hooks, void *ctx,
+                          unsigned options);
 
 #endif /* BYTESIEVE_SCANNER_H */

@@ -4,18 +4,20 @@
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-CTest에 등록된 테스트는 53개입니다.
+CTest에 등록된 테스트는 55개입니다.
 
 | 분류 | 테스트 | 확인 내용 |
 |---|---|---|
-| 단위 테스트(17개) | `path`, `scanner`, `scan_alloc`, `scan_model`, `scan_history`, `export`, `scan_job`, `jsonl`, `cli`, `drive`, `sysmon`, `size_format`, `cleanup_rules`, `cleanup_scan`, `cleanup_trash`, `dev_cache`, `quarantine` | 아래 참고 |
+| 단위 테스트(18개) | `path`, `scanner`, `scan_alloc`, `hardlink`, `scan_model`, `scan_history`, `export`, `scan_job`, `jsonl`, `cli`, `drive`, `sysmon`, `size_format`, `cleanup_rules`, `cleanup_scan`, `cleanup_trash`, `dev_cache`, `quarantine` | 아래 참고 |
 | CLI 검사(24개) | `no_args`, `help`, `scan_*`, `cli_*` | 종료 코드, 텍스트·JSONL 출력, 인자 오류, 접근 거부 픽스처, `--track` 기준 → 변경 → 비교(`cli_track`) |
-| GUI 자체 검사(11개) | `gui_scan`, `gui_cancel`, `gui_missing_dir`, `gui_drives`, `gui_cleanup`, `gui_cleanup_cancel`, `gui_trash`, `gui_quarantine`, `gui_history`, `gui_export`, `gui_cache`, `gui_monitor` | 숨긴 창에서 실제 작업을 실행하고 화면 상태를 검증 |
+| GUI 자체 검사(13개) | `gui_scan`, `gui_cancel`, `gui_missing_dir`, `gui_drives`, `gui_cleanup`, `gui_cleanup_cancel`, `gui_trash`, `gui_quarantine`, `gui_history`, `gui_precise`, `gui_export`, `gui_cache`, `gui_monitor` | 숨긴 창에서 실제 작업을 실행하고 화면 상태를 검증 |
 
 ## 주요 단위 테스트 범위
 
 - `scanner`: 권한 거부, 정션과 정션 순환, 260자를 넘는 경로, 5 GiB 넘는 크기, 깊이 제한, 취소, 제외 훅
 - `scan_alloc`: 디스크 사용량 원인 분류, 실제 NTFS 압축·스파스 파일, 작업 스레드 1개와 8개의 훅 호출 기록이 같은지(제외·취소 포함)
+- `hardlink`: 실제 하드 링크 픽스처(같은 폴더·다른 폴더·크기 0 파일)로 기본 스캔은 그대로(중복 0), 정밀 스캔의 중복 경로 수·용량·할당,
+  실제 파일마다 한 경로만 세는지, 작업 스레드 1개와 8개의 같은 결과, 모델의 폴더별 중복·부모 합계·순위(중복 제외·중복)·진행률
 - `scan_history`: 스냅숏 저장·읽기, 늘어남·줄어듦·새 폴더·삭제·불확실 판정, 손상된 파일,
   자동 저장 설정(기본값·저장 후 다시 읽기·손상된 설정·쓰기 실패), 기록 삭제(형식에 맞는 스냅숏만 삭제, 사용 중인 파일이 있어도 나머지 계속, 설정·다른 파일 보존)
 - `export`: CSV(UTF-8 BOM, CRLF, 머리글·행 수, 크기 내림차순, 쉼표가 든 이름, `=`로 시작하는 이름의 수식 방지, 64 KiB 쓰기 버퍼를 넘는 큰 결과),
@@ -40,6 +42,7 @@ CTest에 등록된 테스트는 53개입니다.
 build\Debug\bytesieve-gui.exe --self-test C:\some\dir
 build\Debug\bytesieve-gui.exe --self-test-cancel C:\some\dir
 build\Debug\bytesieve-gui.exe --self-test-changes C:\some\dir   # 직전 스냅숏 필요, 변화 목록을 stdout에 출력
+build\Debug\bytesieve-gui.exe --self-test-precise C:\some\dir   # 정밀 스캔, 기본·중복 제외 집계를 stdout에 출력
 build\Debug\bytesieve-gui.exe --self-test-no-autosave C:\some\dir    # 주의: 자동 저장 설정을 끔(처음 설정을 stdout에 출력)
 build\Debug\bytesieve-gui.exe --self-test-clear-history C:\some\dir  # 주의: 저장된 기록을 확인 창 없이 모두 삭제
 build\Debug\bytesieve-gui.exe --self-test-export C:\some\dir C:\out\result   # result.csv·result.html 저장

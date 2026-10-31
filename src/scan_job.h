@@ -37,6 +37,10 @@ typedef struct {
 ScanJob *scan_job_start(const wchar_t *root, uint32_t max_depth, uint32_t interval_ms,
                         scan_job_notify_fn notify, void *ctx);
 
+/* scan_job_start 에 스캔 옵션(SCAN_OPT_*, 예: 정밀 스캔 SCAN_OPT_HARDLINKS)을 더한 판. */
+ScanJob *scan_job_start_ex(const wchar_t *root, uint32_t max_depth, unsigned options,
+                           uint32_t interval_ms, scan_job_notify_fn notify, void *ctx);
+
 /* 멈춰 달라고 요청한다(기다리지 않음). 어느 스레드에서 불러도 된다. */
 void scan_job_cancel(ScanJob *job);
 
