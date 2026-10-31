@@ -33,6 +33,7 @@
 | `bytesieve_model` | 폴더 트리 모델, 정렬, 용량·디스크 사용 순위, 진행률 |
 | `bytesieve_job` | 스캔 작업 스레드, 진행률 사본, 취소 |
 | `bytesieve_history` | 폴더별 용량 스냅숏 저장·읽기·비교 |
+| `bytesieve_export` | 스캔 결과 CSV·HTML 보고서 내보내기(임시 파일 → 바꿔치기, 64 KiB 버퍼로 나눠 쓰기) |
 | `bytesieve_cleanup_rules` / `bytesieve_cleanup` / `bytesieve_cleanup_job` | 정리 후보 규칙, 탐지 엔진, 탐지 스레드 |
 | `bytesieve_cleanup_trash` | 삭제 보호 판정, 직전 확인, 휴지통 이동(쓸 수 없으면 격리 폴더로) |
 | `bytesieve_quarantine` | 드라이브별 격리 폴더: 같은 볼륨 안 이동, 기록(원자적 쓰기), 목록·불일치 판정, 복원, 영구 삭제 |

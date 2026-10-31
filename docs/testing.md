@@ -4,13 +4,13 @@
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-CTest에 등록된 테스트는 49개입니다.
+CTest에 등록된 테스트는 51개입니다.
 
 | 분류 | 테스트 | 확인 내용 |
 |---|---|---|
-| 단위 테스트(15개) | `path`, `scanner`, `scan_alloc`, `scan_model`, `scan_history`, `scan_job`, `jsonl`, `cli`, `drive`, `sysmon`, `size_format`, `cleanup_rules`, `cleanup_scan`, `cleanup_trash`, `quarantine` | 아래 참고 |
+| 단위 테스트(16개) | `path`, `scanner`, `scan_alloc`, `scan_model`, `scan_history`, `export`, `scan_job`, `jsonl`, `cli`, `drive`, `sysmon`, `size_format`, `cleanup_rules`, `cleanup_scan`, `cleanup_trash`, `quarantine` | 아래 참고 |
 | CLI 검사(24개) | `no_args`, `help`, `scan_*`, `cli_*` | 종료 코드, 텍스트·JSONL 출력, 인자 오류, 접근 거부 픽스처, `--track` 기준 → 변경 → 비교(`cli_track`) |
-| GUI 자체 검사(10개) | `gui_scan`, `gui_cancel`, `gui_missing_dir`, `gui_drives`, `gui_cleanup`, `gui_cleanup_cancel`, `gui_trash`, `gui_quarantine`, `gui_history`, `gui_monitor` | 숨긴 창에서 실제 작업을 실행하고 화면 상태를 검증 |
+| GUI 자체 검사(11개) | `gui_scan`, `gui_cancel`, `gui_missing_dir`, `gui_drives`, `gui_cleanup`, `gui_cleanup_cancel`, `gui_trash`, `gui_quarantine`, `gui_history`, `gui_export`, `gui_monitor` | 숨긴 창에서 실제 작업을 실행하고 화면 상태를 검증 |
 
 ## 주요 단위 테스트 범위
 
@@ -18,6 +18,8 @@ CTest에 등록된 테스트는 49개입니다.
 - `scan_alloc`: 디스크 사용량 원인 분류, 실제 NTFS 압축·스파스 파일, 작업 스레드 1개와 8개의 훅 호출 기록이 같은지(제외·취소 포함)
 - `scan_history`: 스냅숏 저장·읽기, 늘어남·줄어듦·새 폴더·삭제·불확실 판정, 손상된 파일,
   자동 저장 설정(기본값·저장 후 다시 읽기·손상된 설정·쓰기 실패), 기록 삭제(형식에 맞는 스냅숏만 삭제, 사용 중인 파일이 있어도 나머지 계속, 설정·다른 파일 보존)
+- `export`: CSV(UTF-8 BOM, CRLF, 머리글·행 수, 크기 내림차순, 쉼표가 든 이름, `=`로 시작하는 이름의 수식 방지, 64 KiB 쓰기 버퍼를 넘는 큰 결과),
+  HTML(구역, 이름 이스케이프, 순위 표 100행 제한, 통계), 실패(없는 폴더, 빈·실패한 스캔, 다른 프로그램이 연 파일에서 기존 내용 보존·임시 파일 없음)
 - `cleanup_scan`·`cleanup_rules`: 중첩 항목, 확인됨/추정, 개발 환경 분류, 표시 파일이 없는 `bin`·`.gradle`, 보호 경로, 필터, 취소
 - `cleanup_trash`: 보호 판정 규칙과 **실제 휴지통 이동·거부**(테스트가 넣은 휴지통 항목만 지워 사용자 휴지통은 그대로 둠)
 - `quarantine`: 임시 폴더를 가짜 볼륨으로 써서 격리 이동·목록, 같은 이름 여러 번 격리, 이동 실패(사용 중·없음·다른 볼륨)
@@ -36,6 +38,7 @@ build\Debug\bytesieve-gui.exe --self-test-cancel C:\some\dir
 build\Debug\bytesieve-gui.exe --self-test-changes C:\some\dir   # 직전 스냅숏 필요, 변화 목록을 stdout에 출력
 build\Debug\bytesieve-gui.exe --self-test-no-autosave C:\some\dir    # 주의: 자동 저장 설정을 끔(처음 설정을 stdout에 출력)
 build\Debug\bytesieve-gui.exe --self-test-clear-history C:\some\dir  # 주의: 저장된 기록을 확인 창 없이 모두 삭제
+build\Debug\bytesieve-gui.exe --self-test-export C:\some\dir C:\out\result   # result.csv·result.html 저장
 build\Debug\bytesieve-gui.exe --self-test-drives
 build\Debug\bytesieve-gui.exe --self-test-cleanup C:\some\dir
 build\Debug\bytesieve-gui.exe --self-test-cleanup-cancel C:\some\dir
