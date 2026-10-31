@@ -1,9 +1,12 @@
-# GUI 폴더별 용량 변화 자체 검사(bytesieve-gui --self-test / --self-test-changes).
+# GUI 폴더별 용량 변화·기록 설정 자체 검사(bytesieve-gui --self-test / --self-test-changes /
+# --self-test-no-autosave / --self-test-clear-history).
 #
 #   cmake -DEXE=<bytesieve-gui> -DFIXTURE=<빈 폴더로 만들 경로> -DHIST=<기록 폴더> -P gui_history_check.cmake
 #
 # 첫 스캔은 기준 스냅숏을 저장하고, 픽스처를 바꾼 뒤 두 번째 스캔이 변화 순위 보기·변화 열을
-# 검증한 다음 변화 목록을 stdout 에 쓴다. 기록은 HIST 에만 쓴다(BYTESIEVE_HISTORY_DIR).
+# 검증한 다음 변화 목록을 stdout 에 쓴다. 이어서 자동 저장을 끄면 스냅숏이 바뀌지 않고 재실행해도
+# 설정이 유지되는지, 기록 삭제가 스냅숏만 지우고 화면에 반영되는지 확인한다.
+# 기록·설정은 HIST 에만 쓴다(BYTESIEVE_HISTORY_DIR).
 
 foreach(var EXE FIXTURE HIST)
     if(NOT DEFINED ${var})
@@ -52,5 +55,42 @@ expect("${out}" "change: grown \\+1000 B a\n")
 expect("${out}" "change: removed -100 B b\n")
 expect("${out}" "change: added \\+100 B c\n")
 expect("${out}" "changes: grown 1 shrunk 0 added 1 removed 1\n")
+
+# 3) 자동 저장 끄기: 처음엔 켜져 있고, 끈 뒤 스캔해도 스냅숏이 바뀌지 않는다.
+file(GLOB snaps "${HIST}/*.snap")
+file(SHA256 "${snaps}" snap_hash)
+file(WRITE "${FIXTURE}/c/later.bin" "${thousand}")
+run_gui(out --self-test-no-autosave "${native_fixture}")
+expect("${out}" "autosave: 1\n")
+file(READ "${HIST}/settings.txt" settings)
+expect("${settings}" "\nautosave\t0\n")
+file(SHA256 "${snaps}" after_hash)
+if(NOT snap_hash STREQUAL after_hash)
+    message(FATAL_ERROR "snapshot changed while autosave was off")
+endif()
+
+# 4) 다시 실행해도 꺼진 설정이 유지된다(여전히 저장하지 않음).
+run_gui(out --self-test-no-autosave "${native_fixture}")
+expect("${out}" "autosave: 0\n")
+file(SHA256 "${snaps}" after_hash)
+if(NOT snap_hash STREQUAL after_hash)
+    message(FATAL_ERROR "snapshot changed after restart with autosave off")
+endif()
+
+# 5) 기록 삭제: 스냅숏(+남은 임시 파일)만 지우고 설정·다른 파일은 남긴다.
+file(WRITE "${HIST}/0000000000000001.snap.tmp" "partial")
+file(WRITE "${HIST}/notes.snap" "user file")
+file(WRITE "${HIST}/keep.txt" "keep")
+run_gui(out --self-test-clear-history "${native_fixture}")
+expect("${out}" "cleared: 1\n")
+file(GLOB snaps "${HIST}/*.snap" "${HIST}/*.snap.tmp")
+if(NOT snaps STREQUAL "${HIST}/notes.snap")
+    message(FATAL_ERROR "unexpected files left after clearing history: ${snaps}")
+endif()
+foreach(kept settings.txt keep.txt)
+    if(NOT EXISTS "${HIST}/${kept}")
+        message(FATAL_ERROR "${kept} was removed by clearing history")
+    endif()
+endforeach()
 
 file(REMOVE_RECURSE "${FIXTURE}" "${HIST}")

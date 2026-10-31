@@ -74,6 +74,42 @@ int history_ensure_dir(const wchar_t *dir);
 /* dir 안에서 대상 폴더 root 의 스냅숏 파일 경로(malloc). 대소문자·끝 구분자는 무시한다. */
 wchar_t *history_file_for(const wchar_t *dir, const wchar_t *root);
 
+/*
+ * 자동 저장 설정. 기록 폴더 안의 settings.txt(UTF-8 텍스트)에 둔다. 기록을 삭제해도 남는다.
+ * GUI 가 스캔이 끝날 때 스냅숏을 저장할지 정하는 데 쓴다(CLI --track 은 명시적 요청이라 보지 않는다).
+ */
+#define HISTORY_SETTINGS_FILE L"settings.txt"
+
+/* 자동 저장이 켜져 있으면 1, 꺼져 있으면 0. 설정 파일이 없거나 읽을 수 없거나 손상됐으면 1(기본값). */
+int history_autosave_enabled(const wchar_t *dir);
+
+/*
+ * 자동 저장 설정을 쓴다(폴더가 없으면 만들고, 임시 파일에 쓴 뒤 바꿔치기).
+ * 성공 0, 실패 -1(*error 에 Windows 오류, NULL 허용).
+ */
+int history_set_autosave(const wchar_t *dir, int enabled, unsigned long *error);
+
+/*
+ * dir 안의 스냅숏 파일 수. history_file_for 가 만드는 이름(<16자리 16진수>.snap)의 일반 파일만 센다.
+ * 폴더가 없으면 0.
+ */
+size_t history_count(const wchar_t *dir);
+
+typedef struct {
+    size_t removed;      /* 지운 스냅숏 파일 수 */
+    size_t failed;       /* 지우지 못한 파일 수 */
+    unsigned long error; /* 처음 실패한 Windows 오류(없으면 0) */
+} HistoryClearResult;
+
+/*
+ * 저장된 스냅숏을 모두 지운다(되돌릴 수 없음, 확인은 호출자 몫).
+ *   - history_file_for 형식의 이름인 일반 파일(<hex>.snap 과 남은 <hex>.snap.tmp)만 지운다.
+ *     설정 파일, 형식이 다른 파일, 폴더, 링크(리파스 포인트)는 건드리지 않는다.
+ *   - 한 파일을 지우지 못해도 나머지는 계속 지우고 out 에 개수를 남긴다.
+ * 모두 지웠으면(지울 것이 없거나 폴더가 없어도) 0, 하나라도 실패했거나 폴더를 읽지 못하면 -1.
+ */
+int history_clear(const wchar_t *dir, HistoryClearResult *out);
+
 typedef enum {
     HISTORY_GROWN = 0,
     HISTORY_SHRUNK,

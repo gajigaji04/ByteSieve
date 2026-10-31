@@ -403,6 +403,144 @@ static void test_files_and_errors(void)
     history_snapshot_free(&s);
 }
 
+/* dir 안에 name 파일을 text 내용으로 만든다. */
+static int put_file(const wchar_t *dir, const wchar_t *name, const char *text)
+{
+    wchar_t *p = path_join(dir, name);
+    HANDLE h = p ? CreateFileW(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                               NULL)
+                 : INVALID_HANDLE_VALUE;
+    DWORD written = 0;
+    BOOL ok;
+
+    free(p);
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    ok = WriteFile(h, text, (DWORD)strlen(text), &written, NULL);
+    CloseHandle(h);
+    return ok && written == strlen(text);
+}
+
+static int file_exists(const wchar_t *dir, const wchar_t *name)
+{
+    wchar_t *p = path_join(dir, name);
+    int ok = p != NULL && GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
+
+    free(p);
+    return ok;
+}
+
+/* 자동 저장 설정: 기본값, 저장·다시 읽기, 손상된 파일. */
+static void test_autosave_setting(void)
+{
+    wchar_t dir[MAX_PATH];
+    unsigned long error = 1;
+
+    swprintf(dir, MAX_PATH, L"%ls\\settings\\nested", g_hist);
+    /* 폴더도 설정 파일도 없으면 켬 */
+    CHECK(history_autosave_enabled(dir) == 1);
+    CHECK(history_autosave_enabled(NULL) == 1);
+
+    /* 끄면 폴더를 만들어 저장하고, 다시 읽어도(재실행) 꺼져 있다 */
+    CHECK(history_set_autosave(dir, 0, &error) == 0 && error == 0);
+    CHECK(history_autosave_enabled(dir) == 0);
+    CHECK(history_autosave_enabled(dir) == 0);
+    CHECK(!file_exists(dir, HISTORY_SETTINGS_FILE L".tmp"));
+    CHECK(history_set_autosave(dir, 1, NULL) == 0);
+    CHECK(history_autosave_enabled(dir) == 1);
+    CHECK(history_set_autosave(dir, 0, NULL) == 0);
+
+    /* 손상·알 수 없는 형식이면 기본값(켬) */
+    CHECK(put_file(dir, HISTORY_SETTINGS_FILE, "garbage\nautosave\t0\n"));
+    CHECK(history_autosave_enabled(dir) == 1);
+    CHECK(put_file(dir, HISTORY_SETTINGS_FILE, "BYTESIEVE-HISTORY-SETTINGS 1\nautosave\t01\n"));
+    CHECK(history_autosave_enabled(dir) == 1);
+    CHECK(put_file(dir, HISTORY_SETTINGS_FILE, ""));
+    CHECK(history_autosave_enabled(dir) == 1);
+    /* CRLF 로 고쳐 써도 읽는다 */
+    CHECK(put_file(dir, HISTORY_SETTINGS_FILE,
+                   "BYTESIEVE-HISTORY-SETTINGS 1\r\nautosave\t0\r\n") &&
+          history_autosave_enabled(dir) == 0);
+    CHECK(put_file(dir, HISTORY_SETTINGS_FILE,
+                   "BYTESIEVE-HISTORY-SETTINGS 1\nother\tx\nautosave\t0\r\n"));
+    CHECK(history_autosave_enabled(dir) == 0);
+
+    /* 설정 파일 자리에 폴더가 있으면 쓰지 못하고 오류를 알린다 */
+    swprintf(dir, MAX_PATH, L"%ls\\settings\\blocked", g_hist);
+    CHECK(history_ensure_dir(dir) == 0);
+    {
+        wchar_t *sub = path_join(dir, HISTORY_SETTINGS_FILE);
+        CHECK(sub != NULL && CreateDirectoryW(sub, NULL));
+        free(sub);
+    }
+    error = 0;
+    CHECK(history_set_autosave(dir, 0, &error) == -1 && error != 0);
+    CHECK(history_autosave_enabled(dir) == 1);
+}
+
+/* 기록 삭제: 형식에 맞는 스냅숏만 지우고 설정·다른 파일·폴더는 남긴다. */
+static void test_clear(void)
+{
+    wchar_t dir[MAX_PATH], sub[MAX_PATH];
+    HistoryClearResult r;
+    HistorySnapshot s;
+    wchar_t *file;
+    HANDLE locked;
+
+    swprintf(dir, MAX_PATH, L"%ls\\clear", g_hist);
+    /* 폴더가 없으면 0개, 지울 것도 없다 */
+    CHECK(history_count(dir) == 0);
+    memset(&r, 0xff, sizeof(r));
+    CHECK(history_clear(dir, &r) == 0 && r.removed == 0 && r.failed == 0 && r.error == 0);
+
+    /* 실제 스냅숏 두 개 + 남은 임시 파일 + 지우면 안 되는 것들 */
+    CHECK(history_ensure_dir(dir) == 0);
+    history_snapshot_init(&s);
+    CHECK(snapshot_now(&s) == 0);
+    file = history_file_for(dir, g_root);
+    CHECK(file != NULL && history_save(&s, file, NULL) == 0);
+    free(file);
+    file = history_file_for(dir, L"C:\\Other\\Target");
+    CHECK(file != NULL && history_save(&s, file, NULL) == 0);
+    free(file);
+    history_snapshot_free(&s);
+    CHECK(put_file(dir, L"0123456789abcdef.snap.tmp", "partial"));
+    CHECK(history_set_autosave(dir, 0, NULL) == 0);
+    CHECK(put_file(dir, L"notes.snap", "user file"));
+    CHECK(put_file(dir, L"0123456789abcdeg.snap", "not hex"));
+    CHECK(put_file(dir, L"0123456789abcdef.snapshot", "other ext"));
+    CHECK(put_file(dir, L"keep.txt", "keep"));
+    swprintf(sub, MAX_PATH, L"%ls\\fedcba9876543210.snap", dir);
+    CHECK(CreateDirectoryW(sub, NULL));
+    CHECK(history_count(dir) == 2);
+
+    /* 사용 중(공유 삭제 불가)인 스냅숏이 있어도 나머지는 지우고 실패를 센다 */
+    CHECK(put_file(dir, L"aaaaaaaaaaaaaaaa.snap", "locked"));
+    CHECK(history_count(dir) == 3);
+    file = path_join(dir, L"aaaaaaaaaaaaaaaa.snap");
+    locked = file ? CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL)
+                  : INVALID_HANDLE_VALUE;
+    free(file);
+    CHECK(locked != INVALID_HANDLE_VALUE);
+    CHECK(history_clear(dir, &r) == -1);
+    CHECK(r.removed == 2 && r.failed == 1 && r.error == ERROR_SHARING_VIOLATION);
+    CHECK(history_count(dir) == 1);
+    CHECK(!file_exists(dir, L"0123456789abcdef.snap.tmp"));
+    CloseHandle(locked);
+
+    /* 다시 지우면 남은 것까지 지운다 */
+    CHECK(history_clear(dir, &r) == 0 && r.removed == 1 && r.failed == 0);
+    CHECK(history_count(dir) == 0);
+
+    /* 설정과 형식이 다른 파일·폴더는 그대로 */
+    CHECK(history_autosave_enabled(dir) == 0);
+    CHECK(file_exists(dir, L"notes.snap") && file_exists(dir, L"0123456789abcdeg.snap") &&
+          file_exists(dir, L"0123456789abcdef.snapshot") && file_exists(dir, L"keep.txt") &&
+          file_exists(dir, L"fedcba9876543210.snap"));
+    CHECK(history_clear(NULL, &r) == -1 && r.error != 0);
+}
+
 static int setup(void)
 {
     wchar_t tmp[MAX_PATH];
@@ -446,6 +584,8 @@ int main(void)
     test_diff();
     test_uncertain_and_depth();
     test_files_and_errors();
+    test_autosave_setting();
+    test_clear();
     remove_tree(g_root);
     remove_tree(g_hist);
 

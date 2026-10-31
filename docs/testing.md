@@ -16,7 +16,8 @@ CTest에 등록된 테스트는 49개입니다.
 
 - `scanner`: 권한 거부, 정션과 정션 순환, 260자를 넘는 경로, 5 GiB 넘는 크기, 깊이 제한, 취소, 제외 훅
 - `scan_alloc`: 디스크 사용량 원인 분류, 실제 NTFS 압축·스파스 파일, 작업 스레드 1개와 8개의 훅 호출 기록이 같은지(제외·취소 포함)
-- `scan_history`: 스냅숏 저장·읽기, 늘어남·줄어듦·새 폴더·삭제·불확실 판정, 손상된 파일
+- `scan_history`: 스냅숏 저장·읽기, 늘어남·줄어듦·새 폴더·삭제·불확실 판정, 손상된 파일,
+  자동 저장 설정(기본값·저장 후 다시 읽기·손상된 설정·쓰기 실패), 기록 삭제(형식에 맞는 스냅숏만 삭제, 사용 중인 파일이 있어도 나머지 계속, 설정·다른 파일 보존)
 - `cleanup_scan`·`cleanup_rules`: 중첩 항목, 확인됨/추정, 개발 환경 분류, 표시 파일이 없는 `bin`·`.gradle`, 보호 경로, 필터, 취소
 - `cleanup_trash`: 보호 판정 규칙과 **실제 휴지통 이동·거부**(테스트가 넣은 휴지통 항목만 지워 사용자 휴지통은 그대로 둠)
 - `quarantine`: 임시 폴더를 가짜 볼륨으로 써서 격리 이동·목록, 같은 이름 여러 번 격리, 이동 실패(사용 중·없음·다른 볼륨)
@@ -33,6 +34,8 @@ CTest에 등록된 테스트는 49개입니다.
 build\Debug\bytesieve-gui.exe --self-test C:\some\dir
 build\Debug\bytesieve-gui.exe --self-test-cancel C:\some\dir
 build\Debug\bytesieve-gui.exe --self-test-changes C:\some\dir   # 직전 스냅숏 필요, 변화 목록을 stdout에 출력
+build\Debug\bytesieve-gui.exe --self-test-no-autosave C:\some\dir    # 주의: 자동 저장 설정을 끔(처음 설정을 stdout에 출력)
+build\Debug\bytesieve-gui.exe --self-test-clear-history C:\some\dir  # 주의: 저장된 기록을 확인 창 없이 모두 삭제
 build\Debug\bytesieve-gui.exe --self-test-drives
 build\Debug\bytesieve-gui.exe --self-test-cleanup C:\some\dir
 build\Debug\bytesieve-gui.exe --self-test-cleanup-cancel C:\some\dir
@@ -47,3 +50,6 @@ build\Debug\bytesieve-gui.exe --self-test-monitor
 옮기고 영구 삭제하므로 테스트용 폴더에만 쓰세요(격리 폴더 탭은 이 폴더만 보여 주어 사용자의 실제 격리 항목은 건드리지 않습니다).
 `BYTESIEVE_QUARANTINE_ROOT`는 테스트용 환경 변수로, 지정한 폴더 안의 항목을 휴지통이 없는 드라이브처럼 그 폴더의 격리 폴더로 옮깁니다. 폴더 스캔 자체 검사도 스냅숏을 저장하므로,
 CTest는 `BYTESIEVE_HISTORY_DIR`을 빌드 폴더로 지정해 사용자 기록 폴더를 건드리지 않습니다.
+`--self-test-no-autosave`·`--self-test-clear-history`는 기록 폴더의 설정·기록을 바꾸므로 `BYTESIEVE_HISTORY_DIR`을 테스트용 폴더로 지정해 실행하세요.
+`gui_history`는 기준 스캔 → 변화 비교 → 자동 저장 끄기(스냅숏 그대로, 재실행 뒤에도 꺼짐) → 기록 삭제(스냅숏과 남은 임시 파일만 지우고
+설정·다른 파일 보존, 변화 열·변화 순위·분석 줄·버튼에 반영) 순으로 확인합니다.
