@@ -242,7 +242,9 @@ static int should_skip_dir(const ScanEntry *entry, const ScanDirInfo *parent, vo
 {
     DetectCtx *c = ctx;
 
-    return c->skip_protected && cleanup_protect_match(c->protect, parent->path, entry->name);
+    /* 격리 폴더는 이미 정리한 항목이므로 보호 경로 안을 고른 경우에도 들어가지 않는다. */
+    return cleanup_is_quarantine_name(entry->name) ||
+           (c->skip_protected && cleanup_protect_match(c->protect, parent->path, entry->name));
 }
 
 static void finalize(CleanupResult *r)

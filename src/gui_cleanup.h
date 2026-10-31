@@ -10,6 +10,7 @@
  * 선택 요약과 [휴지통으로 이동]으로 이루어진다.
  * 탐지는 작업 스레드(cleanup_job)에서 읽기 전용으로 하고, 정리는 사용자가 고르고 확인한
  * 항목만 작업 스레드(cleanup_trash)에서 Windows 휴지통으로 옮긴다(영구 삭제 없음).
+ * 휴지통이 없는 드라이브의 항목은 같은 드라이브의 격리 폴더로 옮긴다(gui_quarantine).
  */
 
 /* 탐지가 끝나면 부모에게 WM_COMMAND(MAKEWPARAM(id, CPN_FINISHED), panel) 를 보낸다. */
@@ -56,8 +57,9 @@ int cleanup_panel_verify(HWND panel, int expect_cancelled);
 
 /*
  * 자체 검사: 휴지통 이동이 끝난 뒤 선택한 expect_moved 개가 모두 옮겨져 원래 경로에 없고,
- * 목록·선택 요약·상태 줄이 결과와 맞는지 확인한다. 옮긴 항목의 휴지통 안 위치를
- * stdout 에 "recycled: <경로>" 줄로 쓴다(검사 스크립트가 정리용으로 읽음). 실패 수를 반환한다.
+ * 목록·선택 요약·상태 줄이 결과와 맞는지 확인한다. 옮긴 항목의 휴지통(또는 격리 폴더) 안
+ * 위치를 stdout 에 "recycled: <경로>" 줄로 쓴다(검사 스크립트가 정리용으로 읽음).
+ * 실패 수를 반환한다.
  */
 int cleanup_panel_verify_trash(HWND panel, size_t expect_moved);
 

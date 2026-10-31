@@ -12,6 +12,7 @@ CLI(`disk-scanner`)와 Win32 GUI(`bytesieve-gui`)를 제공합니다.
 | 폴더별 용량 변화 추적 | 스냅숏을 저장해 다음 스캔 때 늘어남·줄어듦·새 폴더·삭제된 폴더를 비교 |
 | 정리 후보 탐지 | `node_modules`·빌드 결과물·개발 캐시·임시·로그를 개발 환경(Node.js·Python·Rust·Java·.NET·C/C++·Go)별로 분류 |
 | 안전한 정리 | 고르고 확인한 항목만 **Windows 휴지통으로** 이동(영구 삭제 없음), 시스템·중요 폴더 보호 |
+| 격리 폴더 | 휴지통이 없는 드라이브(USB 등)는 같은 드라이브의 격리 폴더(`.bytesieve-trash`)로 옮기고, GUI에서 복원(덮어쓰기 없음)하거나 두 번 확인한 뒤 영구 삭제 |
 | 드라이브·시스템 | 드라이브별 사용률, RAM·CPU 사용률 1초 갱신과 60초 그래프 |
 | 병렬 스캔 | 폴더 목록을 여러 스레드로 미리 읽어 `C:\Windows` 스캔을 16.4초 → 3.2초로 단축 |
 | JSON Lines 출력 | 다른 도구가 읽을 수 있는 UTF-8 이벤트 스트림(`--jsonl`) |
@@ -48,7 +49,7 @@ On disk:        12.50 KiB (12800 bytes)
 Status:         complete (all directories scanned)
 ```
 
-GUI는 **폴더 스캔 / 드라이브 / 정리 후보 / 시스템** 네 탭으로 나뉩니다. 정리 후보 탭에서 [탐지] → 항목 체크 →
+GUI는 **폴더 스캔 / 드라이브 / 정리 후보 / 격리 폴더 / 시스템** 다섯 탭으로 나뉩니다. 정리 후보 탭에서 [탐지] → 항목 체크 →
 [휴지통으로 이동...] → 확인 창에서 [예] 순서로 정리하며, 옮긴 항목은 Windows 휴지통에서 복원할 수 있습니다.
 
 ## 테스트
@@ -57,7 +58,7 @@ GUI는 **폴더 스캔 / 드라이브 / 정리 후보 / 시스템** 네 탭으�
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-단위 테스트 14개, CLI 검사 24개, GUI 자체 검사 9개(총 47개)가 등록되어 있습니다.
+단위 테스트 15개, CLI 검사 24개, GUI 자체 검사 10개(총 49개)가 등록되어 있습니다.
 
 ## 문서
 
@@ -79,16 +80,17 @@ ByteSieve/
 ├── src/
 │   ├── scanner, scan_model, scan_job, scan_history   폴더 열거·트리 모델·스캔 스레드·변화 추적
 │   ├── cleanup_rules, cleanup_scan, cleanup_job, cleanup_trash   정리 후보 탐지·휴지통 이동
+│   ├── quarantine                                    격리 폴더(이동·기록·복원·영구 삭제)
 │   ├── drive, sysmon, path, size_format              드라이브·RAM/CPU 측정·경로·용량 표시
 │   ├── cli, jsonl, main.c                            CLI(disk-scanner)
-│   ├── gui_main.c, gui_drives, gui_cleanup, gui_monitor   GUI(bytesieve-gui)
+│   ├── gui_main.c, gui_drives, gui_cleanup, gui_quarantine, gui_monitor   GUI(bytesieve-gui)
 │   └── bench.c                                       성능 측정 도구(bytesieve-bench)
 └── tests/             단위 테스트(test_*.c), CLI·GUI 검사 스크립트(*.cmake)
 ```
 
 ## 구현 상태와 향후 계획
 
-CLI 스캐너, JSON Lines 출력, GUI 네 탭, 정리 후보 탐지·휴지통 이동, 디스크 사용량 분석, 폴더별 변화 추적, 병렬 스캔이 구현되어 있습니다.
+CLI 스캐너, JSON Lines 출력, GUI 다섯 탭, 정리 후보 탐지·휴지통 이동, 휴지통 없는 드라이브의 격리 폴더(복원·영구 삭제), 디스크 사용량 분석, 폴더별 변화 추적, 병렬 스캔이 구현되어 있습니다.
 
 ### 향후 개선 계획(미구현)
 
@@ -98,7 +100,6 @@ CLI 스캐너, JSON Lines 출력, GUI 네 탭, 정리 후보 탐지·휴지통 �
 - 트리맵 시각화: 폴더별 용량을 사각형 크기로 표현
 - 결과 내보내기: CSV·HTML 형식 지원
 - 공용 개발 캐시 탐지: 프로젝트 밖의 npm·pip·Gradle·Cargo·NuGet 전역 캐시 탐지
-- 휴지통 없는 드라이브 정리: USB·외장 드라이브(FAT32/exFAT)처럼 휴지통이 없는 볼륨에서는 같은 드라이브의 격리 폴더(예: `D:\.bytesieve-trash\`)로 옮기고, ByteSieve에서 복원·영구 삭제 지원(지금은 이런 볼륨의 정리를 거부함)
 - 스캔 기록 관리: GUI의 스냅숏 자동 저장을 끄는 설정, 저장된 기록 삭제
 - BitLocker 등 볼륨 암호화 정보 표시
 
@@ -110,8 +111,8 @@ CLI 스캐너, JSON Lines 출력, GUI 네 탭, 정리 후보 탐지·휴지통 �
 - 조회 완료 표시 개선: 조회 후 사라지는 상단 로딩 바를 고치고, 완료·실패 상태를 명확하게 표시
 - `gui_trash` 테스트 실패 원인 분석: 실패 재현과 원인 확인
 
-**개발·문서**
-- 자동 빌드·테스트: GitHub Actions로 Windows 환경의 빌드와 테스트 자동화
+**배포·문서**
+- 설치 프로그램 배포: 설치형 exe 제공(설치·제거, 시작 메뉴 바로 가기)
 - GUI 스크린샷 추가: 개인정보가 드러나지 않는 예제 화면(`docs/screenshots/`)
 
 ## 라이선스

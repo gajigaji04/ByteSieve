@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cleanup_rules.h"
 #include "path.h"
 #include "scan_model.h"
 
@@ -214,6 +215,14 @@ static int should_cancel(void *ctx)
     return b->cancel(b->ctx);
 }
 
+/* 정리한 항목을 옮겨 둔 격리 폴더(CLEANUP_QUARANTINE_DIR)는 사용 중인 공간으로 세지 않는다. */
+static int should_skip_dir(const ScanEntry *entry, const ScanDirInfo *parent, void *ctx)
+{
+    (void)parent;
+    (void)ctx;
+    return cleanup_is_quarantine_name(entry->name);
+}
+
 /* 플래그를 마무리하고 하위 트리 합계를 계산한다(재귀 없이 역순 한 번). */
 static void finalize(ScanModel *m)
 {
@@ -253,7 +262,7 @@ ScanStatus scan_model_build_ex(ScanModel *model, const wchar_t *root, uint32_t m
                                scan_progress_fn progress, scan_cancel_fn cancel,
                                void *ctx)
 {
-    ScanHooks hooks = {on_entry, on_dir_begin, on_dir_end, NULL};
+    ScanHooks hooks = {on_entry, on_dir_begin, on_dir_end, NULL, should_skip_dir};
     BuildCtx b;
     size_t root_index = SCAN_NODE_NONE;
     wchar_t *full;

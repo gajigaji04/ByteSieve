@@ -12,6 +12,7 @@
 #include "gui_cleanup.h"
 #include "gui_drives.h"
 #include "gui_monitor.h"
+#include "gui_quarantine.h"
 #include "path.h"
 #include "scan_history.h"
 #include "scan_job.h"
@@ -49,11 +50,12 @@ enum {
     IDC_CLEANUP,
     IDC_MONITOR,
     IDC_VIEW,
-    IDC_ANALYSIS
+    IDC_ANALYSIS,
+    IDC_QUARANTINE
 };
 
 /* 탭 순서. */
-enum { TAB_SCAN, TAB_DRIVES, TAB_CLEANUP, TAB_MONITOR };
+enum { TAB_SCAN, TAB_DRIVES, TAB_CLEANUP, TAB_QUARANTINE, TAB_MONITOR };
 
 /* 순위 목록 열. */
 enum { COL_RANK, COL_PATH, COL_SIZE, COL_CHANGE, COL_ALLOC, COL_FILES, COL_SHARE, COL_COUNT };
@@ -79,13 +81,15 @@ typedef enum {
     SELF_TEST_CLEANUP_CANCEL, /* 정리 후보 탐지 시작 직후 취소 → 화면 검증 → 종료 */
     SELF_TEST_TRASH, /* 정리 후보 탐지 → 모두 선택 → 휴지통 이동(확인 창 없이) → 화면 검증 → 종료 */
     SELF_TEST_MONITOR, /* 시스템 탭 측정 몇 회 → 화면·갱신 간격·실패 표시 검증 → 종료 */
+    SELF_TEST_QUARANTINE, /* 정리(격리 폴더로) → 격리 폴더 탭 → 복원(같은 이름 1개는 건너뜀) →
+                           * 남은 항목 영구 삭제 → 각 단계 화면 검증 → 종료 */
     SELF_TEST_CHANGES  /* 스캔 → 직전 스냅숏과 비교한 변화 보기 검증·출력 → 종료 */
 } SelfTest;
 
 typedef struct {
     HWND hwnd;
     HWND path, browse, scan, cancel, progress, status, tree, list, view, analysis;
-    HWND tabs, drives, cleanup, monitor;
+    HWND tabs, drives, cleanup, quarantine, monitor;
     HFONT font;
     int dpi;
 
@@ -103,7 +107,9 @@ typedef struct {
 
     SelfTest self_test;
     int self_test_exit;
-    size_t trash_expect; /* SELF_TEST_TRASH: 선택해 옮기기 시작한 항목 수 */
+    size_t trash_expect; /* SELF_TEST_TRASH·QUARANTINE: 선택해 옮기기 시작한 항목 수 */
+    const wchar_t *quarantine_root;     /* SELF_TEST_QUARANTINE: 탐지 경로(가짜 볼륨 루트) */
+    const wchar_t *quarantine_conflict; /* SELF_TEST_QUARANTINE: 복원 전에 만들 같은 이름 파일 */
 } App;
 
 static App g_app;
@@ -193,6 +199,8 @@ static void layout(void)
                body_h > 0 ? body_h : 0, TRUE);
     MoveWindow(g_app.cleanup, x + m, rc.top + m, w - 2 * m > 0 ? w - 2 * m : 0,
                body_h > 0 ? body_h : 0, TRUE);
+    MoveWindow(g_app.quarantine, x + m, rc.top + m, w - 2 * m > 0 ? w - 2 * m : 0,
+               body_h > 0 ? body_h : 0, TRUE);
     MoveWindow(g_app.monitor, x + m, rc.top + m, w - 2 * m > 0 ? w - 2 * m : 0,
                body_h > 0 ? body_h : 0, TRUE);
 }
@@ -205,6 +213,7 @@ static int current_tab(void)
 }
 
 /* 고른 탭의 컨트롤만 보이게 한다. 드라이브 탭을 처음 열면 바로 조회하고,
+ * 격리 폴더 탭은 열 때마다 목록을 다시 읽으며,
  * 시스템 탭을 처음 열면 측정을 시작한다(이후 탭을 옮겨도 그래프 기록을 위해 계속 측정). */
 static void show_tab(int tab)
 {
@@ -222,9 +231,13 @@ static void show_tab(int tab)
     }
     ShowWindow(g_app.drives, tab == TAB_DRIVES ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.cleanup, tab == TAB_CLEANUP ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_app.quarantine, tab == TAB_QUARANTINE ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.monitor, tab == TAB_MONITOR ? SW_SHOW : SW_HIDE);
     if (tab == TAB_DRIVES && !drive_panel_loaded(g_app.drives)) {
         drive_panel_refresh(g_app.drives);
+    }
+    if (tab == TAB_QUARANTINE) {
+        quarantine_panel_refresh(g_app.quarantine);
     }
     if (tab == TAB_MONITOR) {
         monitor_panel_start(g_app.monitor);
@@ -1048,10 +1061,75 @@ static int verify_monitor_tab(void)
     int failures = monitor_panel_verify(g_app.monitor);
 
     SELF_CHECK(current_tab() == TAB_MONITOR);
-    SELF_CHECK(is_shown(g_app.monitor) && !is_shown(g_app.drives) && !is_shown(g_app.cleanup));
+    SELF_CHECK(is_shown(g_app.monitor) && !is_shown(g_app.drives) && !is_shown(g_app.cleanup) &&
+               !is_shown(g_app.quarantine));
     SELF_CHECK(!is_shown(g_app.tree) && !is_shown(g_app.list) && !is_shown(g_app.path));
     SELF_CHECK(GetWindow(g_app.tabs, GW_HWNDNEXT) == NULL);
     return failures == 0 ? 0 : 1;
+}
+
+/* 격리 폴더 탭의 탭 전환 상태와 패널 내용을 확인한다. */
+static int verify_quarantine_tab(size_t rows, size_t ok)
+{
+    int failures = quarantine_panel_verify(g_app.quarantine, rows, ok);
+
+    SELF_CHECK(current_tab() == TAB_QUARANTINE);
+    SELF_CHECK(is_shown(g_app.quarantine) && !is_shown(g_app.cleanup) && !is_shown(g_app.drives));
+    SELF_CHECK(GetWindow(g_app.tabs, GW_HWNDNEXT) == NULL);
+    return failures == 0 ? 0 : 1;
+}
+
+/* 파일을 만든다(같은 이름이 있는 복원 상황 재현용). */
+static int write_conflict_file(const wchar_t *path)
+{
+    static const char text[] = "conflict";
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD written = 0;
+    BOOL ok;
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    ok = WriteFile(h, text, (DWORD)(sizeof(text) - 1), &written, NULL);
+    CloseHandle(h);
+    return ok && written == sizeof(text) - 1;
+}
+
+/*
+ * SELF_TEST_QUARANTINE: 정리가 끝난 뒤 격리 폴더 탭에서 목록 확인 → 같은 이름 파일을 하나 만든
+ * 뒤 모두 복원(그 항목은 건너뜀) → 남은 항목 영구 삭제를 시작한다. 실패하면 0.
+ */
+static int self_test_quarantine_step(void)
+{
+    size_t restored;
+
+    if (cleanup_panel_verify_trash(g_app.cleanup, g_app.trash_expect) != 0) {
+        return 0;
+    }
+    show_tab(TAB_QUARANTINE);
+    /* 사용자의 실제 격리 항목은 건드리지 않도록 픽스처만 보이게 한다. */
+    quarantine_panel_set_root(g_app.quarantine, g_app.quarantine_root);
+    if (verify_quarantine_tab(g_app.trash_expect, g_app.trash_expect) != 0) {
+        return 0;
+    }
+    if (!write_conflict_file(g_app.quarantine_conflict)) {
+        fwprintf(stderr, L"self-test failed: could not create %ls\n", g_app.quarantine_conflict);
+        return 0;
+    }
+    if (quarantine_panel_select_all(g_app.quarantine) != g_app.trash_expect) {
+        fwprintf(stderr, L"self-test failed: could not select quarantined items\n");
+        return 0;
+    }
+    restored = quarantine_panel_restore(g_app.quarantine, 0);
+    if (restored + 1 != g_app.trash_expect || quarantine_panel_conflicts(g_app.quarantine) != 1 ||
+        verify_quarantine_tab(1, 1) != 0) {
+        fwprintf(stderr, L"self-test failed: restored %u of %u (conflicts %u)\n",
+                 (unsigned)restored, (unsigned)g_app.trash_expect,
+                 (unsigned)quarantine_panel_conflicts(g_app.quarantine));
+        return 0;
+    }
+    return quarantine_panel_select_all(g_app.quarantine) == 1 &&
+           quarantine_panel_purge(g_app.quarantine, 0);
 }
 
 /* ---- 창 프로시저 ---- */
@@ -1099,6 +1177,8 @@ static void create_controls(void)
         SendMessageW(g_app.tabs, TCM_INSERTITEMW, TAB_DRIVES, (LPARAM)&tab);
         tab.pszText = L"정리 후보";
         SendMessageW(g_app.tabs, TCM_INSERTITEMW, TAB_CLEANUP, (LPARAM)&tab);
+        tab.pszText = L"격리 폴더";
+        SendMessageW(g_app.tabs, TCM_INSERTITEMW, TAB_QUARANTINE, (LPARAM)&tab);
         tab.pszText = L"시스템";
         SendMessageW(g_app.tabs, TCM_INSERTITEMW, TAB_MONITOR, (LPARAM)&tab);
     }
@@ -1149,6 +1229,8 @@ static void create_controls(void)
 
     g_app.drives = drive_panel_create(g_app.hwnd, IDC_DRIVES, g_app.font, g_app.dpi);
     g_app.cleanup = cleanup_panel_create(g_app.hwnd, IDC_CLEANUP, g_app.font, g_app.dpi);
+    g_app.quarantine =
+        quarantine_panel_create(g_app.hwnd, IDC_QUARANTINE, g_app.font, g_app.dpi);
     g_app.monitor = monitor_panel_create(g_app.hwnd, IDC_MONITOR, g_app.font, g_app.dpi);
     /* 새 자식 창은 Z 순서 맨 아래에 붙으므로, 모두 만든 뒤 탭 컨트롤을 맨 아래로 보내
      * 탭 위의 컨트롤이 가려지지 않게 한다. */
@@ -1234,7 +1316,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 KillTimer(hwnd, TIMER_SELF_TEST);
                 g_app.self_test_exit = verify_cleanup_tab();
                 DestroyWindow(hwnd);
-            } else if (HIWORD(wp) == CPN_FINISHED && g_app.self_test == SELF_TEST_TRASH) {
+            } else if (HIWORD(wp) == CPN_FINISHED && (g_app.self_test == SELF_TEST_TRASH ||
+                                                      g_app.self_test == SELF_TEST_QUARANTINE)) {
                 /* 탐지 화면을 확인한 뒤, 옮길 수 있는 항목을 모두 체크해 휴지통으로 옮긴다. */
                 g_app.trash_expect = cleanup_panel_check_all(g_app.cleanup, 1);
                 if (verify_cleanup_tab() != 0 || g_app.trash_expect == 0 ||
@@ -1249,6 +1332,20 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 KillTimer(hwnd, TIMER_SELF_TEST);
                 g_app.self_test_exit =
                     cleanup_panel_verify_trash(g_app.cleanup, g_app.trash_expect) == 0 ? 0 : 1;
+                DestroyWindow(hwnd);
+            } else if (HIWORD(wp) == CPN_TRASHED && g_app.self_test == SELF_TEST_QUARANTINE) {
+                if (!self_test_quarantine_step()) {
+                    KillTimer(hwnd, TIMER_SELF_TEST);
+                    g_app.self_test_exit = 1;
+                    DestroyWindow(hwnd);
+                }
+            }
+            return 0;
+        case IDC_QUARANTINE:
+            /* 남은 항목(같은 이름 때문에 건너뛴 것)까지 영구 삭제했으면 목록이 비어야 한다. */
+            if (HIWORD(wp) == QPN_PURGED && g_app.self_test == SELF_TEST_QUARANTINE) {
+                KillTimer(hwnd, TIMER_SELF_TEST);
+                g_app.self_test_exit = verify_quarantine_tab(0, 0);
                 DestroyWindow(hwnd);
             }
             return 0;
@@ -1314,6 +1411,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  *   bytesieve-gui --self-test-cleanup-cancel <dir> 탐지 시작 직후 취소한 뒤 화면을 검증하고 종료
  *   bytesieve-gui --self-test-trash <dir>          탐지 후 옮길 수 있는 항목을 모두 휴지통으로
  *                                                  옮기고(확인 창 없음) 결과 화면을 검증하고 종료
+ *   bytesieve-gui --self-test-quarantine <dir> <file>
+ *                                         탐지 후 모두 정리(BYTESIEVE_QUARANTINE_ROOT=<dir> 이면 격리
+ *                                         폴더로) → 격리 폴더 탭 확인 → <file> 을 만든 뒤 모두 복원
+ *                                         (그 항목은 같은 이름이라 건너뜀) → 남은 항목 영구 삭제 → 종료
  *   bytesieve-gui --self-test-monitor     시스템 탭에서 RAM·CPU 를 몇 번 측정한 뒤 화면을 검증하고 종료
  *   bytesieve-gui --self-test-changes <dir> 스캔 후 직전 스냅숏과 비교한 변화 보기를 검증하고
  *                                          변화 목록을 stdout 에 쓴 뒤 종료(직전 스냅숏 필요)
@@ -1354,6 +1455,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     } else if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test-trash") == 0) {
         g_app.self_test = SELF_TEST_TRASH;
         cleanup_target = argv[2];
+    } else if (argv != NULL && argc >= 4 && wcscmp(argv[1], L"--self-test-quarantine") == 0) {
+        g_app.self_test = SELF_TEST_QUARANTINE;
+        cleanup_target = argv[2];
+        g_app.quarantine_root = argv[2];
+        g_app.quarantine_conflict = argv[3];
     } else if (argv != NULL && argc >= 2 && wcscmp(argv[1], L"--self-test-monitor") == 0) {
         g_app.self_test = SELF_TEST_MONITOR;
     } else if (argv != NULL && argc >= 2) {
@@ -1382,6 +1488,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     InitCommonControlsEx(&icc);
     drive_panel_register(inst);
     cleanup_panel_register(inst);
+    quarantine_panel_register(inst);
     monitor_panel_register(inst);
 
     memset(&wc, 0, sizeof(wc));
@@ -1453,14 +1560,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
             SetTimer(g_app.hwnd, TIMER_SELF_TEST, SELF_TEST_TIMEOUT_MS, NULL);
         }
     }
-    LocalFree(argv);
-
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         if (!IsDialogMessageW(g_app.hwnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
+    /* 자체 검사의 경로 인자(quarantine_root 등)를 루프 동안 쓰므로 끝난 뒤 해제한다. */
+    LocalFree(argv);
     DeleteObject(g_app.font);
     CoUninitialize();
     return (int)msg.wParam;
