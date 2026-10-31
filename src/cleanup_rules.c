@@ -428,3 +428,32 @@ int cleanup_protect_contains(const CleanupProtect *p, const wchar_t *path)
     }
     return 0;
 }
+
+int cleanup_is_quarantine_name(const wchar_t *name)
+{
+    return name != NULL && name_eq(name, CLEANUP_QUARANTINE_DIR);
+}
+
+int cleanup_in_quarantine(const wchar_t *path)
+{
+    size_t qlen = wcslen(CLEANUP_QUARANTINE_DIR);
+    const wchar_t *s;
+
+    if (path == NULL) {
+        return 0;
+    }
+    for (s = path; *s != L'\0';) {
+        size_t len = 0;
+        while (s[len] != L'\0' && !path_is_separator(s[len])) {
+            len++;
+        }
+        if (name_eq_n(s, len, CLEANUP_QUARANTINE_DIR, qlen)) {
+            return 1;
+        }
+        s += len;
+        while (*s != L'\0' && path_is_separator(*s)) {
+            s++;
+        }
+    }
+    return 0;
+}

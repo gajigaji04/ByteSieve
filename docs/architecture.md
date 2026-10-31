@@ -4,17 +4,20 @@
 
 - **언어·빌드**: C11, CMake 3.21+, MSVC(`/W4 /utf-8`), 유니코드(`UNICODE`) 빌드
 - **Windows API**: 폴더 열거 `GetFileInformationByHandleEx(FileFullDirectoryInfo)`(미지원 파일 시스템은 `FindFirstFileExW`),
-  긴 경로 `\\?\`, 휴지통 이동 `IFileOperation`, 드라이브 `GetLogicalDrives`·`GetDiskFreeSpaceExW`,
+  긴 경로 `\\?\`, 휴지통 이동 `IFileOperation`, 격리 폴더 이동·복원 `MoveFileExW`(같은 볼륨, 덮어쓰기 없음), 드라이브 `GetLogicalDrives`·`GetDiskFreeSpaceExW`,
   메모리·CPU `GlobalMemoryStatusEx`·`GetSystemTimes`, GUI는 Win32 + Common Controls v6
 - **구조**: UI와 무관한 정적 라이브러리 위에 CLI·GUI를 얹었습니다. 무거운 작업(스캔·탐지·휴지통 이동·측정)은 모두 작업 스레드에서
   실행하고, GUI 스레드는 `PostMessage`로 결과만 받아 화면을 갱신합니다.
 
 ```
                     disk-scanner (CLI)                bytesieve-gui (GUI)
-                     │  cli · jsonl                     │  폴더 스캔 │ 드라이브 │ 정리 후보 │ 시스템
+                     │  cli · jsonl                     │  폴더 스캔 │ 드라이브 │ 정리 후보 │ 공용 캐시 │ 격리 폴더 │ 시스템
                      │                                  │
-   scan_history ── scan_model ── scan_job        cleanup_job ── cleanup_trash      drive   sysmon
-   (변화 추적)     (폴더 트리)   (스캔 스레드)   (탐지 스레드)   (휴지통 이동)    (드라이브) (RAM·CPU)
+   scan_history ── scan_model ── scan_job        cleanup_job ── cleanup_trash ── dev_cache   drive   sysmon
+   (변화 추적)     (폴더 트리)   (스캔 스레드)   (탐지 스레드)   (휴지통 이동)    (공용 캐시)  (드라이브) (RAM·CPU)
+                                                                        │
+                                                                    quarantine
+                                                                    (격리 폴더)
                         │                             │
                         └────────── scanner ──────────┘   cleanup_scan ── cleanup_rules
                          (DFS 열거·병렬 미리 열거·      (탐지 엔진)     (이름 규칙·개발 환경·보호 경로)
@@ -30,8 +33,11 @@
 | `bytesieve_model` | 폴더 트리 모델, 정렬, 용량·디스크 사용 순위, 진행률 |
 | `bytesieve_job` | 스캔 작업 스레드, 진행률 사본, 취소 |
 | `bytesieve_history` | 폴더별 용량 스냅숏 저장·읽기·비교 |
+| `bytesieve_export` | 스캔 결과 CSV·HTML 보고서 내보내기(임시 파일 → 바꿔치기, 64 KiB 버퍼로 나눠 쓰기) |
 | `bytesieve_cleanup_rules` / `bytesieve_cleanup` / `bytesieve_cleanup_job` | 정리 후보 규칙, 탐지 엔진, 탐지 스레드 |
-| `bytesieve_cleanup_trash` | 삭제 보호 판정, 직전 확인, 휴지통 이동 |
+| `bytesieve_cleanup_trash` | 삭제 보호 판정, 직전 확인, 휴지통 이동(쓸 수 없으면 격리 폴더로). 항목마다 탐지 경로를 따로 받는 작업도 지원 |
+| `bytesieve_dev_cache` | 공용 개발 캐시(npm·pip·Gradle·Cargo·NuGet) 위치 탐지(환경 변수·설정 파일·기본 위치, 캐시 구조 확인), 용량 세기, 작업 스레드 |
+| `bytesieve_quarantine` | 드라이브별 격리 폴더: 같은 볼륨 안 이동, 기록(원자적 쓰기), 목록·불일치 판정, 복원, 영구 삭제 |
 | `bytesieve_drive` / `bytesieve_sysmon` / `bytesieve_format` | 드라이브 조회, RAM·CPU 측정, 용량 표시 문자열 |
 | `bytesieve_cli` / `bytesieve_jsonl` | CLI 인자 해석·출력, JSON Lines 직렬화 |
 
@@ -70,6 +76,8 @@
 폴더 트리를 깊이 4까지 저장하며(그 아래 변화는 조상 폴더 용량에 반영), 새 폴더·삭제된 폴더 안의 하위 폴더는 따로 나열하지 않습니다.
 스냅숏은 임시 파일에 쓴 뒤 바꿔치기하고, 대상 폴더마다 직전 스냅숏 하나만 남깁니다.
 저장 위치는 환경 변수 `BYTESIEVE_HISTORY_DIR`, 없으면 `%LOCALAPPDATA%\ByteSieve\history`입니다.
+같은 폴더의 `settings.txt`에 GUI 자동 저장 설정을 둡니다(임시 파일에 쓴 뒤 바꿔치기, 없거나 손상되면 켬). CLI `--track`은 명시적 요청이므로 이 설정을 보지 않습니다.
+기록 삭제는 `<16자리 16진수>.snap`(과 남은 `.snap.tmp`) 형식의 일반 파일만 지우고, 하나가 실패해도 나머지를 계속 지운 뒤 지운·실패 개수를 알려 줍니다.
 
 ## 파일 삭제 안전성
 

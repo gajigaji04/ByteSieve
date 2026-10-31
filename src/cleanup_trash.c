@@ -12,6 +12,7 @@
 
 #include "cleanup_trash.h"
 #include "path.h"
+#include "quarantine.h"
 
 /* ---- 상태 이름 ---- */
 
@@ -20,6 +21,8 @@ const wchar_t *cleanup_trash_status_text(CleanupTrashStatus status)
     switch (status) {
     case CLEANUP_TRASH_MOVED:
         return L"휴지통으로 이동됨";
+    case CLEANUP_TRASH_QUARANTINED:
+        return L"격리 폴더로 이동됨";
     case CLEANUP_TRASH_DENY_PATH:
         return L"휴지통이 지원하지 않는 경로(네트워크·너무 긴 경로)";
     case CLEANUP_TRASH_DENY_OUTSIDE:
@@ -31,7 +34,7 @@ const wchar_t *cleanup_trash_status_text(CleanupTrashStatus status)
     case CLEANUP_TRASH_DENY_INCOMPLETE:
         return L"하위를 다 읽지 못한 항목";
     case CLEANUP_TRASH_DENY_DRIVE:
-        return L"휴지통이 없는 드라이브";
+        return L"휴지통·격리 폴더를 쓸 수 없는 드라이브(네트워크·CD 등)";
     case CLEANUP_TRASH_MISSING:
         return L"이미 없음";
     case CLEANUP_TRASH_CHANGED:
@@ -40,6 +43,8 @@ const wchar_t *cleanup_trash_status_text(CleanupTrashStatus status)
         return L"휴지통에 넣을 수 없음(영구 삭제 방지)";
     case CLEANUP_TRASH_FAILED:
         return L"이동 실패";
+    case CLEANUP_TRASH_QUARANTINE_FAILED:
+        return L"격리 폴더로 옮기지 못함";
     case CLEANUP_TRASH_CANCELLED:
         return L"취소됨";
     default:
@@ -52,6 +57,8 @@ const wchar_t *cleanup_trash_status_name(CleanupTrashStatus status)
     switch (status) {
     case CLEANUP_TRASH_MOVED:
         return L"moved";
+    case CLEANUP_TRASH_QUARANTINED:
+        return L"quarantined";
     case CLEANUP_TRASH_DENY_PATH:
         return L"deny_path";
     case CLEANUP_TRASH_DENY_OUTSIDE:
@@ -72,6 +79,8 @@ const wchar_t *cleanup_trash_status_name(CleanupTrashStatus status)
         return L"no_recycle";
     case CLEANUP_TRASH_FAILED:
         return L"failed";
+    case CLEANUP_TRASH_QUARANTINE_FAILED:
+        return L"quarantine_failed";
     case CLEANUP_TRASH_CANCELLED:
         return L"cancelled";
     default:
@@ -220,7 +229,8 @@ CleanupTrashStatus cleanup_guard_check(const CleanupGuard *g, const wchar_t *roo
     if (!trim_span(root, &r, &rlen) || !within(r, rlen, s, len) || len == rlen) {
         return CLEANUP_TRASH_DENY_OUTSIDE;
     }
-    if ((item->flags & CLEANUP_ITEM_PROTECTED) ||
+    /* 격리 폴더 안은 이미 정리한 항목이다(복원·영구 삭제는 격리 폴더 화면에서). */
+    if ((item->flags & CLEANUP_ITEM_PROTECTED) || cleanup_in_quarantine(item->path) ||
         cleanup_protect_contains(g != NULL ? &g->protect : NULL, item->path)) {
         return CLEANUP_TRASH_DENY_PROTECTED;
     }
@@ -269,22 +279,39 @@ static int same_final_path(const wchar_t *path)
     return alen == blen && name_eq_n(a, b, alen);
 }
 
-static CleanupTrashStatus verify_on_disk(const CleanupItem *item, uint32_t *code)
+/*
+ * 드라이브 종류로 정리 방법을 정한다: 고정 디스크는 휴지통(*quarantine = 0), 이동식 드라이브는
+ * 격리 폴더(*quarantine = 1). 테스트용 BYTESIEVE_QUARANTINE_ROOT 안은 격리 폴더로 본다.
+ */
+static CleanupTrashStatus pick_method(const CleanupItem *item, int *quarantine)
 {
-    WIN32_FILE_ATTRIBUTE_DATA data;
     const wchar_t *s;
     size_t len;
     wchar_t drive[4];
-    int is_dir;
+    UINT type;
 
+    if (quarantine_test_root_contains(item->path)) {
+        *quarantine = 1;
+        return CLEANUP_TRASH_PENDING;
+    }
     trim_span(item->path, &s, &len);
     drive[0] = s[0];
     drive[1] = L':';
     drive[2] = L'\\';
     drive[3] = L'\0';
-    if (GetDriveTypeW(drive) != DRIVE_FIXED) {
+    type = GetDriveTypeW(drive);
+    if (type != DRIVE_FIXED && type != DRIVE_REMOVABLE) {
         return CLEANUP_TRASH_DENY_DRIVE;
     }
+    *quarantine = type == DRIVE_REMOVABLE;
+    return CLEANUP_TRASH_PENDING;
+}
+
+static CleanupTrashStatus verify_on_disk(const CleanupItem *item, uint32_t *code)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    int is_dir;
+
     if (!GetFileAttributesExW(item->path, GetFileExInfoStandard, &data)) {
         DWORD err = GetLastError();
         if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
@@ -497,7 +524,11 @@ static IFileOperationProgressSinkVtbl g_sink_vtbl = {
     .ResumeTimer = sink_timer,
 };
 
-static CleanupTrashStatus recycle(const wchar_t *path, CleanupTrashOutcome *out)
+/*
+ * 휴지통으로 옮긴다. *untouched 는 실패했을 때 셸이 항목을 건드리지 않았는지(삭제 단계에
+ * 이르지 못했거나 거부했고 원래 경로가 그대로 있음) 알려 준다(격리 폴더로 바꿔 옮겨도 되는지).
+ */
+static CleanupTrashStatus recycle(const wchar_t *path, CleanupTrashOutcome *out, int *untouched)
 {
     TrashSink sink;
     IFileOperation *op = NULL;
@@ -540,9 +571,11 @@ static CleanupTrashStatus recycle(const wchar_t *path, CleanupTrashOutcome *out)
         IFileOperation_Release(op);
     }
 
+    *untouched = 0;
     if (sink.vetoed) {
         free(sink.recycled_path);
         out->code = (uint32_t)E_ABORT;
+        *untouched = 1;
         return CLEANUP_TRASH_NO_RECYCLE;
     }
     /* 원래 경로가 남아 있으면(일부만 옮겨진 폴더 포함) 실패로 본다. */
@@ -552,6 +585,7 @@ static CleanupTrashStatus recycle(const wchar_t *path, CleanupTrashOutcome *out)
             hr = sink.hr;
         }
         out->code = (uint32_t)(FAILED(hr) ? hr : E_FAIL);
+        *untouched = !sink.deleted;
         return CLEANUP_TRASH_FAILED;
     }
     out->recycled_path = sink.recycled_path;
@@ -568,18 +602,56 @@ void cleanup_trash_outcome_free(CleanupTrashOutcome *o)
     }
 }
 
+/* 같은 드라이브의 격리 폴더로 옮긴다. */
+static CleanupTrashStatus quarantine_item(const CleanupItem *item, CleanupTrashOutcome *out)
+{
+    wchar_t *volume = quarantine_volume_root(item->path);
+    QuarantineStatus qs;
+    uint32_t code = 0;
+
+    out->code = 0;
+    if (volume == NULL) {
+        out->code = ERROR_PATH_NOT_FOUND;
+        return CLEANUP_TRASH_QUARANTINE_FAILED;
+    }
+    qs = quarantine_move(volume, item->path, (item->flags & CLEANUP_ITEM_DIR) != 0, item->bytes,
+                         &out->recycled_path, &code);
+    free(volume);
+    if (qs == QUARANTINE_OK) {
+        return CLEANUP_TRASH_QUARANTINED;
+    }
+    if (qs == QUARANTINE_MISSING) {
+        return CLEANUP_TRASH_MISSING;
+    }
+    out->code = code;
+    return CLEANUP_TRASH_QUARANTINE_FAILED;
+}
+
 CleanupTrashStatus cleanup_trash_one(const CleanupGuard *g, const wchar_t *root,
                                      const CleanupItem *item, CleanupTrashOutcome *out)
 {
     CleanupTrashStatus status;
+    int quarantine = 0, untouched = 0;
 
     cleanup_trash_outcome_free(out);
     status = cleanup_guard_check(g, root, item);
     if (status == CLEANUP_TRASH_PENDING) {
-        status = verify_on_disk(item, &out->code);
+        status = pick_method(item, &quarantine);
     }
     if (status == CLEANUP_TRASH_PENDING) {
-        status = recycle(item->path, out);
+        status = verify_on_disk(item, &out->code);
+    }
+    if (status == CLEANUP_TRASH_PENDING && !quarantine) {
+        status = recycle(item->path, out, &untouched);
+        /* 휴지통을 쓸 수 없었고 항목이 그대로면, 다시 확인한 뒤 격리 폴더로 옮긴다. */
+        if ((status == CLEANUP_TRASH_NO_RECYCLE || status == CLEANUP_TRASH_FAILED) && untouched) {
+            uint32_t code = 0;
+            quarantine = verify_on_disk(item, &code) == CLEANUP_TRASH_PENDING;
+        }
+    }
+    if (quarantine && (status == CLEANUP_TRASH_PENDING || status == CLEANUP_TRASH_NO_RECYCLE ||
+                       status == CLEANUP_TRASH_FAILED)) {
+        status = quarantine_item(item, out);
     }
     out->status = status;
     return status;
@@ -589,7 +661,7 @@ CleanupTrashStatus cleanup_trash_one(const CleanupGuard *g, const wchar_t *root,
 
 struct CleanupTrashJob {
     HANDLE thread;
-    wchar_t *root;
+    wchar_t **roots;    /* 항목마다 탐지 경로(복사본) */
     CleanupItem *items; /* 경로는 복사본 */
     CleanupTrashOutcome *outcomes;
     size_t count;
@@ -626,14 +698,15 @@ static unsigned __stdcall trash_thread(void *arg)
             o->status = CLEANUP_TRASH_FAILED;
             o->code = (uint32_t)init;
         } else {
-            cleanup_trash_one(&job->guard, job->root, &job->items[i], o);
+            cleanup_trash_one(&job->guard, job->roots[i], &job->items[i], o);
         }
 
         EnterCriticalSection(&job->lock);
         job->snapshot.done++;
-        if (o->status == CLEANUP_TRASH_MOVED) {
+        if (o->status == CLEANUP_TRASH_MOVED || o->status == CLEANUP_TRASH_QUARANTINED) {
             job->snapshot.moved++;
             job->snapshot.moved_bytes += job->items[i].bytes;
+            job->snapshot.quarantined += o->status == CLEANUP_TRASH_QUARANTINED;
         } else {
             job->snapshot.failed++;
         }
@@ -660,21 +733,44 @@ static void job_free(CleanupTrashJob *job)
     size_t i;
 
     DeleteCriticalSection(&job->lock);
-    if (job->items != NULL) {
-        for (i = 0; i < job->count; i++) {
+    for (i = 0; i < job->count; i++) {
+        if (job->items != NULL) {
             free(job->items[i].path);
+        }
+        if (job->roots != NULL) {
+            free(job->roots[i]);
         }
     }
     free(job->items);
+    free(job->roots);
     cleanup_trash_outcomes_free(job->outcomes, job->count);
     cleanup_guard_free(&job->guard);
-    free(job->root);
     free(job);
 }
 
 CleanupTrashJob *cleanup_trash_job_start(const wchar_t *root, const CleanupItem *const *items,
                                          size_t count, uint32_t interval_ms,
                                          cleanup_trash_notify_fn notify, void *ctx)
+{
+    const wchar_t **roots = malloc((count > 0 ? count : 1) * sizeof(*roots));
+    CleanupTrashJob *job;
+    size_t i;
+
+    if (roots == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < count; i++) {
+        roots[i] = root;
+    }
+    job = cleanup_trash_job_start_each(roots, items, count, interval_ms, notify, ctx);
+    free((void *)roots);
+    return job;
+}
+
+CleanupTrashJob *cleanup_trash_job_start_each(const wchar_t *const *roots,
+                                              const CleanupItem *const *items, size_t count,
+                                              uint32_t interval_ms,
+                                              cleanup_trash_notify_fn notify, void *ctx)
 {
     CleanupTrashJob *job = calloc(1, sizeof(*job));
     size_t i;
@@ -691,17 +787,18 @@ CleanupTrashJob *cleanup_trash_job_start(const wchar_t *root, const CleanupItem 
     job->notify = notify;
     job->ctx = ctx;
     job->last_notify = GetTickCount64();
-    job->root = path_dup(root != NULL ? root : L"");
+    job->roots = calloc(count > 0 ? count : 1, sizeof(*job->roots));
     job->items = calloc(count > 0 ? count : 1, sizeof(*job->items));
     job->outcomes = calloc(count > 0 ? count : 1, sizeof(*job->outcomes));
-    if (job->root == NULL || job->items == NULL || job->outcomes == NULL) {
+    if (job->roots == NULL || job->items == NULL || job->outcomes == NULL) {
         job_free(job);
         return NULL;
     }
     for (i = 0; i < count; i++) {
         job->items[i] = *items[i];
         job->items[i].path = path_dup(items[i]->path != NULL ? items[i]->path : L"");
-        if (job->items[i].path == NULL) {
+        job->roots[i] = path_dup(roots[i] != NULL ? roots[i] : L"");
+        if (job->items[i].path == NULL || job->roots[i] == NULL) {
             job_free(job);
             return NULL;
         }

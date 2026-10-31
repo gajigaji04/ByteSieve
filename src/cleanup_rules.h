@@ -130,4 +130,17 @@ int cleanup_protect_match(const CleanupProtect *p, const wchar_t *dir, const wch
 /* path 가 보호 경로와 같거나 그 아래에 있는지(탐지 시작 경로 경고용). */
 int cleanup_protect_contains(const CleanupProtect *p, const wchar_t *path);
 
+/*
+ * 휴지통이 없는 드라이브에서 정리한 항목을 옮겨 두는 격리 폴더 이름(볼륨 루트 아래
+ * "X:\.bytesieve-trash", quarantine.h). 폴더 스캔·정리 후보 탐지는 이 이름의 폴더에 들어가지
+ * 않고, 정리 보호 판정은 이 폴더 안의 항목을 거부한다.
+ */
+#define CLEANUP_QUARANTINE_DIR L".bytesieve-trash"
+
+/* name 이 격리 폴더 이름인지(대소문자 무시). */
+int cleanup_is_quarantine_name(const wchar_t *name);
+
+/* path 의 구성 요소 중 하나가 격리 폴더 이름인지(격리 폴더 자체이거나 그 안). */
+int cleanup_in_quarantine(const wchar_t *path);
+
 #endif /* BYTESIEVE_CLEANUP_RULES_H */

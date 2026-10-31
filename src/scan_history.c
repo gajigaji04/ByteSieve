@@ -224,13 +224,51 @@ static void tb_wide(TextBuf *b, const wchar_t *s)
     }
 }
 
+/* data 를 "<file>.tmp" 에 쓴 뒤 file 로 바꿔치기한다. 실패하면 임시 파일을 지우고 -1. */
+static int write_replace(const wchar_t *file, const char *data, size_t len, unsigned long *error)
+{
+    wchar_t *tmp_path;
+    HANDLE h;
+    DWORD written = 0;
+    int ok;
+
+    tmp_path = malloc((wcslen(file) + 5) * sizeof(wchar_t));
+    if (tmp_path == NULL) {
+        if (error != NULL) {
+            *error = ERROR_NOT_ENOUGH_MEMORY;
+        }
+        return -1;
+    }
+    swprintf(tmp_path, wcslen(file) + 5, L"%ls.tmp", file);
+    h = CreateFileW(tmp_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    ok = h != INVALID_HANDLE_VALUE;
+    if (ok) {
+        ok = len <= MAXDWORD && WriteFile(h, data, (DWORD)len, &written, NULL) &&
+             written == len;
+        if (!ok && error != NULL) {
+            *error = GetLastError();
+        }
+        CloseHandle(h);
+    } else if (error != NULL) {
+        *error = GetLastError();
+    }
+    if (ok && !MoveFileExW(tmp_path, file, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        if (error != NULL) {
+            *error = GetLastError();
+        }
+        ok = 0;
+    }
+    if (!ok) {
+        DeleteFileW(tmp_path);
+    }
+    free(tmp_path);
+    return ok ? 0 : -1;
+}
+
 int history_save(const HistorySnapshot *s, const wchar_t *file, unsigned long *error)
 {
     TextBuf b = {0};
     char line[160];
-    wchar_t *tmp_path;
-    HANDLE h;
-    DWORD written = 0;
     size_t i;
     int ok;
 
@@ -264,40 +302,9 @@ int history_save(const HistorySnapshot *s, const wchar_t *file, unsigned long *e
         }
         return -1;
     }
-
-    tmp_path = malloc((wcslen(file) + 5) * sizeof(wchar_t));
-    if (tmp_path == NULL) {
-        free(b.data);
-        if (error != NULL) {
-            *error = ERROR_NOT_ENOUGH_MEMORY;
-        }
-        return -1;
-    }
-    swprintf(tmp_path, wcslen(file) + 5, L"%ls.tmp", file);
-    h = CreateFileW(tmp_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    ok = h != INVALID_HANDLE_VALUE;
-    if (ok) {
-        ok = b.len <= MAXDWORD && WriteFile(h, b.data, (DWORD)b.len, &written, NULL) &&
-             written == b.len;
-        if (!ok && error != NULL) {
-            *error = GetLastError();
-        }
-        CloseHandle(h);
-    } else if (error != NULL) {
-        *error = GetLastError();
-    }
-    if (ok && !MoveFileExW(tmp_path, file, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        if (error != NULL) {
-            *error = GetLastError();
-        }
-        ok = 0;
-    }
-    if (!ok) {
-        DeleteFileW(tmp_path);
-    }
-    free(tmp_path);
+    ok = write_replace(file, b.data, b.len, error);
     free(b.data);
-    return ok ? 0 : -1;
+    return ok;
 }
 
 /* 줄 하나를 잘라 낸다(끝의 '\r' 은 뺀다). 없으면 NULL. */
@@ -561,6 +568,185 @@ wchar_t *history_file_for(const wchar_t *dir, const wchar_t *root)
     free(upper);
     joined = path_join(dir, name);
     return joined;
+}
+
+/* ---- 자동 저장 설정 ---- */
+
+#define SETTINGS_MAGIC "BYTESIEVE-HISTORY-SETTINGS 1"
+#define SETTINGS_MAX_BYTES 4096
+
+int history_autosave_enabled(const wchar_t *dir)
+{
+    char data[SETTINGS_MAX_BYTES + 1];
+    const char *p;
+    wchar_t *file;
+    HANDLE h;
+    DWORD got = 0;
+    int enabled = 1;
+
+    if (dir == NULL || (file = path_join(dir, HISTORY_SETTINGS_FILE)) == NULL) {
+        return 1;
+    }
+    h = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    free(file);
+    if (h == INVALID_HANDLE_VALUE) {
+        return 1;
+    }
+    if (!ReadFile(h, data, SETTINGS_MAX_BYTES, &got, NULL)) {
+        got = 0;
+    }
+    CloseHandle(h);
+    data[got] = '\0';
+    /* 첫 줄이 형식 표시이고 "autosave\t0" 줄이 있을 때만 끈다. 그 밖에는 모두 기본값(켬). */
+    if (strncmp(data, SETTINGS_MAGIC "\n", sizeof(SETTINGS_MAGIC)) != 0 &&
+        strncmp(data, SETTINGS_MAGIC "\r\n", sizeof(SETTINGS_MAGIC) + 1) != 0) {
+        return 1;
+    }
+    for (p = data; p != NULL && *p != '\0'; p = strchr(p, '\n'), p = p != NULL ? p + 1 : NULL) {
+        if (strncmp(p, "autosave\t", 9) == 0) {
+            enabled = !(p[9] == '0' && (p[10] == '\n' || p[10] == '\r' || p[10] == '\0'));
+        }
+    }
+    return enabled;
+}
+
+int history_set_autosave(const wchar_t *dir, int enabled, unsigned long *error)
+{
+    const char *text = enabled ? SETTINGS_MAGIC "\nautosave\t1\n" : SETTINGS_MAGIC "\nautosave\t0\n";
+    wchar_t *file;
+    int rc;
+
+    if (error != NULL) {
+        *error = 0;
+    }
+    if (dir == NULL || history_ensure_dir(dir) != 0) {
+        if (error != NULL) {
+            *error = dir == NULL ? ERROR_INVALID_PARAMETER : GetLastError();
+            if (*error == 0) {
+                *error = ERROR_PATH_NOT_FOUND;
+            }
+        }
+        return -1;
+    }
+    file = path_join(dir, HISTORY_SETTINGS_FILE);
+    if (file == NULL) {
+        if (error != NULL) {
+            *error = ERROR_NOT_ENOUGH_MEMORY;
+        }
+        return -1;
+    }
+    rc = write_replace(file, text, strlen(text), error);
+    free(file);
+    return rc;
+}
+
+/* ---- 기록 삭제 ---- */
+
+/* history_file_for 가 만드는 이름("<16자리 16진수>.snap") 또는 그 임시 파일(".snap.tmp")인지. */
+static int is_snapshot_name(const wchar_t *name, int allow_tmp)
+{
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        if (!iswxdigit(name[i])) {
+            return 0;
+        }
+    }
+    return _wcsicmp(name + 16, L".snap") == 0 ||
+           (allow_tmp && _wcsicmp(name + 16, L".snap.tmp") == 0);
+}
+
+/*
+ * dir 안의 스냅숏 파일마다 visit(전체 경로, 이름, ctx)을 부른다. 경로를 만들지 못하면 file 은
+ * NULL 이다. 폴더가 없으면 0, 열 수 없으면 -1(*error).
+ */
+static int each_snapshot(const wchar_t *dir, int allow_tmp,
+                         void (*visit)(const wchar_t *file, const wchar_t *name, void *ctx),
+                         void *ctx, unsigned long *error)
+{
+    WIN32_FIND_DATAW fd;
+    wchar_t *pattern;
+    HANDLE h;
+    DWORD err;
+
+    if (dir == NULL || (pattern = path_join(dir, L"*")) == NULL) {
+        *error = dir == NULL ? ERROR_INVALID_PARAMETER : ERROR_NOT_ENOUGH_MEMORY;
+        return -1;
+    }
+    h = FindFirstFileExW(pattern, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, 0);
+    err = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+    free(pattern);
+    if (h == INVALID_HANDLE_VALUE) {
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+            return 0;
+        }
+        *error = err;
+        return -1;
+    }
+    do {
+        wchar_t *file;
+        if ((fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+            !is_snapshot_name(fd.cFileName, allow_tmp)) {
+            continue;
+        }
+        file = path_join(dir, fd.cFileName);
+        visit(file, fd.cFileName, ctx);
+        free(file);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return 0;
+}
+
+static void count_visit(const wchar_t *file, const wchar_t *name, void *ctx)
+{
+    (void)file;
+    (void)name;
+    (*(size_t *)ctx)++;
+}
+
+size_t history_count(const wchar_t *dir)
+{
+    size_t count = 0;
+    unsigned long error = 0;
+
+    each_snapshot(dir, 0, count_visit, &count, &error);
+    return count;
+}
+
+/* 남은 임시 파일(.snap.tmp)은 지우되 개수에는 넣지 않는다(지우지 못하면 실패로 센다). */
+static void clear_visit(const wchar_t *file, const wchar_t *name, void *ctx)
+{
+    HistoryClearResult *r = ctx;
+
+    if (file != NULL && DeleteFileW(file)) {
+        if (_wcsicmp(name + 16, L".snap") == 0) {
+            r->removed++;
+        }
+        return;
+    }
+    r->failed++;
+    if (r->error == 0) {
+        r->error = file != NULL ? GetLastError() : ERROR_NOT_ENOUGH_MEMORY;
+    }
+}
+
+int history_clear(const wchar_t *dir, HistoryClearResult *out)
+{
+    HistoryClearResult r = {0, 0, 0};
+    unsigned long error = 0;
+
+    if (each_snapshot(dir, 1, clear_visit, &r, &error) != 0) {
+        r.error = error;
+        if (out != NULL) {
+            *out = r;
+        }
+        return -1;
+    }
+    if (out != NULL) {
+        *out = r;
+    }
+    return r.failed == 0 ? 0 : -1;
 }
 
 /* ---- 비교 ---- */
