@@ -87,6 +87,12 @@ add_library(bytesieve_format STATIC src/size_format.c)
 target_include_directories(bytesieve_format PUBLIC src)
 bytesieve_configure(bytesieve_format)
 
+# 스캔 결과 내보내기(CSV·HTML 보고서). 모델을 읽기만 한다.
+add_library(bytesieve_export STATIC src/scan_export.c)
+target_include_directories(bytesieve_export PUBLIC src)
+target_link_libraries(bytesieve_export PUBLIC bytesieve_model bytesieve_format)
+bytesieve_configure(bytesieve_export)
+
 # 논리 드라이브 목록·용량 조회(GetLogicalDrives, GetDiskFreeSpaceExW). 스캐너와 독립.
 add_library(bytesieve_drive STATIC src/drive.c)
 target_include_directories(bytesieve_drive PUBLIC src)
@@ -103,9 +109,9 @@ bytesieve_configure(bytesieve_sysmon)
 # 시스템 탭(RAM·CPU 실시간 사용률 막대·그래프).
 add_executable(bytesieve-gui WIN32 src/gui_main.c src/gui_drives.c src/gui_cleanup.c
                src/gui_quarantine.c src/gui_monitor.c)
-target_link_libraries(bytesieve-gui PRIVATE bytesieve_job bytesieve_history bytesieve_drive
-                      bytesieve_format bytesieve_cleanup_job bytesieve_cleanup_trash
-                      bytesieve_sysmon comctl32 shell32 ole32)
+target_link_libraries(bytesieve-gui PRIVATE bytesieve_job bytesieve_history bytesieve_export
+                      bytesieve_drive bytesieve_format bytesieve_cleanup_job
+                      bytesieve_cleanup_trash bytesieve_sysmon comctl32 comdlg32 shell32 ole32)
 bytesieve_configure(bytesieve-gui)
 
 # 대용량 폴더 스캔의 실행 시간·메모리 측정 도구.
@@ -229,6 +235,11 @@ target_link_libraries(test_scan_history PRIVATE bytesieve_history)
 bytesieve_configure(test_scan_history)
 add_test(NAME scan_history COMMAND test_scan_history)
 
+add_executable(test_export tests/test_export.c)
+target_link_libraries(test_export PRIVATE bytesieve_export)
+bytesieve_configure(test_export)
+add_test(NAME export COMMAND test_export)
+
 add_executable(test_scan_job tests/test_scan_job.c)
 target_link_libraries(test_scan_job PRIVATE bytesieve_job)
 bytesieve_configure(test_scan_job)
@@ -302,11 +313,18 @@ add_test(NAME gui_history
                  -DFIXTURE=${CMAKE_CURRENT_BINARY_DIR}/gui_history_fixture
                  -DHIST=${CMAKE_CURRENT_BINARY_DIR}/gui_history_check
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/gui_history_check.cmake)
+# 폴더 스캔 탭 내보내기: 스캔 → CSV·HTML 보고서 저장(대화 상자 없이) → 파일 내용 확인.
+add_test(NAME gui_export
+         COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bytesieve-gui>
+                 -DFIXTURE=${CMAKE_CURRENT_BINARY_DIR}/gui_export_fixture
+                 -DOUT=${CMAKE_CURRENT_BINARY_DIR}/gui_export_out
+                 -DHIST=${CMAKE_CURRENT_BINARY_DIR}/gui_export_history
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/gui_export_check.cmake)
 # 시스템 탭: 몇 초 동안 RAM·CPU 를 측정해 화면·1초 갱신 간격·측정 실패 표시를 확인한다.
 add_test(NAME gui_monitor COMMAND bytesieve-gui --self-test-monitor)
 set_tests_properties(gui_scan gui_cancel gui_missing_dir gui_drives gui_cleanup
                      gui_cleanup_cancel gui_trash gui_quarantine gui_monitor gui_history
-                     PROPERTIES TIMEOUT 120)
+                     gui_export PROPERTIES TIMEOUT 120)
 # 폴더 스캔 자체 검사가 사용자 기록 폴더(%LOCALAPPDATA%)에 스냅숏을 쓰지 않게 한다.
 set_tests_properties(gui_scan gui_cancel gui_missing_dir PROPERTIES
                      ENVIRONMENT "BYTESIEVE_HISTORY_DIR=${CMAKE_CURRENT_BINARY_DIR}/gui_test_history")

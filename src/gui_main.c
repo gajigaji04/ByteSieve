@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
 
@@ -14,6 +15,7 @@
 #include "gui_monitor.h"
 #include "gui_quarantine.h"
 #include "path.h"
+#include "scan_export.h"
 #include "scan_history.h"
 #include "scan_job.h"
 #include "scan_model.h"
@@ -53,8 +55,13 @@ enum {
     IDC_ANALYSIS,
     IDC_QUARANTINE,
     IDC_AUTOSAVE,
-    IDC_CLEAR_HISTORY
+    IDC_CLEAR_HISTORY,
+    IDC_EXPORT_CSV,
+    IDC_EXPORT_HTML
 };
+
+/* 내보내기 형식. */
+typedef enum { EXPORT_KIND_CSV, EXPORT_KIND_HTML } ExportKind;
 
 /* 탭 순서. */
 enum { TAB_SCAN, TAB_DRIVES, TAB_CLEANUP, TAB_QUARANTINE, TAB_MONITOR };
@@ -89,13 +96,14 @@ typedef enum {
                            * 남은 항목 영구 삭제 → 각 단계 화면 검증 → 종료 */
     SELF_TEST_CHANGES,  /* 스캔 → 직전 스냅숏과 비교한 변화 보기 검증·출력 → 종료 */
     SELF_TEST_NO_AUTOSAVE, /* 처음 설정 출력 → 자동 저장 끔 → 스캔 → 저장하지 않았는지 검증 → 종료 */
-    SELF_TEST_CLEAR_HISTORY /* 스캔 → 기록 삭제(확인 창 없이) → 화면 반영 검증·출력 → 종료 */
+    SELF_TEST_CLEAR_HISTORY, /* 스캔 → 기록 삭제(확인 창 없이) → 화면 반영 검증·출력 → 종료 */
+    SELF_TEST_EXPORT /* 스캔 → CSV·HTML 내보내기(대화 상자 없이) → 화면 검증·출력 → 종료 */
 } SelfTest;
 
 typedef struct {
     HWND hwnd;
     HWND path, browse, scan, cancel, progress, status, tree, list, view, analysis;
-    HWND autosave, clear_history;
+    HWND autosave, clear_history, export_csv, export_html;
     HWND tabs, drives, cleanup, quarantine, monitor;
     HFONT font;
     int dpi;
@@ -104,6 +112,7 @@ typedef struct {
     ScanModel model;
     int has_model;
     int progress_pos;
+    ExportInfo scan_info; /* 마지막 스캔의 완료 시각·걸린 시간(보고서용) */
 
     /* 폴더별 용량 변화(직전 스캔 대비) */
     HistoryState history;
@@ -119,6 +128,8 @@ typedef struct {
     size_t trash_expect; /* SELF_TEST_TRASH·QUARANTINE: 선택해 옮기기 시작한 항목 수 */
     const wchar_t *quarantine_root;     /* SELF_TEST_QUARANTINE: 탐지 경로(가짜 볼륨 루트) */
     const wchar_t *quarantine_conflict; /* SELF_TEST_QUARANTINE: 복원 전에 만들 같은 이름 파일 */
+    const wchar_t *export_prefix;  /* SELF_TEST_EXPORT: 내보낼 파일 경로(확장자 제외) */
+    int export_enabled_before_scan; /* SELF_TEST_EXPORT: 스캔 전 내보내기 버튼이 켜져 있었으면 1 */
 } App;
 
 static App g_app;
@@ -160,7 +171,7 @@ static void layout(void)
 {
     RECT rc;
     int m = scale(8), h = scale(24), bw = scale(84), gap = scale(6), view_w = scale(170);
-    int check_w = scale(150);
+    int check_w = scale(150), export_w = scale(104);
     int x, w, y, path_w, bar_w, body_h, tree_w;
 
     /* 탭 컨트롤이 창 전체를 차지하고, 각 탭의 컨트롤은 탭의 표시 영역 안에 놓는다. */
@@ -188,15 +199,24 @@ static void layout(void)
     /* 콤보 상자 높이는 펼친 목록 높이까지 포함한다. */
     MoveWindow(g_app.view, x + m + path_w + gap + 3 * (bw + gap), y, view_w, scale(120), TRUE);
 
-    /* 진행 막대 오른쪽에 기록 설정: [v] 스캔 기록 자동 저장  [기록 삭제...] */
+    /* 진행 막대 오른쪽에 내보내기와 기록 설정:
+     * [CSV 내보내기...] [HTML 보고서...]  [v] 스캔 기록 자동 저장  [기록 삭제...] */
     y += h + gap;
-    bar_w = w - 2 * m - check_w - bw - 2 * gap;
+    bar_w = w - 2 * m - 2 * (export_w + gap) - check_w - bw - 2 * gap;
     if (bar_w < scale(40)) {
         bar_w = scale(40);
     }
     MoveWindow(g_app.progress, x + m, y + (h - scale(16)) / 2, bar_w, scale(16), TRUE);
-    MoveWindow(g_app.autosave, x + m + bar_w + gap, y, check_w, h, TRUE);
-    MoveWindow(g_app.clear_history, x + m + bar_w + gap + check_w + gap, y, bw, h, TRUE);
+    {
+        int cx = x + m + bar_w + gap;
+        MoveWindow(g_app.export_csv, cx, y, export_w, h, TRUE);
+        cx += export_w + gap;
+        MoveWindow(g_app.export_html, cx, y, export_w, h, TRUE);
+        cx += export_w + gap + gap;
+        MoveWindow(g_app.autosave, cx, y, check_w, h, TRUE);
+        cx += check_w + gap;
+        MoveWindow(g_app.clear_history, cx, y, bw, h, TRUE);
+    }
     y += h + gap;
     MoveWindow(g_app.status, x + m, y, w - 2 * m, scale(20), TRUE);
     y += scale(20);
@@ -236,7 +256,8 @@ static void show_tab(int tab)
 {
     HWND scan_controls[] = {g_app.path,   g_app.browse, g_app.scan,     g_app.cancel,
                             g_app.view,   g_app.progress, g_app.status, g_app.analysis,
-                            g_app.tree,   g_app.list,     g_app.autosave, g_app.clear_history};
+                            g_app.tree,   g_app.list,     g_app.autosave, g_app.clear_history,
+                            g_app.export_csv, g_app.export_html};
     int show_scan = tab == TAB_SCAN;
     size_t i;
 
@@ -642,6 +663,8 @@ static void clear_results(void)
     g_app.change_of_node = NULL;
     g_app.history = HIST_NONE;
     SetWindowTextW(g_app.analysis, L"");
+    EnableWindow(g_app.export_csv, FALSE);
+    EnableWindow(g_app.export_html, FALSE);
 }
 
 static void show_results(void)
@@ -716,12 +739,21 @@ static void update_clear_button(void)
     EnableWindow(g_app.clear_history, count > 0);
 }
 
+/* 내보낼 스캔 결과가 있는지(스캔 중이 아니고, 결과가 있고, 대상 폴더를 열지 못한 것이 아님). */
+static int can_export(void)
+{
+    return g_app.job == NULL && g_app.has_model && g_app.model.len > 0 &&
+           g_app.model.status != SCAN_FATAL;
+}
+
 static void set_scanning(int scanning)
 {
     EnableWindow(g_app.scan, !scanning);
     EnableWindow(g_app.browse, !scanning);
     EnableWindow(g_app.path, !scanning);
     EnableWindow(g_app.cancel, scanning);
+    EnableWindow(g_app.export_csv, can_export());
+    EnableWindow(g_app.export_html, can_export());
     update_clear_button();
 }
 
@@ -832,6 +864,145 @@ static int clear_history(int confirm)
     return 1;
 }
 
+/* ---- 내보내기 ---- */
+
+/* 기본 파일 이름 "ByteSieve-<대상 폴더 이름>-YYYYMMDD-HHMM.<확장자>"(이름에 못 쓰는 글자는 _). */
+static void default_export_name(ExportKind kind, wchar_t *buf, size_t len)
+{
+    const wchar_t *root = g_app.model.nodes[0].name;
+    wchar_t label[64];
+    size_t n = wcslen(root), start, i, out = 0;
+    SYSTEMTIME st;
+
+    while (n > 0 && path_is_separator(root[n - 1])) {
+        n--;
+    }
+    start = n;
+    while (start > 0 && !path_is_separator(root[start - 1])) {
+        start--;
+    }
+    for (i = start; i < n && out + 1 < sizeof(label) / sizeof(label[0]); i++) {
+        label[out++] = wcschr(L"\\/:*?\"<>|", root[i]) != NULL || root[i] < 32 ? L'_' : root[i];
+    }
+    while (out > 0 && label[out - 1] == L'_') {
+        out--; /* "D:" → "D" */
+    }
+    label[out] = L'\0';
+    GetLocalTime(&st);
+    swprintf(buf, len, L"ByteSieve-%ls%ls%04u%02u%02u-%02u%02u.%ls", label,
+             out > 0 ? L"-" : L"", (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
+             (unsigned)st.wHour, (unsigned)st.wMinute, kind == EXPORT_KIND_CSV ? L"csv" : L"html");
+}
+
+/* 내보내기 실패 원인(사용자용). */
+static const wchar_t *export_error_text(unsigned long error)
+{
+    switch (error) {
+    case ERROR_ACCESS_DENIED:
+    case ERROR_WRITE_PROTECT:
+        return L"저장 위치에 쓸 권한이 없습니다(읽기 전용 파일이거나 보호된 폴더).";
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_LOCK_VIOLATION:
+        return L"다른 프로그램(Excel 등)이 파일을 사용 중입니다. 파일을 닫고 다시 시도하세요.";
+    case ERROR_DISK_FULL:
+    case ERROR_HANDLE_DISK_FULL:
+        return L"디스크 공간이 부족합니다.";
+    case ERROR_PATH_NOT_FOUND:
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_INVALID_NAME:
+        return L"저장 위치를 찾을 수 없거나 파일 이름이 올바르지 않습니다.";
+    case ERROR_NOT_ENOUGH_MEMORY:
+    case ERROR_OUTOFMEMORY:
+        return L"메모리가 부족합니다.";
+    case ERROR_INVALID_PARAMETER:
+        return L"내보낼 스캔 결과가 없습니다.";
+    default:
+        return L"파일을 쓰지 못했습니다.";
+    }
+}
+
+/*
+ * 지금 스캔 결과를 kind 형식으로 file 에 쓴다. 결과는 상태 줄에 쓰고, 실패했고 show_error 가 1 이면
+ * 원인을 창으로도 알린다(기존 파일은 바뀌지 않음). 성공하면 1.
+ */
+static int export_to(ExportKind kind, const wchar_t *file, int show_error)
+{
+    const wchar_t *what = kind == EXPORT_KIND_CSV ? L"CSV" : L"HTML 보고서";
+    unsigned long error = ERROR_INVALID_PARAMETER;
+    size_t len = wcslen(file) + 256;
+    wchar_t *text;
+    int ok = 0;
+
+    if (can_export()) {
+        ok = (kind == EXPORT_KIND_CSV
+                  ? export_csv(&g_app.model, file, &error)
+                  : export_html(&g_app.model, &g_app.scan_info, file, &error)) == 0;
+    }
+    text = malloc(len * sizeof(*text));
+    if (text == NULL) {
+        return ok;
+    }
+    if (ok) {
+        swprintf(text, len, L"%ls(으)로 내보냈습니다(폴더 %u개): %ls", what,
+                 (unsigned)g_app.model.len, file);
+        set_status(text);
+    } else {
+        swprintf(text, len, L"%ls 내보내기 실패(오류 %lu): %ls", what, error,
+                 export_error_text(error));
+        set_status(text);
+        if (show_error) {
+            swprintf(text, len,
+                     L"%ls(으)로 내보내지 못했습니다.\n\n%ls\n(오류 %lu)\n\n파일: %ls\n\n"
+                     L"이미 있던 파일은 바뀌지 않았습니다.",
+                     what, export_error_text(error), error, file);
+            MessageBoxW(g_app.hwnd, text, L"내보내기 실패", MB_OK | MB_ICONWARNING);
+        }
+    }
+    free(text);
+    return ok;
+}
+
+/* 저장 위치를 고르게 한 뒤(덮어쓰기는 대화 상자가 확인) 내보낸다. */
+static void export_results(ExportKind kind)
+{
+    OPENFILENAMEW ofn;
+    wchar_t file[MAX_PATH * 4];
+    DWORD dlg_error;
+
+    if (!can_export()) {
+        set_status(L"내보낼 스캔 결과가 없습니다. 먼저 폴더를 스캔하세요.");
+        return;
+    }
+    default_export_name(kind, file, sizeof(file) / sizeof(file[0]));
+    memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_app.hwnd;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = (DWORD)(sizeof(file) / sizeof(file[0]));
+    if (kind == EXPORT_KIND_CSV) {
+        ofn.lpstrFilter = L"CSV 파일 (*.csv)\0*.csv\0모든 파일 (*.*)\0*.*\0";
+        ofn.lpstrDefExt = L"csv";
+        ofn.lpstrTitle = L"스캔 결과를 CSV로 내보내기";
+    } else {
+        ofn.lpstrFilter = L"HTML 보고서 (*.html)\0*.html;*.htm\0모든 파일 (*.*)\0*.*\0";
+        ofn.lpstrDefExt = L"html";
+        ofn.lpstrTitle = L"스캔 결과를 HTML 보고서로 저장";
+    }
+    ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY |
+                OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&ofn)) {
+        dlg_error = CommDlgExtendedError();
+        if (dlg_error != 0) {
+            wchar_t text[128];
+            swprintf(text, 128, L"저장 위치 대화 상자를 열지 못했습니다(오류 0x%lx).",
+                     (unsigned long)dlg_error);
+            set_status(text);
+        }
+        return; /* 취소 */
+    }
+    export_to(kind, file, 1);
+}
+
 /* 스캔 스레드에서 호출된다. 창이 이미 없으면 PostMessage 가 실패할 뿐이다. */
 static void on_job_notify(int finished, void *ctx)
 {
@@ -926,6 +1097,12 @@ static void finish_scan(void)
     g_app.job = NULL;
     g_app.has_model = 1;
     r = &g_app.model.report;
+    {
+        FILETIME now;
+        GetSystemTimeAsFileTime(&now);
+        g_app.scan_info.finished_time = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime;
+        g_app.scan_info.elapsed_ms = snap.elapsed_ms;
+    }
 
     if (r->cancelled) {
         head = L"취소됨(그때까지 집계)";
@@ -1132,6 +1309,44 @@ static int verify_history_settings(void)
     return failures;
 }
 
+/*
+ * SELF_TEST_EXPORT: 스캔 전에는 꺼져 있던 내보내기 버튼이 켜졌는지, <prefix>.csv·<prefix>.html 로
+ * 내보내지는지, 없는 폴더로 내보내면 실패를 알리고 아무것도 만들지 않는지. 내용은 검사 스크립트가
+ * 확인하도록 폴더 수를 stdout 에 쓴다. 실패 수.
+ */
+static int verify_export(void)
+{
+    int failures = 0;
+    size_t len = wcslen(g_app.export_prefix) + 32;
+    wchar_t *file = malloc(len * sizeof(*file)), text[512];
+
+    SELF_CHECK(!g_app.export_enabled_before_scan);
+    SELF_CHECK(IsWindowEnabled(g_app.export_csv) && IsWindowEnabled(g_app.export_html));
+    if (file == NULL) {
+        return failures + 1;
+    }
+    swprintf(file, len, L"%ls.csv", g_app.export_prefix);
+    SELF_CHECK(export_to(EXPORT_KIND_CSV, file, 0));
+    GetWindowTextW(g_app.status, text, 512);
+    SELF_CHECK(wcsstr(text, L"CSV(으)로 내보냈습니다") == text);
+    swprintf(file, len, L"%ls.html", g_app.export_prefix);
+    SELF_CHECK(export_to(EXPORT_KIND_HTML, file, 0));
+    GetWindowTextW(g_app.status, text, 512);
+    SELF_CHECK(wcsstr(text, L"HTML 보고서(으)로 내보냈습니다") == text);
+
+    /* 없는 폴더: 실패를 상태 줄에 알리고 아무 파일도 남기지 않는다. */
+    swprintf(file, len, L"%ls-missing\\out.csv", g_app.export_prefix);
+    SELF_CHECK(!export_to(EXPORT_KIND_CSV, file, 0));
+    GetWindowTextW(g_app.status, text, 512);
+    SELF_CHECK(wcsstr(text, L"내보내기 실패") != NULL);
+    SELF_CHECK(GetFileAttributesW(file) == INVALID_FILE_ATTRIBUTES);
+    free(file);
+
+    wprintf(L"exported folders: %u\n", (unsigned)g_app.model.len);
+    fflush(stdout);
+    return failures;
+}
+
 /* 스캔이 끝난 뒤 화면 상태가 모델과 맞는지 확인하고 종료 코드를 정한다. */
 static int verify_screen(void)
 {
@@ -1190,6 +1405,9 @@ static int verify_screen(void)
         SELF_CHECK(wcscmp(cell, expect) == 0);
     }
     failures += verify_views();
+    /* 결과가 있으면(취소된 스캔 포함) 내보낼 수 있다. */
+    SELF_CHECK(IsWindowEnabled(g_app.export_csv) == (g_app.model.status != SCAN_FATAL));
+    SELF_CHECK(IsWindowEnabled(g_app.export_html) == (g_app.model.status != SCAN_FATAL));
 
     if (g_app.self_test == SELF_TEST_SCAN || g_app.self_test == SELF_TEST_CHANGES) {
         wchar_t text[512];
@@ -1209,6 +1427,9 @@ static int verify_screen(void)
     } else if (g_app.self_test == SELF_TEST_NO_AUTOSAVE ||
                g_app.self_test == SELF_TEST_CLEAR_HISTORY) {
         failures += verify_history_settings();
+    } else if (g_app.self_test == SELF_TEST_EXPORT) {
+        SELF_CHECK(g_app.model.report.cancelled == 0 && g_app.model.status != SCAN_FATAL);
+        failures += verify_export();
     } else if (g_app.model.report.cancelled) {
         SELF_CHECK(g_app.history == HIST_CANCELLED);
         size_t i;
@@ -1428,6 +1649,11 @@ static void create_controls(void)
         col.fmt = cols[i].fmt;
         SendMessageW(g_app.list, LVM_INSERTCOLUMNW, (WPARAM)i, (LPARAM)&col);
     }
+    /* 탭 순서가 화면 순서와 같도록 왼쪽 것부터 만든다. */
+    g_app.export_csv = make_child(L"BUTTON", L"CSV 내보내기...", BS_PUSHBUTTON | WS_TABSTOP, 0,
+                                  IDC_EXPORT_CSV);
+    g_app.export_html = make_child(L"BUTTON", L"HTML 보고서...", BS_PUSHBUTTON | WS_TABSTOP, 0,
+                                   IDC_EXPORT_HTML);
     g_app.autosave = make_child(L"BUTTON", L"스캔 기록 자동 저장", BS_AUTOCHECKBOX | WS_TABSTOP,
                                 0, IDC_AUTOSAVE);
     g_app.clear_history = make_child(L"BUTTON", L"기록 삭제...", BS_PUSHBUTTON | WS_TABSTOP, 0,
@@ -1494,7 +1720,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         layout();
         return 0;
     case WM_GETMINMAXINFO:
-        ((MINMAXINFO *)lp)->ptMinTrackSize.x = scale(520);
+        ((MINMAXINFO *)lp)->ptMinTrackSize.x = scale(700);
         ((MINMAXINFO *)lp)->ptMinTrackSize.y = scale(320);
         return 0;
     case WM_COMMAND:
@@ -1526,6 +1752,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case IDC_CLEAR_HISTORY:
             clear_history(1);
+            return 0;
+        case IDC_EXPORT_CSV:
+            export_results(EXPORT_KIND_CSV);
+            return 0;
+        case IDC_EXPORT_HTML:
+            export_results(EXPORT_KIND_HTML);
             return 0;
         case IDC_DRIVES:
             if (HIWORD(wp) == DPN_REFRESHED && g_app.self_test == SELF_TEST_DRIVES) {
@@ -1648,6 +1880,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  *   bytesieve-gui --self-test-clear-history <dir>
  *                                         스캔(직전 스냅숏 필요) 후 기록을 삭제(확인 창 없음)하고
  *                                         화면 반영을 검증한 뒤 지운 개수를 stdout 에 쓰고 종료
+ *   bytesieve-gui --self-test-export <dir> <prefix>
+ *                                         스캔 후 <prefix>.csv·<prefix>.html 로 내보내고(대화 상자 없음)
+ *                                         화면을 검증한 뒤 폴더 수를 stdout 에 쓰고 종료
  */
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
@@ -1677,6 +1912,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
                wcscmp(argv[1], L"--self-test-clear-history") == 0) {
         g_app.self_test = SELF_TEST_CLEAR_HISTORY;
         target = argv[2];
+    } else if (argv != NULL && argc >= 4 && wcscmp(argv[1], L"--self-test-export") == 0) {
+        g_app.self_test = SELF_TEST_EXPORT;
+        target = argv[2];
+        g_app.export_prefix = argv[3];
     } else if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test-cancel") == 0) {
         g_app.self_test = SELF_TEST_CANCEL;
         target = argv[2];
@@ -1764,6 +2003,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         }
     }
     if (target != NULL) {
+        g_app.export_enabled_before_scan =
+            IsWindowEnabled(g_app.export_csv) || IsWindowEnabled(g_app.export_html);
         SetWindowTextW(g_app.path, target);
         start_scan();
         if (g_app.self_test == SELF_TEST_CANCEL) {
