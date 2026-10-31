@@ -202,30 +202,98 @@ typedef struct {
 #define REC_ALLOC_KNOWN 1u
 #define REC_HAS_ID 2u
 
-typedef enum { TASK_QUEUED = 0, TASK_RUNNING, TASK_DONE } TaskState;
+/* 작업 상태. 큐에는 작업이 아니라 칸(KidSlot)이 들어가므로, 막 만든 작업은 TASK_NEW 다. */
+typedef enum { TASK_NEW = 0, TASK_RUNNING, TASK_DONE } TaskState;
+
+/*
+ * 한 번의 탐색에서 살아 있는 폴더 작업의 수와 메모리(구조·경로·키·열거 결과·자식 목록) 집계.
+ * 작업 스레드와 호출 스레드가 함께 고치므로 원자적으로 더한다. ScanReport 의 진단 값이 된다.
+ */
+typedef struct {
+    volatile LONG64 tasks;
+    volatile LONG64 bytes;
+    volatile LONG64 peak_tasks;
+    volatile LONG64 peak_bytes;
+    volatile LONG64 discarded; /* 처리하지 않고 해제한 작업 */
+} MemTally;
+
+static void tally_max(volatile LONG64 *peak, LONG64 v)
+{
+    LONG64 cur = *peak;
+
+    while (v > cur) {
+        LONG64 prev = InterlockedCompareExchange64(peak, v, cur);
+        if (prev == cur) {
+            break;
+        }
+        cur = prev;
+    }
+}
+
+static void tally_add(MemTally *m, LONG64 tasks, LONG64 bytes)
+{
+    LONG64 t, b;
+
+    if (m == NULL) {
+        return;
+    }
+    t = InterlockedAdd64(&m->tasks, tasks);
+    b = InterlockedAdd64(&m->bytes, bytes);
+    if (tasks > 0) {
+        tally_max(&m->peak_tasks, t);
+    }
+    if (bytes > 0) {
+        tally_max(&m->peak_bytes, b);
+    }
+}
+
+struct DirTask;
+
+/*
+ * 아직 내려가지 않은 하위 폴더 하나(부모 작업의 slots 에 열거 순서로 둔다).
+ * 폴더 작업(경로 사본 등)은 열거하기 직전에야 만든다. 그 전에는 부모의 열거 기록을 가리키기만 한다.
+ *   task == NULL, heap_index == HEAP_NONE : 아직 아무도 손대지 않음(호출 스레드가 차례가 되면 만든다)
+ *   task == NULL, heap_index != HEAP_NONE : 미리 열거할 차례를 큐에서 기다림
+ *   task != NULL                          : 작업 스레드가 열거 중(RUNNING)이거나 마침(DONE)
+ * 작업 스레드가 있으면 Pool.lock 으로 보호한다.
+ */
+typedef struct {
+    struct DirTask *task;
+    size_t heap_index;  /* 큐(힙) 안의 위치, 없으면 HEAP_NONE */
+    uintptr_t id;       /* 호출 스레드가 on_entry 결과로 채운다 */
+    uint32_t rec_off;   /* 부모 buf 안의 이 폴더 기록 위치 */
+    uint32_t flags;     /* SLOT_* */
+} KidSlot;
+
+#define SLOT_EXCLUDED 1u /* should_skip_dir 훅이 뺐다 */
+#define SLOT_TOO_LONG 2u /* 경로가 너무 길어 내려갈 수 없다(부모를 처리할 때 오류로 기록) */
 
 /*
  * 열거할 폴더 하나와 그 결과.
- * 폴더를 열거한 쪽(작업 스레드 또는 호출 스레드)이 하위 탐색 대상 폴더마다 자식 작업을 미리
- * 만들어 kids 에 둔다(재분석 지점이 아니고 깊이 제한 안인 폴더, 열거 순서). 작업 스레드가 있으면
- * 자식도 바로 큐에 넣어 미리 열거하므로, 호출 스레드가 깊이 우선으로 내려갈 때 기다리지 않는다.
- * 호출 스레드는 항목을 처리하며 kids 를 차례로 넘겨받고, 훅이 제외한 폴더의 작업은 버린다.
+ * 폴더를 열거한 쪽(작업 스레드 또는 호출 스레드)이 하위 탐색 대상 폴더(재분석 지점이 아니고 깊이
+ * 제한 안인 폴더)마다 slots 에 칸을 만든다. 작업 스레드가 있으면 그 칸들을 큐에 넣어, 작업 스레드가
+ * 가장 먼저 필요한 것부터 꺼내 작업을 만들고 미리 열거한다.
+ * 호출 스레드가 처리한 작업은 남은 하위 폴더가 있는 동안 깊이 우선 스택의 한 칸이 되어, slots 를
+ * 마지막 칸부터 차례로 넘겨받는다(next_kid). 그래서 기다리는 형제 폴더마다 작업을 만들어 두지 않는다.
  */
 typedef struct DirTask {
     wchar_t *path;      /* 확장 경로(구조체와 같은 할당) */
     uint32_t *key;      /* 처리 순서 키(구조체와 같은 할당, 아래 설명) */
     unsigned char *buf; /* EntryRec 이어 붙임 */
-    struct DirTask **kids; /* 하위 탐색 대상 폴더마다 하나(만들지 못했으면 NULL) */
+    KidSlot *slots;     /* 하위 탐색 대상 폴더마다 하나(열거 순서, 만들지 못했으면 NULL) */
     uintptr_t id;       /* 호출 스레드가 on_entry 결과로 채운다 */
     size_t path_len;
     size_t len;
     size_t cap;
-    size_t kid_count;
-    size_t heap_index;  /* 큐(힙) 안의 위치, 없으면 HEAP_NONE */
+    size_t kid_count;   /* 하위 탐색 대상 폴더 수(slots 가 NULL 이어도 센다) */
+    size_t next_kid;    /* 스택 칸일 때 아직 넘기지 않은 칸 수(slots[next_kid - 1] 이 다음 차례) */
     DWORD open_error;   /* 0 이 아니면 폴더를 열지 못함 */
     DWORD enum_error;   /* 0 이 아니면 열거 도중 오류(그때까지의 항목은 유효) */
     uint32_t depth;
     uint64_t volume;    /* 정밀 스캔: 이 폴더가 있는 볼륨의 일련번호(모르면 0) */
+    MemTally *tally;    /* 탐색 하나의 메모리 집계(자식 작업이 물려받는다) */
+    size_t self_bytes;  /* 구조·키·경로를 담은 할당 크기 */
+    unsigned char processed; /* 호출 스레드가 처리했으면 1(아니면 해제할 때 버린 작업으로 센다) */
     /*
      * 깊이 우선 처리 순서 키의 길이. 키는 루트에서 이 폴더까지 각 단계의 (형제 수 - 1 - 열거 순번)
      * 이다. 호출 스레드는 마지막 자식부터 내려가므로 키를 사전순으로 비교하면 처리 순서와 같다.
@@ -235,6 +303,11 @@ typedef struct DirTask {
     unsigned char state;     /* TaskState. 작업 스레드가 있으면 Pool.lock 으로 보호 */
     unsigned char by_worker; /* 작업 스레드가 열거했으면 1 */
     unsigned char discard;   /* 작업 스레드가 열거하는 도중 버려졌으면 1(그 스레드가 해제) */
+    unsigned char awaited;   /* 호출 스레드가 끝나기를 기다리면 1(끝낸 쪽이 깨운다) */
+    /* 작업 스레드가 만든 작업: 부모의 어느 칸인지(내쫓을 때 칸을 되돌린다), 준비 힙 위치 */
+    struct DirTask *parent;
+    size_t slot_index;
+    size_t ready_index;      /* 준비 힙(Pool.ready_heap) 안의 위치, 없으면 HEAP_NONE */
 } DirTask;
 
 #define HEAP_NONE ((size_t)-1)
@@ -270,13 +343,14 @@ static const wchar_t *rec_name(const EntryRec *rec)
  * 작업을 만든다. 구조체 뒤에 키와 경로(dir + 구분자 + name)를 이어 담아 한 번만 할당한다.
  * name 이 NULL 이면 dir 가 곧 경로다. key 는 부모 키(key_len 개) 뒤에 last 를 붙인 것이다
  * (has_last 가 0 이면 붙이지 않는다). 경로가 PATH_MAX_WIDE 를 넘거나 메모리가 없으면 NULL.
+ * 만든 작업은 tally 에 센다(NULL 허용).
  */
 static DirTask *task_new(const wchar_t *dir, size_t dir_len, const wchar_t *name, size_t name_len,
                          const uint32_t *key, uint32_t key_len, int has_last, uint32_t last,
-                         uint32_t depth)
+                         uint32_t depth, MemTally *tally)
 {
     DirTask *t;
-    size_t sep, path_len;
+    size_t sep, path_len, bytes;
     uint32_t klen = key_len + (has_last ? 1u : 0u);
     wchar_t *path;
 
@@ -286,13 +360,17 @@ static DirTask *task_new(const wchar_t *dir, size_t dir_len, const wchar_t *name
     if (path_len > PATH_MAX_WIDE) {
         return NULL;
     }
-    t = malloc(sizeof(*t) + klen * sizeof(uint32_t) + (path_len + 1) * sizeof(wchar_t));
+    bytes = sizeof(*t) + klen * sizeof(uint32_t) + (path_len + 1) * sizeof(wchar_t);
+    t = malloc(bytes);
     if (t == NULL) {
         return NULL;
     }
     memset(t, 0, sizeof(*t));
+    t->tally = tally;
+    t->self_bytes = bytes;
+    tally_add(tally, 1, (LONG64)bytes);
+    t->ready_index = HEAP_NONE;
     t->depth = depth;
-    t->heap_index = HEAP_NONE;
     t->key = (uint32_t *)(t + 1);
     t->key_len = klen;
     if (key_len > 0) {
@@ -315,15 +393,26 @@ static DirTask *task_new(const wchar_t *dir, size_t dir_len, const wchar_t *name
     return t;
 }
 
-/* 작업 하나만 해제한다(kids 가 가리키는 작업은 건드리지 않는다). */
+static size_t slots_bytes(const DirTask *t)
+{
+    return t->slots != NULL ? t->kid_count * sizeof(*t->slots) : 0;
+}
+
+/* 작업 하나만 해제한다(slots 가 가리키는 작업은 건드리지 않는다). */
 static void task_free_one(DirTask *t)
 {
+    if (t->tally != NULL) {
+        tally_add(t->tally, -1, -(LONG64)(t->self_bytes + t->cap + slots_bytes(t)));
+        if (!t->processed) {
+            InterlockedIncrement64(&t->tally->discarded);
+        }
+    }
     free(t->buf);
-    free(t->kids);
+    free(t->slots);
     free(t);
 }
 
-/* 작업과 아직 넘겨받지 않은 자식 작업 전체를 해제한다. 작업 스레드가 없을 때만 부른다. */
+/* 작업과 그 slots 가 가리키는 작업 전체를 해제한다. 작업 스레드가 없을 때만 부른다. */
 static void task_free_tree(DirTask *t)
 {
     DirTask **work = NULL;
@@ -331,8 +420,8 @@ static void task_free_tree(DirTask *t)
 
     while (t != NULL) {
         size_t i;
-        for (i = 0; i < t->kid_count; i++) {
-            if (t->kids[i] == NULL) {
+        for (i = 0; t->slots != NULL && i < t->kid_count; i++) {
+            if (t->slots[i].task == NULL) {
                 continue;
             }
             if (len == cap) {
@@ -340,13 +429,13 @@ static void task_free_tree(DirTask *t)
                 DirTask **grown = realloc(work, ncap * sizeof(*grown));
                 if (grown == NULL) {
                     /* 메모리가 없으면 재귀로라도 해제한다(깊이는 폴더 깊이로 제한). */
-                    task_free_tree(t->kids[i]);
+                    task_free_tree(t->slots[i].task);
                     continue;
                 }
                 work = grown;
                 cap = ncap;
             }
-            work[len++] = t->kids[i];
+            work[len++] = t->slots[i].task;
         }
         task_free_one(t);
         t = len > 0 ? work[--len] : NULL;
@@ -379,6 +468,7 @@ static int task_reserve(DirTask *t, size_t extra)
     if (grown == NULL) {
         return 0;
     }
+    tally_add(t->tally, 0, (LONG64)(cap - t->cap));
     t->buf = grown;
     t->cap = cap;
     return 1;
@@ -402,6 +492,7 @@ static int task_append(DirTask *t, const wchar_t *name, size_t name_len, uint64_
         if (grown == NULL) {
             return 0;
         }
+        tally_add(t->tally, 0, (LONG64)(cap - t->cap));
         t->buf = grown;
         t->cap = cap;
     }
@@ -677,75 +768,117 @@ static int rec_wants_descend(const DirTask *t, const EntryRec *rec, uint32_t max
 }
 
 /*
- * 폴더 하나를 열거해 t 에 담고 자식 작업을 만든다. 어느 스레드에서나 부를 수 있다
- * (t 와 새로 만든 자식 외에는 건드리지 않음).
+ * 폴더 하나를 열거해 t 에 담고 하위 탐색 대상 폴더마다 빈 칸(slots)을 만든다. 자식 작업은 아직
+ * 만들지 않는다. 어느 스레드에서나 부를 수 있다(t 외에는 건드리지 않음).
  */
 static void fetch_dir(DirTask *t, unsigned char *scratch, uint32_t max_depth, unsigned options)
 {
     size_t off, n = 0;
 
     fetch_records(t, scratch, options);
+    /* 큰 폴더는 1.5배씩 늘린 여유가 남으므로 처리를 기다리는 동안 붙잡지 않게 줄인다. */
+    if (t->buf != NULL && t->len > 0 && t->cap - t->len > t->len / 8) {
+        unsigned char *fit = realloc(t->buf, t->len);
+        if (fit != NULL) {
+            tally_add(t->tally, 0, -(LONG64)(t->cap - t->len));
+            t->buf = fit;
+            t->cap = t->len;
+        }
+    }
     for (off = 0; off < t->len; off += rec_size((const EntryRec *)(t->buf + off))) {
         n += rec_wants_descend(t, (const EntryRec *)(t->buf + off), max_depth);
     }
+    t->kid_count = n;
     if (n == 0) {
         return;
     }
-    t->kids = calloc(n, sizeof(*t->kids));
-    if (t->kids == NULL) {
-        /* 자식 작업 없이 두면 호출 스레드가 메모리 부족으로 기록한다. */
+    /* 칸을 만들지 못하면 slots 없이 두어 호출 스레드가 메모리 부족으로 기록한다. */
+    t->slots = t->len <= UINT32_MAX ? calloc(n, sizeof(*t->slots)) : NULL;
+    if (t->slots == NULL) {
         return;
     }
-    t->kid_count = n;
+    tally_add(t->tally, 0, (LONG64)(n * sizeof(*t->slots)));
     n = 0;
-    for (off = 0; off < t->len;) {
-        const EntryRec *rec = (const EntryRec *)(t->buf + off);
-        off += rec_size(rec);
-        if (rec_wants_descend(t, rec, max_depth)) {
-            t->kids[n] = task_new(t->path, t->path_len, rec_name(rec), rec->name_len, t->key,
-                                  t->key_len, 1, (uint32_t)(t->kid_count - 1 - n), t->depth + 1);
+    for (off = 0; off < t->len; off += rec_size((const EntryRec *)(t->buf + off))) {
+        if (rec_wants_descend(t, (const EntryRec *)(t->buf + off), max_depth)) {
+            t->slots[n].heap_index = HEAP_NONE;
+            t->slots[n].rec_off = (uint32_t)off;
             n++;
         }
     }
 }
 
+/* 칸 i 의 폴더 기록. */
+static const EntryRec *slot_rec(const DirTask *parent, size_t i)
+{
+    return (const EntryRec *)(parent->buf + parent->slots[i].rec_off);
+}
+
+/*
+ * 칸 i 의 자식 작업을 만든다(경로 = 부모 경로 + 이름). 처리 순서 키는 부모 키 뒤에
+ * (형제 수 - 1 - i)를 붙인 것이다. 경로가 너무 길거나 메모리가 없으면 NULL.
+ */
+static DirTask *slot_task_new(const DirTask *parent, size_t i)
+{
+    const EntryRec *rec = slot_rec(parent, i);
+
+    return task_new(parent->path, parent->path_len, rec_name(rec), rec->name_len, parent->key,
+                    parent->key_len, 1, (uint32_t)(parent->kid_count - 1 - i), parent->depth + 1,
+                    parent->tally);
+}
+
 /* ---- 미리 열거하는 작업 스레드 ---- */
 
 /*
- * 미리 열거해 두고 아직 처리하지 않은 폴더의 상한(메모리 보호). 보통은 호출 스레드가 바로 뒤따라와
- * 닿지 않지만, 큰 폴더 하나를 열거하는 동안 다른 작업 스레드가 뒤쪽 하위 트리를 앞서 읽어 둘 수
- * 있어 넉넉히 잡는다. 상한에 닿으면 작업 스레드가 쉬고 호출 스레드가 직접 열거한다(결과는 같다).
+ * 미리 열거해 두고 아직 처리하지 않은 폴더의 상한. 상한에 닿으면 더 급한 칸이 있을 때만 가장 나중에
+ * 필요한 것을 내쫓고 열거하며, 아니면 작업 스레드가 쉬다가 호출 스레드가 따라잡으면 깨어난다
+ * (결과는 같다). C:\Windows 측정에서 1024 개·2 MiB 아래로는 메모리가 거의 줄지 않고(큰 폴더 하나의
+ * 목록이 바닥) 256 개부터 호출 스레드가 기다려 느려졌다(performance.md 참고).
  */
-#define POOL_READY_LIMIT 65536
-#define POOL_READY_BYTES ((size_t)32 * 1024 * 1024)
+#define POOL_READY_LIMIT 1024
+#define POOL_READY_BYTES ((size_t)2 * 1024 * 1024)
+
+/*
+ * 큐 항목: 미리 열거할 하위 폴더 하나(부모 작업과 칸 번호, 16바이트). 폴더 작업(경로 사본 등)은
+ * 작업 스레드가 꺼낼 때 만들므로, 큐가 길어져도 메모리를 거의 쓰지 않는다.
+ */
+typedef struct {
+    DirTask *parent;
+    size_t index;
+} QueueItem;
 
 typedef struct {
     SRWLOCK lock;
-    CONDITION_VARIABLE work_cv; /* 할 일이 생김·여유가 생김·중지 */
-    CONDITION_VARIABLE done_cv; /* 작업 하나가 끝남 */
-    DirTask **queue;            /* TASK_QUEUED 인 작업의 최소 힙(task_before 순서) */
+    CONDITION_VARIABLE work_cv; /* 할 일이 생김·여유가 생김·중지(작업 스레드가 기다림) */
+    CONDITION_VARIABLE done_cv; /* 호출 스레드가 기다리는 작업이 끝남 */
+    QueueItem *queue;           /* 최소 힙(item_before 순서) */
     size_t qlen;
     size_t qcap;
+    /*
+     * 미리 열거해 둔 작업 중 가장 나중에 필요한 것이 맨 위인 힙. 상한이 찼는데 큐 맨 앞이 그보다 먼저
+     * 필요하면 그 작업을 내쫓고(칸은 큐로 되돌림) 큐 맨 앞을 열거한다. 그래서 상한 안에는 언제나
+     * 가장 먼저 필요한 것들이 남고, 깊은 곳에서 새로 나타난 급한 폴더가 막히지 않는다.
+     */
+    DirTask **ready_heap;
+    size_t rlen;
+    size_t rcap;
+    uint64_t evicted; /* 내쫓은 작업 수(진단, 열거를 한 번 버림) */
     size_t ready; /* 작업 스레드가 끝냈고 아직 넘겨받거나 버리지 않은 작업 */
-    size_t ready_bytes; /* 그 작업들이 붙잡은 메모리 추정치(ready_cost 합) */
+    size_t ready_bytes; /* 그 작업들이 붙잡은 메모리(ready_cost 합) */
+    int idle;           /* work_cv 에서 쉬는 작업 스레드 수 */
     int throttled;      /* 상한 때문에 쉬는 작업 스레드가 있으면 1 */
     int stop;
     uint32_t max_depth;
-    unsigned options; /* SCAN_OPT_* */
+    unsigned options;    /* SCAN_OPT_* */
+    uint64_t prefetched; /* 작업 스레드가 열거한 폴더(진단) */
     HANDLE threads[SCAN_MAX_THREADS];
     int nthreads;
 } Pool;
 
-/*
- * 미리 열거한 작업 하나가 붙잡고 있는 메모리 추정치: 열거 결과와, 그 결과로 만든 자식 작업
- * (작업 구조·경로·키, 할당 머리 포함). 넣을 때와 뺄 때 같은 값이 나와야 한다.
- */
+/* 미리 열거한 작업 하나가 붙잡고 있는 메모리. 넣을 때와 뺄 때 같은 값이 나와야 한다. */
 static size_t ready_cost(const DirTask *t)
 {
-    size_t per_kid = sizeof(DirTask) + sizeof(*t->kids) + (t->path_len + 32) * sizeof(wchar_t) +
-                     (t->key_len + 1) * sizeof(uint32_t) + 16;
-
-    return sizeof(*t) + t->cap + t->kid_count * per_kid;
+    return t->self_bytes + t->cap + slots_bytes(t);
 }
 
 static int pool_full_locked(const Pool *p)
@@ -753,66 +886,217 @@ static int pool_full_locked(const Pool *p)
     return p->ready >= POOL_READY_LIMIT || p->ready_bytes >= POOL_READY_BYTES;
 }
 
+/* 쉬고 있는 작업 스레드를 n 개까지 깨운다(lock 보유). 모두 깨워 다시 잠드는 낭비를 줄인다. */
+static void wake_workers_locked(Pool *p, size_t n)
+{
+    if (p->idle <= 0 || n == 0) {
+        return;
+    }
+    if (n >= (size_t)p->idle) {
+        WakeAllConditionVariable(&p->work_cv);
+        return;
+    }
+    while (n-- > 0) {
+        WakeConditionVariable(&p->work_cv);
+    }
+}
+
+static void ready_remove_locked(Pool *p, DirTask *t);
+
 /* 작업 스레드가 끝낸 작업을 넘겨받거나 버릴 때 상한 계산에서 뺀다(lock 보유). */
-static void ready_release_locked(Pool *p, const DirTask *t)
+static void ready_release_locked(Pool *p, DirTask *t)
 {
     if (!t->by_worker) {
         return;
     }
+    ready_remove_locked(p, t);
     p->ready--;
     p->ready_bytes -= ready_cost(t);
     if (p->throttled && !pool_full_locked(p)) {
         p->throttled = 0;
-        WakeAllConditionVariable(&p->work_cv);
+        wake_workers_locked(p, p->qlen);
     }
 }
 
-/* a 가 b 보다 먼저 처리되는지(키 사전순, 접두사가 같으면 짧은 쪽). */
-static int task_before(const DirTask *a, const DirTask *b)
+/* 처리 순서 키 보기: key[0..len) 뒤에 has_last 이면 last 를 붙인 것. */
+typedef struct {
+    const uint32_t *key;
+    uint32_t len;
+    uint32_t last;
+    int has_last;
+} KeyView;
+
+static KeyView item_key(const QueueItem *q)
 {
-    uint32_t i, n = a->key_len < b->key_len ? a->key_len : b->key_len;
+    KeyView k;
+
+    k.key = q->parent->key;
+    k.len = q->parent->key_len;
+    k.last = (uint32_t)(q->parent->kid_count - 1 - q->index); /* 형제 수 - 1 - 칸 번호 */
+    k.has_last = 1;
+    return k;
+}
+
+static KeyView task_key(const DirTask *t)
+{
+    KeyView k;
+
+    k.key = t->key;
+    k.len = t->key_len;
+    k.last = 0;
+    k.has_last = 0;
+    return k;
+}
+
+/* a 가 b 보다 먼저 처리되는지(키 사전순, 접두사가 같으면 짧은 쪽이 먼저). */
+static int key_before(const KeyView *a, const KeyView *b)
+{
+    uint32_t la = a->len + (a->has_last ? 1u : 0u), lb = b->len + (b->has_last ? 1u : 0u);
+    uint32_t n = la < lb ? la : lb, i;
 
     for (i = 0; i < n; i++) {
-        if (a->key[i] != b->key[i]) {
-            return a->key[i] < b->key[i];
+        uint32_t ka = i < a->len ? a->key[i] : a->last;
+        uint32_t kb = i < b->len ? b->key[i] : b->last;
+        if (ka != kb) {
+            return ka < kb;
         }
     }
-    return a->key_len < b->key_len;
+    return la < lb;
 }
 
-static void heap_set(Pool *p, size_t i, DirTask *t)
+static int item_before(const QueueItem *a, const QueueItem *b)
 {
-    p->queue[i] = t;
-    t->heap_index = i;
+    KeyView ka, kb;
+
+    if (a->parent == b->parent) {
+        return a->index > b->index; /* 같은 부모: 마지막 칸부터 */
+    }
+    ka = item_key(a);
+    kb = item_key(b);
+    return key_before(&ka, &kb);
+}
+
+/* ---- 준비 힙(가장 나중에 필요한 작업이 맨 위) ---- */
+
+static int ready_later(const DirTask *a, const DirTask *b)
+{
+    KeyView ka = task_key(a), kb = task_key(b);
+
+    return key_before(&kb, &ka);
+}
+
+static void ready_set(Pool *p, size_t i, DirTask *t)
+{
+    p->ready_heap[i] = t;
+    t->ready_index = i;
+}
+
+static void ready_up(Pool *p, size_t i)
+{
+    DirTask *t = p->ready_heap[i];
+
+    while (i > 0) {
+        size_t parent = (i - 1) / 2;
+        if (!ready_later(t, p->ready_heap[parent])) {
+            break;
+        }
+        ready_set(p, i, p->ready_heap[parent]);
+        i = parent;
+    }
+    ready_set(p, i, t);
+}
+
+static void ready_down(Pool *p, size_t i)
+{
+    DirTask *t = p->ready_heap[i];
+
+    for (;;) {
+        size_t l = 2 * i + 1, best = i;
+        DirTask *best_t = t;
+        if (l < p->rlen && ready_later(p->ready_heap[l], best_t)) {
+            best = l;
+            best_t = p->ready_heap[l];
+        }
+        if (l + 1 < p->rlen && ready_later(p->ready_heap[l + 1], best_t)) {
+            best = l + 1;
+        }
+        if (best == i) {
+            break;
+        }
+        ready_set(p, i, p->ready_heap[best]);
+        i = best;
+    }
+    ready_set(p, i, t);
+}
+
+/* 준비 힙에 넣는다(lock 보유). 늘리지 못하면 넣지 않는다(그 작업은 내쫓기지 않을 뿐). */
+static void ready_push_locked(Pool *p, DirTask *t)
+{
+    if (p->rlen == p->rcap) {
+        size_t cap = p->rcap ? p->rcap * 2 : 256;
+        DirTask **grown = realloc(p->ready_heap, cap * sizeof(*grown));
+        if (grown == NULL) {
+            return;
+        }
+        p->ready_heap = grown;
+        p->rcap = cap;
+    }
+    ready_set(p, p->rlen++, t);
+    ready_up(p, p->rlen - 1);
+}
+
+static void ready_remove_locked(Pool *p, DirTask *t)
+{
+    size_t i = t->ready_index;
+
+    if (i == HEAP_NONE) {
+        return;
+    }
+    t->ready_index = HEAP_NONE;
+    if (i == --p->rlen) {
+        return;
+    }
+    {
+        DirTask *last = p->ready_heap[p->rlen];
+        ready_set(p, i, last);
+        ready_up(p, i);
+        ready_down(p, last->ready_index);
+    }
+}
+
+static void heap_set(Pool *p, size_t i, QueueItem item)
+{
+    p->queue[i] = item;
+    item.parent->slots[item.index].heap_index = i;
 }
 
 static void heap_up(Pool *p, size_t i)
 {
-    DirTask *t = p->queue[i];
+    QueueItem item = p->queue[i];
 
     while (i > 0) {
         size_t parent = (i - 1) / 2;
-        if (!task_before(t, p->queue[parent])) {
+        if (!item_before(&item, &p->queue[parent])) {
             break;
         }
         heap_set(p, i, p->queue[parent]);
         i = parent;
     }
-    heap_set(p, i, t);
+    heap_set(p, i, item);
 }
 
 static void heap_down(Pool *p, size_t i)
 {
-    DirTask *t = p->queue[i];
+    QueueItem item = p->queue[i];
 
     for (;;) {
         size_t l = 2 * i + 1, best = i;
-        const DirTask *best_t = t;
-        if (l < p->qlen && task_before(p->queue[l], best_t)) {
+        const QueueItem *best_item = &item;
+        if (l < p->qlen && item_before(&p->queue[l], best_item)) {
             best = l;
-            best_t = p->queue[l];
+            best_item = &p->queue[l];
         }
-        if (l + 1 < p->qlen && task_before(p->queue[l + 1], best_t)) {
+        if (l + 1 < p->qlen && item_before(&p->queue[l + 1], best_item)) {
             best = l + 1;
         }
         if (best == i) {
@@ -821,101 +1105,111 @@ static void heap_down(Pool *p, size_t i)
         heap_set(p, i, p->queue[best]);
         i = best;
     }
-    heap_set(p, i, t);
+    heap_set(p, i, item);
 }
 
-/* 큐에 넣는다(lock 보유). 큐를 늘리지 못하면 넣지 않는다(나중에 호출 스레드가 열거). */
-static void queue_push_locked(Pool *p, DirTask *t)
+/* 칸을 큐에 넣는다(lock 보유). 큐를 늘리지 못하면 넣지 않는다(차례가 되면 호출 스레드가 열거). */
+static int queue_push_locked(Pool *p, DirTask *parent, size_t index)
 {
+    QueueItem item;
+
     if (p->qlen == p->qcap) {
         size_t cap = p->qcap ? p->qcap * 2 : 256;
-        DirTask **grown = realloc(p->queue, cap * sizeof(*grown));
+        QueueItem *grown = realloc(p->queue, cap * sizeof(*grown));
         if (grown == NULL) {
-            return;
+            return 0;
         }
         p->queue = grown;
         p->qcap = cap;
     }
-    heap_set(p, p->qlen++, t);
+    item.parent = parent;
+    item.index = index;
+    heap_set(p, p->qlen++, item);
     heap_up(p, p->qlen - 1);
+    return 1;
 }
 
-/* 가장 먼저 필요한 작업을 꺼낸다(lock 보유, 큐가 비어 있지 않아야 함). */
-static DirTask *queue_pop_locked(Pool *p)
+/* 가장 먼저 필요한 칸을 꺼낸다(lock 보유, 큐가 비어 있지 않아야 함). */
+static QueueItem queue_pop_locked(Pool *p)
 {
-    DirTask *t = p->queue[0];
+    QueueItem item = p->queue[0];
 
-    t->heap_index = HEAP_NONE;
+    item.parent->slots[item.index].heap_index = HEAP_NONE;
     if (--p->qlen > 0) {
         heap_set(p, 0, p->queue[p->qlen]);
         heap_down(p, 0);
     }
-    return t;
+    return item;
 }
 
-static void queue_remove_locked(Pool *p, DirTask *t)
+static void queue_remove_locked(Pool *p, KidSlot *slot)
 {
-    size_t i = t->heap_index;
+    size_t i = slot->heap_index;
 
     if (i == HEAP_NONE) {
         return;
     }
-    t->heap_index = HEAP_NONE;
+    slot->heap_index = HEAP_NONE;
     if (i == --p->qlen) {
         return;
     }
     {
-        DirTask *last = p->queue[p->qlen];
+        QueueItem last = p->queue[p->qlen];
         heap_set(p, i, last);
         heap_up(p, i);
-        heap_down(p, last->heap_index);
+        heap_down(p, last.parent->slots[last.index].heap_index);
     }
 }
 
-/* 자식 작업을 큐에 넣는다. */
+/* 아직 아무도 손대지 않은 칸을 모두 큐에 넣고 그만큼 쉬는 작업 스레드를 깨운다(lock 보유). */
 static void submit_kids_locked(Pool *p, DirTask *t)
 {
-    size_t i;
+    size_t i, pushed = 0;
 
-    for (i = 0; i < t->kid_count; i++) {
-        if (t->kids[i] != NULL) {
-            queue_push_locked(p, t->kids[i]);
+    for (i = 0; t->slots != NULL && i < t->kid_count; i++) {
+        const KidSlot *s = &t->slots[i];
+        if (s->task == NULL && s->heap_index == HEAP_NONE &&
+            !(s->flags & (SLOT_EXCLUDED | SLOT_TOO_LONG))) {
+            pushed += queue_push_locked(p, t, i);
         }
     }
+    /* 상한이 찼어도 하나는 깨워, 새 칸이 더 급하면 나중 것을 내쫓고 열거하게 한다. */
+    wake_workers_locked(p, pool_full_locked(p) && pushed > 0 ? 1 : pushed);
 }
 
 /*
- * 필요 없어진 작업과 그 자식들을 버린다(lock 보유). 큐에 있으면 빼서 해제하고, 열거 중이면
- * 그 작업 스레드가 끝낸 뒤 해제하게 표시하며, 끝났으면 자식까지 따라가 해제한다.
+ * 필요 없어진 작업과 그 아래를 버린다(lock 보유). 열거 중이면 그 작업 스레드가 끝낸 뒤 해제하게
+ * 표시하고, 끝났으면 칸들을 따라가 큐에서 빼고 해제한다.
  */
-static void discard_locked(Pool *p, DirTask *t)
+static void discard_task_locked(Pool *p, DirTask *t)
 {
     DirTask **work = NULL;
     size_t len = 0, cap = 0;
 
     while (t != NULL) {
-        if (t->state == TASK_QUEUED) {
-            queue_remove_locked(p, t);
-            task_free_one(t);
-        } else if (t->state == TASK_RUNNING) {
+        if (t->state == TASK_RUNNING) {
             t->discard = 1;
         } else {
             size_t i;
-            for (i = 0; i < t->kid_count; i++) {
-                if (t->kids[i] == NULL) {
+            for (i = 0; t->slots != NULL && i < t->kid_count; i++) {
+                KidSlot *s = &t->slots[i];
+                queue_remove_locked(p, s);
+                if (s->task == NULL) {
                     continue;
                 }
                 if (len == cap) {
                     size_t ncap = cap ? cap * 2 : 64;
                     DirTask **grown = realloc(work, ncap * sizeof(*grown));
                     if (grown == NULL) {
-                        discard_locked(p, t->kids[i]);
+                        discard_task_locked(p, s->task);
+                        s->task = NULL;
                         continue;
                     }
                     work = grown;
                     cap = ncap;
                 }
-                work[len++] = t->kids[i];
+                work[len++] = s->task;
+                s->task = NULL;
             }
             ready_release_locked(p, t);
             task_free_one(t);
@@ -923,6 +1217,48 @@ static void discard_locked(Pool *p, DirTask *t)
         t = len > 0 ? work[--len] : NULL;
     }
     free(work);
+}
+
+/* 칸을 버린다(lock 보유, 작업 스레드가 없으면 NULL): 큐에서 빼고 만든 작업이 있으면 버린다. */
+static void discard_slot(Pool *p, KidSlot *s, uint32_t flag)
+{
+    s->flags |= flag;
+    if (p == NULL) {
+        return;
+    }
+    queue_remove_locked(p, s);
+    if (s->task != NULL) {
+        discard_task_locked(p, s->task);
+        s->task = NULL;
+    }
+}
+
+/*
+ * 상한이 찼을 때, 큐 맨 앞이 미리 열거해 둔 것 중 가장 나중에 필요한 작업보다 먼저 필요하면 그 작업을
+ * 내쫓는다(lock 보유): 칸을 큐로 되돌리고 작업(과 그 아래)을 버린다. 내쫓았으면 1.
+ */
+static int evict_later_locked(Pool *p)
+{
+    DirTask *victim, *parent;
+    KeyView kq, kv;
+    size_t index;
+
+    if (p->rlen == 0 || p->qlen == 0) {
+        return 0;
+    }
+    victim = p->ready_heap[0];
+    kq = item_key(&p->queue[0]);
+    kv = task_key(victim);
+    if (victim->awaited || victim->parent == NULL || !key_before(&kq, &kv)) {
+        return 0;
+    }
+    parent = victim->parent;
+    index = victim->slot_index;
+    parent->slots[index].task = NULL;
+    discard_task_locked(p, victim);
+    queue_push_locked(p, parent, index);
+    p->evicted++;
+    return 1;
 }
 
 static unsigned __stdcall pool_worker(void *arg)
@@ -936,37 +1272,53 @@ static unsigned __stdcall pool_worker(void *arg)
     }
     AcquireSRWLockExclusive(&p->lock);
     for (;;) {
+        QueueItem item;
         DirTask *t;
-        while (!p->stop && (p->qlen == 0 || pool_full_locked(p))) {
+        while (!p->stop) {
             if (p->qlen != 0) {
+                if (!pool_full_locked(p) || evict_later_locked(p)) {
+                    break;
+                }
                 p->throttled = 1;
             }
+            p->idle++;
             SleepConditionVariableSRW(&p->work_cv, &p->lock, INFINITE, 0);
+            p->idle--;
         }
         if (p->stop) {
             break;
         }
-        t = queue_pop_locked(p);
+        /* 작업은 이제야 만든다. 부모의 열거 기록은 부모가 해제되기 전까지 바뀌지 않는다. */
+        item = queue_pop_locked(p);
+        t = slot_task_new(item.parent, item.index);
+        if (t == NULL) {
+            /* 경로가 너무 길거나 메모리가 없다. 차례가 되면 호출 스레드가 다시 해 보고 기록한다. */
+            continue;
+        }
         t->state = TASK_RUNNING;
         t->by_worker = 1;
+        t->parent = item.parent;
+        t->slot_index = item.index;
+        item.parent->slots[item.index].task = t;
         ReleaseSRWLockExclusive(&p->lock);
 
         fetch_dir(t, scratch, p->max_depth, p->options);
 
         AcquireSRWLockExclusive(&p->lock);
+        p->prefetched++;
         if (t->discard) {
-            /* 열거하는 동안 필요 없어졌다. 자식은 아직 아무에게도 넘기지 않았다. */
-            task_free_tree(t);
+            /* 열거하는 동안 필요 없어졌다. 칸은 아직 큐에 넣지 않았다. */
+            task_free_one(t);
             continue;
         }
-        submit_kids_locked(p, t);
         t->state = TASK_DONE;
         p->ready++;
         p->ready_bytes += ready_cost(t);
-        WakeAllConditionVariable(&p->done_cv);
-        if (t->kid_count > 0) {
-            WakeAllConditionVariable(&p->work_cv);
+        ready_push_locked(p, t);
+        if (t->awaited) {
+            WakeConditionVariable(&p->done_cv);
         }
+        submit_kids_locked(p, t);
     }
     ReleaseSRWLockExclusive(&p->lock);
     free(scratch);
@@ -1010,6 +1362,9 @@ static void pool_stop(Pool *p)
     free(p->queue);
     p->queue = NULL;
     p->qlen = 0;
+    free(p->ready_heap);
+    p->ready_heap = NULL;
+    p->rlen = 0;
     p->nthreads = 0;
 }
 
@@ -1115,6 +1470,7 @@ static int idset_add(IdSet *set, uint64_t volume, const RecId *id)
 
 /* ---- 깊이 우선 탐색 ---- */
 
+/* 깊이 우선 스택. 칸 하나는 처리를 마쳤고 아직 내려가지 않은 하위 폴더가 남은 폴더 작업이다. */
 typedef struct {
     DirTask **items;
     size_t len;
@@ -1132,6 +1488,11 @@ typedef struct {
     int pooled; /* 작업 스레드가 동작 중이면 1 */
     unsigned char *scratch; /* 호출 스레드의 열거 버퍼 */
     IdSet ids;  /* 정밀 스캔: 지금까지 센 파일 */
+    MemTally tally;        /* 폴더 작업 메모리 집계(진단) */
+    uint64_t self_fetched; /* 호출 스레드가 직접 열거한 폴더(진단) */
+    uint64_t waits;        /* 작업 스레드를 기다린 횟수(진단) */
+    uint64_t prefetched;   /* 작업 스레드가 열거한 폴더(풀을 멈출 때 옮겨 둔다) */
+    size_t pending;        /* 스택 칸들에 남은 하위 폴더 수(ScanDirInfo.pending, 취소 시 건너뛴 수) */
 } Walker;
 
 static int stack_push(DirStack *stack, DirTask *t)
@@ -1149,54 +1510,79 @@ static int stack_push(DirStack *stack, DirTask *t)
     return 1;
 }
 
-/* 필요 없어진 자식 작업을 버린다. */
-static void walker_discard(Walker *w, DirTask *t)
+/* 칸을 버린다(should_skip_dir 로 뺐거나 경로가 너무 길거나 취소). */
+static void walker_drop_slot(Walker *w, DirTask *t, size_t i, uint32_t flag)
 {
-    if (t == NULL) {
+    if (t->slots == NULL) {
         return;
     }
     if (w->pooled) {
         AcquireSRWLockExclusive(&w->pool.lock);
-        discard_locked(&w->pool, t);
+        discard_slot(&w->pool, &t->slots[i], flag);
         ReleaseSRWLockExclusive(&w->pool.lock);
     } else {
-        task_free_tree(t);
+        discard_slot(NULL, &t->slots[i], flag);
     }
 }
 
-/*
- * 처리할 차례가 된 작업을 넘겨받아 열거 결과를 준비한다. 아무도 시작하지 않았으면 큐에서 빼고
- * 직접 열거하고, 작업 스레드가 열거 중이면 끝날 때까지 기다린다.
- */
-static void walker_obtain(Walker *w, DirTask *t)
+/* 스택에 올리지 못한 작업 t 와 그 칸들(큐에 있거나 미리 열거한 작업)을 모두 버린다. */
+static void walker_drop_all(Walker *w, DirTask *t)
 {
-    int self = 1;
+    size_t i;
 
     if (w->pooled) {
         AcquireSRWLockExclusive(&w->pool.lock);
-        if (t->state == TASK_QUEUED) {
-            queue_remove_locked(&w->pool, t);
-            t->state = TASK_RUNNING;
-        } else {
+        for (i = 0; t->slots != NULL && i < t->kid_count; i++) {
+            discard_slot(&w->pool, &t->slots[i], SLOT_EXCLUDED);
+        }
+        ReleaseSRWLockExclusive(&w->pool.lock);
+    }
+    task_free_tree(t);
+}
+
+/*
+ * 스택 칸 f 의 칸 i 차례가 된 하위 폴더 작업을 넘겨받아 열거 결과를 준비한다. 작업 스레드가 열거했으면
+ * 그 결과를 받고(열거 중이면 끝날 때까지 기다림), 아직이면 큐에서 빼고 직접 만들어 열거한다.
+ * 작업을 만들지 못하면(메모리 부족) NULL.
+ */
+static DirTask *walker_take(Walker *w, DirTask *f, size_t i)
+{
+    KidSlot *s = &f->slots[i];
+    DirTask *t = NULL;
+
+    if (w->pooled) {
+        AcquireSRWLockExclusive(&w->pool.lock);
+        queue_remove_locked(&w->pool, s);
+        t = s->task;
+        s->task = NULL;
+        if (t != NULL) {
+            if (t->state != TASK_DONE) {
+                w->waits++;
+                t->awaited = 1;
+            }
             while (t->state != TASK_DONE) {
                 SleepConditionVariableSRW(&w->pool.done_cv, &w->pool.lock, INFINITE, 0);
             }
             ready_release_locked(&w->pool, t);
-            self = 0;
         }
         ReleaseSRWLockExclusive(&w->pool.lock);
+        if (t != NULL) {
+            return t;
+        }
     }
-    if (!self) {
-        return;
+    t = slot_task_new(f, i);
+    if (t == NULL) {
+        return NULL;
     }
+    w->self_fetched++;
     fetch_dir(t, w->scratch, w->max_depth, w->options);
+    t->state = TASK_DONE;
     if (w->pooled && t->kid_count > 0) {
         AcquireSRWLockExclusive(&w->pool.lock);
         submit_kids_locked(&w->pool, t);
         ReleaseSRWLockExclusive(&w->pool.lock);
-        WakeAllConditionVariable(&w->pool.work_cv);
     }
-    t->state = TASK_DONE;
+    return t;
 }
 
 /*
@@ -1253,10 +1639,11 @@ static void account_entry(const EntryRec *rec, ScanReport *report, ScanEntry *en
 }
 
 /*
- * 열거해 둔 폴더 t 의 항목을 집계하고 훅을 부르며, 하위 탐색할 폴더의 작업을 스택에 쌓는다.
+ * 열거해 둔 폴더 t 의 항목을 집계하고 훅을 부르며, 하위 탐색할 폴더의 칸에 on_entry 결과를 적는다.
  * 폴더를 열지 못했으면 SCAN_FATAL, 도중 오류·취소는 SCAN_PARTIAL.
- * 열지 못한 폴더와 스택에 넣지 못한 하위 폴더는 skipped_dir_count 로 센다.
- * 넘겨받지 않은 t 의 자식 작업은 모두 버리거나 스택으로 옮긴다(t->kids 는 비운다).
+ * 열지 못한 폴더와 내려갈 수 없는 하위 폴더(경로가 너무 김·메모리 부족)는 skipped_dir_count 로 센다.
+ * 끝나면 t->next_kid 가 내려갈 칸 수가 되고(0 이 아니면 호출자가 스택에 올린다), 그 수만큼
+ * w->pending 이 는다. 제외·취소로 빠진 칸은 버린다.
  */
 static ScanStatus process_dir(Walker *w, DirTask *t)
 {
@@ -1265,12 +1652,13 @@ static ScanStatus process_dir(Walker *w, DirTask *t)
     ScanStatus status = SCAN_COMPLETE;
     ScanDirInfo info;
     unsigned seen = 0;
-    size_t off, kid = 0;
+    size_t off, kid = 0, live = 0;
 
+    t->processed = 1;
     info.id = t->id;
     info.path = t->path;
     info.depth = t->depth;
-    info.pending = w->stack.len;
+    info.pending = w->pending;
     if (hooks->on_dir_begin != NULL) {
         hooks->on_dir_begin(&info, w->ctx);
     }
@@ -1285,7 +1673,7 @@ static ScanStatus process_dir(Walker *w, DirTask *t)
             ScanEntry entry;
             uintptr_t child_id = 0;
             int will_descend;
-            DirTask *ct = NULL;
+            size_t slot = kid;
 
             off += rec_size(rec);
             /* 큰 디렉터리에서도 취소가 늦지 않도록 열거 도중에도 확인한다. */
@@ -1299,23 +1687,18 @@ static ScanStatus process_dir(Walker *w, DirTask *t)
             if ((w->options & SCAN_OPT_HARDLINKS) && !entry.is_dir) {
                 account_hardlink(w, t, rec, &entry);
             }
+            /* fetch_dir 가 같은 판단으로 칸을 만들었다(slots 를 못 만들었으면 없음). */
             will_descend = rec_wants_descend(t, rec, w->max_depth);
             if (will_descend) {
-                /* fetch_dir 가 같은 판단으로 만든 자식 작업(kids 를 못 만들었으면 없음). */
-                if (kid < t->kid_count) {
-                    ct = t->kids[kid];
-                    t->kids[kid] = NULL;
-                }
                 kid++;
             }
             if (will_descend && hooks->should_skip_dir != NULL) {
                 ScanDirInfo parent = info;
-                parent.pending = w->stack.len;
+                parent.pending = w->pending + live;
                 if (hooks->should_skip_dir(&entry, &parent, w->ctx)) {
                     report->excluded_dir_count++;
                     will_descend = 0;
-                    walker_discard(w, ct);
-                    ct = NULL;
+                    walker_drop_slot(w, t, slot, SLOT_EXCLUDED);
                 }
             }
             if (hooks->on_entry != NULL) {
@@ -1323,21 +1706,19 @@ static ScanStatus process_dir(Walker *w, DirTask *t)
             }
 
             if (will_descend) {
-                if (ct == NULL) {
-                    /* 경로가 너무 길거나 작업을 만들지 못했다. */
-                    int too_long = t->path_len + 1 + rec->name_len > PATH_MAX_WIDE;
+                int too_long = t->path_len + 1 + rec->name_len > PATH_MAX_WIDE;
+                if (t->slots == NULL || too_long) {
+                    /* 경로가 너무 길거나 칸을 만들지 못했다. */
                     record_error(report, t->path,
                                  too_long ? ERROR_FILENAME_EXCED_RANGE : ERROR_NOT_ENOUGH_MEMORY);
                     report->skipped_dir_count++;
                     status = SCAN_PARTIAL;
-                } else {
-                    ct->id = child_id;
-                    if (!stack_push(&w->stack, ct)) {
-                        walker_discard(w, ct);
-                        record_error(report, t->path, ERROR_NOT_ENOUGH_MEMORY);
-                        report->skipped_dir_count++;
-                        status = SCAN_PARTIAL;
+                    if (too_long) {
+                        walker_drop_slot(w, t, slot, SLOT_TOO_LONG);
                     }
+                } else {
+                    t->slots[slot].id = child_id;
+                    live++;
                 }
             }
         }
@@ -1346,17 +1727,103 @@ static ScanStatus process_dir(Walker *w, DirTask *t)
             status = SCAN_PARTIAL;
         }
     }
-    /* 취소로 멈췄으면 남은 자식 작업을 버린다. */
-    for (; kid < t->kid_count; kid++) {
-        walker_discard(w, t->kids[kid]);
-        t->kids[kid] = NULL;
+    /* 취소로 멈췄으면 남은 칸을 버린다. */
+    for (; t->slots != NULL && kid < t->kid_count; kid++) {
+        walker_drop_slot(w, t, kid, SLOT_EXCLUDED);
     }
+    t->next_kid = t->slots != NULL ? t->kid_count : 0;
+    w->pending += live;
 
     if (hooks->on_dir_end != NULL) {
-        info.pending = w->stack.len;
+        info.pending = w->pending;
         hooks->on_dir_end(&info, status, w->ctx);
     }
     return status;
+}
+
+/* 스택 칸 f 의 다음 차례 칸 번호. 남은 칸이 없으면 0 을 돌려준다(있으면 번호 + 1). */
+static size_t next_live_slot(DirTask *f)
+{
+    while (f->next_kid > 0 &&
+           (f->slots[f->next_kid - 1].flags & (SLOT_EXCLUDED | SLOT_TOO_LONG))) {
+        f->next_kid--;
+    }
+    if (f->next_kid == 0) {
+        return 0;
+    }
+    return f->next_kid--;
+}
+
+/* 남은 칸 수(제외·너무 긴 경로 제외). */
+static size_t live_slots(const DirTask *f)
+{
+    size_t i, n = 0;
+
+    for (i = 0; i < f->next_kid; i++) {
+        n += !(f->slots[i].flags & (SLOT_EXCLUDED | SLOT_TOO_LONG));
+    }
+    return n;
+}
+
+/*
+ * 스택에 올릴 작업의 열거 결과에서 남은 하위 폴더 기록만 남기고(파일·제외한 폴더 기록을 버림)
+ * 메모리를 줄인다. 작업 스레드는 칸의 이름을 lock 안에서만 읽으므로 lock 을 쥔 채 부른다.
+ */
+static void frame_compact(DirTask *t)
+{
+    size_t i, out = 0;
+    unsigned char *fit;
+
+    for (i = 0; i < t->kid_count; i++) {
+        KidSlot *s = &t->slots[i];
+        const EntryRec *rec;
+        size_t n;
+        if (s->flags & (SLOT_EXCLUDED | SLOT_TOO_LONG)) {
+            continue; /* 차례가 와도 건너뛰므로 기록이 필요 없다 */
+        }
+        rec = (const EntryRec *)(t->buf + s->rec_off);
+        n = rec_size(rec);
+        /* 칸은 열거 순서라 기록 위치가 커지기만 하므로 앞으로 당겨도 겹치지 않는다. */
+        memmove(t->buf + out, rec, n);
+        s->rec_off = (uint32_t)out;
+        out += n;
+    }
+    t->len = out;
+    if (out > 0 && out < t->cap && (fit = realloc(t->buf, out)) != NULL) {
+        tally_add(t->tally, 0, -(LONG64)(t->cap - out));
+        t->buf = fit;
+        t->cap = out;
+    }
+}
+
+/*
+ * 처리를 마친 작업 t 를 스택에 올린다(내려갈 칸이 없으면 바로 해제). 올리지 못하면 남은 하위 폴더를
+ * 건너뛴 것으로 기록하고 SCAN_PARTIAL.
+ */
+static ScanStatus walker_push(Walker *w, DirTask *t)
+{
+    size_t left;
+
+    if (t->next_kid == 0) {
+        task_free_one(t);
+        return SCAN_COMPLETE;
+    }
+    if (w->pooled) {
+        AcquireSRWLockExclusive(&w->pool.lock);
+        frame_compact(t);
+        ReleaseSRWLockExclusive(&w->pool.lock);
+    } else {
+        frame_compact(t);
+    }
+    if (stack_push(&w->stack, t)) {
+        return SCAN_COMPLETE;
+    }
+    left = live_slots(t);
+    record_error(w->report, t->path, ERROR_NOT_ENOUGH_MEMORY);
+    w->report->skipped_dir_count += left;
+    w->pending -= left;
+    walker_drop_all(w, t);
+    return SCAN_PARTIAL;
 }
 
 /* 볼륨의 클러스터 크기(모르면 0). */
@@ -1413,7 +1880,9 @@ static void walker_finish(Walker *w)
     size_t i;
 
     if (w->pooled) {
+        /* 멈추는 동안 열거를 마친 작업까지 세도록 스레드가 끝난 뒤 읽는다. */
         pool_stop(&w->pool);
+        w->prefetched = w->pool.prefetched;
         w->pooled = 0;
     }
     for (i = 0; i < w->stack.len; i++) {
@@ -1422,6 +1891,18 @@ static void walker_finish(Walker *w)
     free(w->stack.items);
     free(w->scratch);
     free(w->ids.slots);
+
+    /* 진단 값: 최대값은 더 큰 쪽, 횟수는 더한다(scan_tree_ex 를 여러 번 부르는 경우). */
+    if ((uint64_t)w->tally.peak_tasks > w->report->peak_tasks) {
+        w->report->peak_tasks = (uint64_t)w->tally.peak_tasks;
+    }
+    if ((uint64_t)w->tally.peak_bytes > w->report->peak_task_bytes) {
+        w->report->peak_task_bytes = (uint64_t)w->tally.peak_bytes;
+    }
+    w->report->prefetched_dirs += w->prefetched;
+    w->report->self_fetched_dirs += w->self_fetched;
+    w->report->prefetch_waits += w->waits;
+    w->report->discarded_dirs += (uint64_t)w->tally.discarded;
 }
 
 /* 폴더가 있는 볼륨이 하드 링크를 지원하는지(모르면 지원한다고 보고 ID 로 확인한다). */
@@ -1487,7 +1968,7 @@ ScanStatus scan_tree_opts(const wchar_t *dir, uint32_t max_depth, uintptr_t root
     w.hooks = hooks;
     w.ctx = ctx;
     w.scratch = malloc(FETCH_BUFFER_BYTES);
-    t = task_new(ext, wcslen(ext), NULL, 0, NULL, 0, 0, 0, 0);
+    t = task_new(ext, wcslen(ext), NULL, 0, NULL, 0, 0, 0, 0, &w.tally);
     free(ext);
     if (w.scratch == NULL || t == NULL) {
         record_error(report, dir, ERROR_NOT_ENOUGH_MEMORY);
@@ -1501,6 +1982,7 @@ ScanStatus scan_tree_opts(const wchar_t *dir, uint32_t max_depth, uintptr_t root
     t->id = root_id;
 
     /* 루트는 직접 열거하고, 하위 폴더가 있을 때만 작업 스레드를 띄운다. */
+    w.self_fetched++;
     fetch_dir(t, w.scratch, max_depth, w.options);
     threads = scan_effective_threads();
     if (t->kid_count > 0 && threads > 1 && pool_start(&w.pool, threads, max_depth, w.options)) {
@@ -1512,37 +1994,57 @@ ScanStatus scan_tree_opts(const wchar_t *dir, uint32_t max_depth, uintptr_t root
     }
     t->state = TASK_DONE;
     result = process_dir(&w, t);
-    task_free_one(t);
     if (result == SCAN_FATAL) {
         /* 루트를 열지 못하면 하위 트리 전체를 알 수 없으므로 중단한다. */
+        task_free_one(t);
         report->aborted = 1;
         walker_finish(&w);
         return SCAN_FATAL;
     }
-    if (result != SCAN_COMPLETE) {
+    if (result != SCAN_COMPLETE || walker_push(&w, t) != SCAN_COMPLETE) {
         status = SCAN_PARTIAL;
     }
 
     /*
-     * 마지막에 쌓인 디렉터리부터 꺼내므로 깊이 우선으로 진행된다.
+     * 스택 맨 위 폴더의 남은 하위 폴더를 마지막 것부터 하나씩 내려가므로 깊이 우선으로 진행된다.
      * 하위 디렉터리 실패(SCAN_FATAL 포함)는 그 디렉터리만 건너뛰고 계속한다.
      */
     while (w.stack.len > 0) {
+        DirTask *f = w.stack.items[w.stack.len - 1];
+        size_t i;
+
         if (report->cancelled ||
             (hooks->should_cancel != NULL && hooks->should_cancel(ctx))) {
             /* 남은 디렉터리는 열거하지 못한 것으로 센다. */
             report->cancelled = 1;
-            report->skipped_dir_count += w.stack.len;
+            report->skipped_dir_count += w.pending;
             status = SCAN_PARTIAL;
             break;
         }
-        t = w.stack.items[--w.stack.len];
-        walker_obtain(&w, t);
+        i = next_live_slot(f);
+        if (i == 0) {
+            /* 이 폴더의 하위 폴더를 다 돌았다. */
+            w.stack.len--;
+            task_free_one(f);
+            continue;
+        }
+        i--;
+        w.pending--;
+        t = walker_take(&w, f, i);
+        if (t == NULL) {
+            record_error(report, f->path, ERROR_NOT_ENOUGH_MEMORY);
+            report->skipped_dir_count++;
+            status = SCAN_PARTIAL;
+            continue;
+        }
+        t->id = f->slots[i].id;
         result = process_dir(&w, t);
         if (result != SCAN_COMPLETE) {
             status = SCAN_PARTIAL;
         }
-        task_free_one(t);
+        if (walker_push(&w, t) != SCAN_COMPLETE) {
+            status = SCAN_PARTIAL;
+        }
     }
 
     walker_finish(&w);

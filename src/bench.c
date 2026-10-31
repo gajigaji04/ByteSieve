@@ -25,7 +25,8 @@
  *
  *   --threads N  폴더 열거 작업 스레드 수(0 = 자동, 1 = 병렬 없음). scan_set_threads 참고.
  *
- * 실행마다 경과 시간·CPU 시간(사용자+커널)·결과 구조 해제 시간을, 끝에 프로세스 최대
+ * 실행마다 경과 시간·CPU 시간(사용자+커널)·결과 구조 해제 시간과 스캐너 진단 값(동시에 살아 있던
+ * 폴더 작업 수·메모리 최대, 미리 열거·직접 열거·기다림·버린 작업 수)을, 끝에 프로세스 최대
  * 작업 집합과 최대 전용 메모리(커밋)를 출력한다. 최대값은 프로세스 전체 기준이므로
  * 모드를 비교할 때는 모드마다 따로 실행한다. 첫 실행은 디스크 캐시가 차지 않았을 수 있다.
  */
@@ -127,6 +128,7 @@ int wmain(int argc, wchar_t **argv)
     for (i = 0; i < runs; i++) {
         double t0 = now_ms(), c0 = cpu_ms(), t1, c1, t2;
         uint64_t files = 0, dirs = 0, bytes = 0, extra = 0;
+        ScanReport diag; /* 진단 값만 복사해 둔다(errors 는 쓰지 않음) */
         ScanStatus st;
 
         if (mode == MODE_TREE) {
@@ -138,6 +140,7 @@ int wmain(int argc, wchar_t **argv)
             files = r.file_count;
             dirs = r.dir_count;
             bytes = r.total_bytes;
+            diag = r;
             memory(&pmc);
             scan_report_free(&r);
         } else if (mode == MODE_MODEL) {
@@ -150,6 +153,7 @@ int wmain(int argc, wchar_t **argv)
             dirs = m.report.dir_count;
             bytes = m.report.total_bytes;
             extra = m.len;
+            diag = m.report;
             memory(&pmc);
             scan_model_free(&m);
         } else {
@@ -162,6 +166,7 @@ int wmain(int argc, wchar_t **argv)
             dirs = r.report.dir_count;
             bytes = r.report.total_bytes;
             extra = r.len;
+            diag = r.report;
             memory(&pmc);
             cleanup_result_free(&r);
         }
@@ -173,6 +178,12 @@ int wmain(int argc, wchar_t **argv)
                 i + 1, t1 - t0, c1 - c0, t2 - t1, (unsigned long long)files,
                 (unsigned long long)dirs, a, mode == MODE_CLEANUP ? L"items" : L"nodes",
                 (unsigned long long)extra, b, scan_status_name(st));
+        format_size(diag.peak_task_bytes, a, 32);
+        wprintf(L"       scanner: peak tasks %llu (%ls) · prefetched %llu · self %llu · waits %llu · "
+                L"discarded %llu\n",
+                (unsigned long long)diag.peak_tasks, a, (unsigned long long)diag.prefetched_dirs,
+                (unsigned long long)diag.self_fetched_dirs, (unsigned long long)diag.prefetch_waits,
+                (unsigned long long)diag.discarded_dirs);
         if (st == SCAN_FATAL) {
             status_code = 1;
         }
