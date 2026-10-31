@@ -531,6 +531,153 @@ static void test_job(void)
     CHECK(cleanup_job_finish(NULL, NULL) == SCAN_FATAL);
 }
 
+/* 개발 환경 분류: 기존 픽스처를 지운 뒤 별도 폴더에서 확인한다. */
+static int setup_eco_fixture(void)
+{
+    wchar_t tmp[MAX_PATH];
+
+    if (GetTempPathW(MAX_PATH, tmp) == 0) {
+        return 0;
+    }
+    swprintf(g_root, MAX_PATH, L"%lsbytesieve_cleanup_eco_%lu", tmp,
+             (unsigned long)GetCurrentProcessId());
+    swprintf(g_root_ext, MAX_PATH, L"\\\\?\\%ls", g_root);
+    remove_tree(g_root_ext);
+    if (!CreateDirectoryW(g_root_ext, NULL)) {
+        return 0;
+    }
+    return make_dir(L"web") && write_file(L"web\\package.json", 2) &&
+           make_dir(L"web\\node_modules") && write_file(L"web\\node_modules\\x.js", 10) &&
+           make_dir(L"web\\build") && write_file(L"web\\build\\b.js", 11) &&
+           make_dir(L"web\\.next") && write_file(L"web\\.next\\c", 12) &&
+           make_dir(L"py") && write_file(L"py\\pyproject.toml", 2) &&
+           make_dir(L"py\\__pycache__") && write_file(L"py\\__pycache__\\m.pyc", 13) &&
+           make_dir(L"py\\pkg") && make_dir(L"py\\pkg\\__pycache__") &&
+           write_file(L"py\\pkg\\__pycache__\\n.pyc", 14) &&
+           make_dir(L"py\\dist") && write_file(L"py\\dist\\w.whl", 15) &&
+           make_dir(L"rs") && make_dir(L"rs\\target") && make_dir(L"rs\\target\\debug") &&
+           write_file(L"rs\\target\\debug\\a", 16) &&
+           /* 표시 파일이 폴더보다 뒤에 열거되어도 판정은 같다. */
+           write_file(L"rs\\Cargo.toml", 2) &&
+           make_dir(L"mvn") && write_file(L"mvn\\pom.xml", 2) && make_dir(L"mvn\\target") &&
+           write_file(L"mvn\\target\\k.class", 17) &&
+           make_dir(L"cs") && write_file(L"cs\\App.csproj", 2) && make_dir(L"cs\\bin") &&
+           make_dir(L"cs\\bin\\Debug") && write_file(L"cs\\bin\\Debug\\a.dll", 18) &&
+           make_dir(L"cs\\obj") && write_file(L"cs\\obj\\p", 19) && make_dir(L"cs\\.vs") &&
+           write_file(L"cs\\.vs\\v", 20) &&
+           make_dir(L"gradle") && write_file(L"gradle\\build.gradle", 2) &&
+           make_dir(L"gradle\\.gradle") && write_file(L"gradle\\.gradle\\g", 21) &&
+           make_dir(L"gradle\\build") && write_file(L"gradle\\build\\h", 22) &&
+           make_dir(L"cpp") && write_file(L"cpp\\CMakeLists.txt", 2) &&
+           make_dir(L"cpp\\cmake-build-debug") && write_file(L"cpp\\cmake-build-debug\\o", 23) &&
+           make_dir(L"cpp\\build") && write_file(L"cpp\\build\\q", 24) &&
+           /* 표시 파일이 없어 후보가 아닌 폴더(사용자 bin, 홈의 .gradle, 아무 target) */
+           make_dir(L"home") && make_dir(L"home\\bin") && write_file(L"home\\bin\\tool.exe", 25) &&
+           write_file(L"home\\bin\\x.log", 26) && make_dir(L"home\\.gradle") &&
+           write_file(L"home\\.gradle\\gradle.properties", 27) && make_dir(L"home\\target") &&
+           write_file(L"home\\target\\t.txt", 28) &&
+           make_dir(L"plain") && make_dir(L"plain\\dist") && write_file(L"plain\\dist\\d.js", 29) &&
+           make_dir(L"plain\\.cache") && write_file(L"plain\\.cache\\c", 30);
+}
+
+static void check_eco(const CleanupResult *r, const wchar_t *rel, CleanupCategory category,
+                      CleanupEco eco, uint64_t bytes)
+{
+    const CleanupItem *it = find_item(r, rel);
+
+    CHECK(it != NULL);
+    if (it == NULL) {
+        fwprintf(stderr, L"  missing item: %ls\n", rel);
+        return;
+    }
+    CHECK(it->category == category);
+    CHECK(it->eco == eco);
+    CHECK_U64(it->bytes, bytes);
+    if (it->eco != eco) {
+        fwprintf(stderr, L"  %ls: eco %ls\n", rel, cleanup_eco_name(it->eco));
+    }
+}
+
+static void test_ecosystems(void)
+{
+    CleanupResult r;
+    size_t order[16], n, i;
+    uint64_t bytes;
+
+    if (!setup_eco_fixture()) {
+        CHECK(0);
+        remove_tree(g_root_ext);
+        return;
+    }
+    cleanup_result_init(&r);
+    CHECK(cleanup_scan(&r, g_root, NULL, NULL, NULL, NULL) == SCAN_COMPLETE);
+
+    check_eco(&r, L"web\\node_modules", CLEANUP_NODE_MODULES, CLEANUP_ECO_NODE, 10);
+    check_eco(&r, L"web\\build", CLEANUP_BUILD, CLEANUP_ECO_NODE, 11);
+    check_eco(&r, L"web\\.next", CLEANUP_CACHE, CLEANUP_ECO_NODE, 12);
+    check_eco(&r, L"py\\__pycache__", CLEANUP_CACHE, CLEANUP_ECO_PYTHON, 13);
+    check_eco(&r, L"py\\pkg\\__pycache__", CLEANUP_CACHE, CLEANUP_ECO_PYTHON, 14);
+    check_eco(&r, L"py\\dist", CLEANUP_BUILD, CLEANUP_ECO_PYTHON, 15);
+    check_eco(&r, L"rs\\target", CLEANUP_BUILD, CLEANUP_ECO_RUST, 16);
+    check_eco(&r, L"mvn\\target", CLEANUP_BUILD, CLEANUP_ECO_JAVA, 17);
+    check_eco(&r, L"cs\\bin", CLEANUP_BUILD, CLEANUP_ECO_DOTNET, 18);
+    check_eco(&r, L"cs\\obj", CLEANUP_BUILD, CLEANUP_ECO_DOTNET, 19);
+    check_eco(&r, L"cs\\.vs", CLEANUP_CACHE, CLEANUP_ECO_DOTNET, 20);
+    check_eco(&r, L"gradle\\.gradle", CLEANUP_CACHE, CLEANUP_ECO_JAVA, 21);
+    check_eco(&r, L"gradle\\build", CLEANUP_BUILD, CLEANUP_ECO_JAVA, 22);
+    check_eco(&r, L"cpp\\cmake-build-debug", CLEANUP_BUILD, CLEANUP_ECO_CPP, 23);
+    check_eco(&r, L"cpp\\build", CLEANUP_BUILD, CLEANUP_ECO_CPP, 24);
+    check_eco(&r, L"plain\\dist", CLEANUP_BUILD, CLEANUP_ECO_GENERIC, 29);
+    check_eco(&r, L"plain\\.cache", CLEANUP_CACHE, CLEANUP_ECO_GENERIC, 30);
+    /* 표시 파일로 확인한 빌드 폴더 */
+    CHECK(find_item(&r, L"rs\\target") != NULL &&
+          (find_item(&r, L"rs\\target")->flags & CLEANUP_ITEM_CONFIRMED));
+    CHECK(find_item(&r, L"plain\\dist") != NULL &&
+          !(find_item(&r, L"plain\\dist")->flags & CLEANUP_ITEM_CONFIRMED));
+
+    /* 표시 파일이 없는 bin·.gradle·target 은 항목이 아니고, 그 안은 일반 폴더처럼 탐지한다. */
+    CHECK(find_item(&r, L"home\\bin") == NULL);
+    CHECK(find_item(&r, L"home\\.gradle") == NULL);
+    CHECK(find_item(&r, L"home\\target") == NULL);
+    check_eco(&r, L"home\\bin\\x.log", CLEANUP_LOG, CLEANUP_ECO_GENERIC, 26);
+
+    CHECK_U64(r.len, 18);
+    CHECK_U64(r.eco_count[CLEANUP_ECO_NODE], 3);
+    CHECK_U64(r.eco_bytes[CLEANUP_ECO_NODE], 10 + 11 + 12);
+    CHECK_U64(r.eco_count[CLEANUP_ECO_PYTHON], 3);
+    CHECK_U64(r.eco_bytes[CLEANUP_ECO_PYTHON], 13 + 14 + 15);
+    CHECK_U64(r.eco_count[CLEANUP_ECO_JAVA], 3);
+    CHECK_U64(r.eco_count[CLEANUP_ECO_DOTNET], 3);
+    CHECK_U64(r.eco_count[CLEANUP_ECO_RUST], 1);
+    CHECK_U64(r.eco_count[CLEANUP_ECO_CPP], 2);
+    CHECK_U64(r.eco_count[CLEANUP_ECO_GO], 0);
+    CHECK_U64(r.eco_count[CLEANUP_ECO_GENERIC], 3);
+    CHECK_U64(r.total_bytes, 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 23 +
+                                 24 + 26 + 29 + 30);
+
+    /* 개발 환경 필터 */
+    n = cleanup_select_ex(&r, CLEANUP_MASK_ALL, CLEANUP_ECO_BIT(CLEANUP_ECO_NODE), order, 16,
+                          &bytes);
+    CHECK_U64(n, 3);
+    CHECK_U64(bytes, 33);
+    for (i = 0; i < n && i < 16; i++) {
+        CHECK(r.items[order[i]].eco == CLEANUP_ECO_NODE);
+    }
+    /* 용량 내림차순 */
+    CHECK(n == 3 && r.items[order[0]].bytes == 12 && r.items[order[2]].bytes == 10);
+    /* 유형 × 환경: Java 빌드 결과물 */
+    n = cleanup_select_ex(&r, CLEANUP_MASK(CLEANUP_BUILD), CLEANUP_ECO_BIT(CLEANUP_ECO_JAVA), order,
+                          16, &bytes);
+    CHECK_U64(n, 2);
+    CHECK_U64(bytes, 17 + 22);
+    /* 기존 cleanup_select 는 모든 환경 */
+    CHECK_U64(cleanup_select(&r, CLEANUP_MASK_ALL, NULL, 0, &bytes), 18);
+    CHECK_U64(bytes, r.total_bytes);
+
+    cleanup_result_free(&r);
+    remove_tree(g_root_ext);
+}
+
 int main(void)
 {
     if (!setup_fixture()) {
@@ -545,6 +692,7 @@ int main(void)
     test_cancel();
     test_job();
     teardown_fixture();
+    test_ecosystems();
 
     if (g_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

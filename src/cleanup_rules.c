@@ -24,18 +24,6 @@ static int name_eq(const wchar_t *a, const wchar_t *b)
     return name_eq_n(a, wcslen(a), b, wcslen(b));
 }
 
-static int in_list(const wchar_t *name, const wchar_t *const *list, size_t n)
-{
-    size_t i;
-
-    for (i = 0; i < n; i++) {
-        if (name_eq(name, list[i])) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 /* name 이 suffix 로 끝나는지(대소문자 무시). */
 static int has_suffix(const wchar_t *name, const wchar_t *suffix)
 {
@@ -44,28 +32,88 @@ static int has_suffix(const wchar_t *name, const wchar_t *suffix)
     return len >= slen && name_eq_n(name + len - slen, slen, suffix, slen);
 }
 
-CleanupCategory cleanup_classify_dir(const wchar_t *name)
+/* name 이 prefix 로 시작하고 더 긴지(대소문자 무시). */
+static int has_prefix(const wchar_t *name, const wchar_t *prefix)
 {
-    static const wchar_t *const build[] = {L"dist", L"build", L"out"};
-    static const wchar_t *const cache[] = {L".cache", L".next", L".vite"};
-    static const wchar_t *const temp[] = {L".tmp", L".temp"};
+    size_t len = wcslen(name), plen = wcslen(prefix);
+
+    return len > plen && name_eq_n(name, plen, prefix, plen);
+}
+
+#define ECO(e) CLEANUP_ECO_##e
+#define BIT(e) CLEANUP_ECO_BIT(CLEANUP_ECO_##e)
+
+static const CleanupEco prefer_dist[] = {ECO(NODE), ECO(PYTHON), ECO(GO), ECO(CPP), ECO(GENERIC)};
+static const CleanupEco prefer_build[] = {ECO(JAVA), ECO(CPP), ECO(NODE), ECO(PYTHON),
+                                          ECO(GENERIC)};
+static const CleanupEco prefer_out[] = {ECO(CPP), ECO(JAVA), ECO(NODE), ECO(GO), ECO(GENERIC)};
+static const CleanupEco prefer_cache[] = {ECO(NODE), ECO(PYTHON), ECO(GENERIC)};
+static const CleanupEco prefer_target[] = {ECO(RUST), ECO(JAVA), ECO(GENERIC)};
+
+static const struct {
+    const wchar_t *name;
+    CleanupDirRule rule;
+} g_dir_rules[] = {
+    {L"node_modules", {CLEANUP_NODE_MODULES, ECO(NODE), 0, NULL}},
+    {L"dist", {CLEANUP_BUILD, ECO(GENERIC), 0, prefer_dist}},
+    {L"build", {CLEANUP_BUILD, ECO(GENERIC), 0, prefer_build}},
+    {L"out", {CLEANUP_BUILD, ECO(GENERIC), 0, prefer_out}},
+    {L"target", {CLEANUP_BUILD, ECO(GENERIC), BIT(RUST) | BIT(JAVA), prefer_target}},
+    {L"bin", {CLEANUP_BUILD, ECO(DOTNET), BIT(DOTNET), NULL}},
+    {L"obj", {CLEANUP_BUILD, ECO(DOTNET), BIT(DOTNET), NULL}},
+    {L".cache", {CLEANUP_CACHE, ECO(GENERIC), 0, prefer_cache}},
+    {L".next", {CLEANUP_CACHE, ECO(NODE), 0, NULL}},
+    {L".nuxt", {CLEANUP_CACHE, ECO(NODE), 0, NULL}},
+    {L".vite", {CLEANUP_CACHE, ECO(NODE), 0, NULL}},
+    {L".parcel-cache", {CLEANUP_CACHE, ECO(NODE), 0, NULL}},
+    {L".turbo", {CLEANUP_CACHE, ECO(NODE), 0, NULL}},
+    {L".svelte-kit", {CLEANUP_CACHE, ECO(NODE), 0, NULL}},
+    {L".angular", {CLEANUP_CACHE, ECO(NODE), 0, NULL}},
+    {L"__pycache__", {CLEANUP_CACHE, ECO(PYTHON), 0, NULL}},
+    {L".pytest_cache", {CLEANUP_CACHE, ECO(PYTHON), 0, NULL}},
+    {L".mypy_cache", {CLEANUP_CACHE, ECO(PYTHON), 0, NULL}},
+    {L".ruff_cache", {CLEANUP_CACHE, ECO(PYTHON), 0, NULL}},
+    {L".tox", {CLEANUP_CACHE, ECO(PYTHON), 0, NULL}},
+    {L".nox", {CLEANUP_CACHE, ECO(PYTHON), 0, NULL}},
+    {L".hypothesis", {CLEANUP_CACHE, ECO(PYTHON), 0, NULL}},
+    {L".gradle", {CLEANUP_CACHE, ECO(JAVA), BIT(JAVA), NULL}},
+    {L".vs", {CLEANUP_CACHE, ECO(DOTNET), BIT(DOTNET), NULL}},
+    {L".tmp", {CLEANUP_TEMP, ECO(GENERIC), 0, NULL}},
+    {L".temp", {CLEANUP_TEMP, ECO(GENERIC), 0, NULL}},
+};
+
+/* CLion 이 프로필마다 만드는 빌드 폴더(cmake-build-debug 등). */
+static const CleanupDirRule g_cmake_build_rule = {CLEANUP_BUILD, ECO(CPP), 0, NULL};
+
+int cleanup_dir_rule(const wchar_t *name, CleanupDirRule *rule)
+{
+    size_t i;
 
     if (name == NULL) {
-        return CLEANUP_NONE;
+        return 0;
     }
-    if (name_eq(name, L"node_modules")) {
-        return CLEANUP_NODE_MODULES;
+    for (i = 0; i < sizeof(g_dir_rules) / sizeof(g_dir_rules[0]); i++) {
+        if (name_eq(name, g_dir_rules[i].name)) {
+            if (rule != NULL) {
+                *rule = g_dir_rules[i].rule;
+            }
+            return 1;
+        }
     }
-    if (in_list(name, build, sizeof(build) / sizeof(build[0]))) {
-        return CLEANUP_BUILD;
+    if (has_prefix(name, L"cmake-build-")) {
+        if (rule != NULL) {
+            *rule = g_cmake_build_rule;
+        }
+        return 1;
     }
-    if (in_list(name, cache, sizeof(cache) / sizeof(cache[0]))) {
-        return CLEANUP_CACHE;
-    }
-    if (in_list(name, temp, sizeof(temp) / sizeof(temp[0]))) {
-        return CLEANUP_TEMP;
-    }
-    return CLEANUP_NONE;
+    return 0;
+}
+
+CleanupCategory cleanup_classify_dir(const wchar_t *name)
+{
+    CleanupDirRule rule;
+
+    return cleanup_dir_rule(name, &rule) ? rule.category : CLEANUP_NONE;
 }
 
 CleanupCategory cleanup_classify_file(const wchar_t *name)
@@ -87,19 +135,95 @@ int cleanup_needs_marker(CleanupCategory category)
     return category == CLEANUP_NODE_MODULES || category == CLEANUP_BUILD;
 }
 
-int cleanup_is_project_marker(const wchar_t *name)
+unsigned cleanup_marker_ecos(const wchar_t *name)
 {
-    static const wchar_t *const markers[] = {
-        L"package.json", L"CMakeLists.txt", L"Makefile",       L"Cargo.toml",
-        L"pom.xml",      L"build.gradle",   L"build.gradle.kts", L"pyproject.toml",
-        L"go.mod",
+    static const struct {
+        const wchar_t *name;
+        unsigned ecos;
+    } markers[] = {
+        {L"package.json", BIT(NODE)},
+        {L"pyproject.toml", BIT(PYTHON)},
+        {L"setup.py", BIT(PYTHON)},
+        {L"setup.cfg", BIT(PYTHON)},
+        {L"requirements.txt", BIT(PYTHON)},
+        {L"Pipfile", BIT(PYTHON)},
+        {L"tox.ini", BIT(PYTHON)},
+        {L"Cargo.toml", BIT(RUST)},
+        {L"pom.xml", BIT(JAVA)},
+        {L"build.gradle", BIT(JAVA)},
+        {L"build.gradle.kts", BIT(JAVA)},
+        {L"settings.gradle", BIT(JAVA)},
+        {L"settings.gradle.kts", BIT(JAVA)},
+        {L"CMakeLists.txt", BIT(CPP)},
+        {L"Makefile", BIT(CPP)},
+        {L"go.mod", BIT(GO)},
     };
+    static const wchar_t *const dotnet_suffixes[] = {L".csproj", L".fsproj", L".vbproj", L".sln"};
+    size_t i;
 
     if (name == NULL) {
         return 0;
     }
-    return in_list(name, markers, sizeof(markers) / sizeof(markers[0])) ||
-           has_suffix(name, L".csproj") || has_suffix(name, L".sln");
+    for (i = 0; i < sizeof(markers) / sizeof(markers[0]); i++) {
+        if (name_eq(name, markers[i].name)) {
+            return markers[i].ecos;
+        }
+    }
+    for (i = 0; i < sizeof(dotnet_suffixes) / sizeof(dotnet_suffixes[0]); i++) {
+        /* 확장자만 있는 이름(".sln")은 표시 파일로 보지 않는다. */
+        if (wcslen(name) > wcslen(dotnet_suffixes[i]) && has_suffix(name, dotnet_suffixes[i])) {
+            return BIT(DOTNET);
+        }
+    }
+    return 0;
+}
+
+int cleanup_is_project_marker(const wchar_t *name)
+{
+    return cleanup_marker_ecos(name) != 0;
+}
+
+CleanupEco cleanup_resolve_eco(const CleanupDirRule *rule, unsigned markers)
+{
+    const CleanupEco *p;
+
+    if (rule == NULL) {
+        return CLEANUP_ECO_GENERIC;
+    }
+    if (rule->eco != CLEANUP_ECO_GENERIC || rule->prefer == NULL) {
+        return rule->eco;
+    }
+    for (p = rule->prefer; *p != CLEANUP_ECO_GENERIC; p++) {
+        if (markers & CLEANUP_ECO_BIT(*p)) {
+            return *p;
+        }
+    }
+    return CLEANUP_ECO_GENERIC;
+}
+
+#undef ECO
+#undef BIT
+
+const wchar_t *cleanup_eco_name(CleanupEco eco)
+{
+    switch (eco) {
+    case CLEANUP_ECO_NODE:
+        return L"node";
+    case CLEANUP_ECO_PYTHON:
+        return L"python";
+    case CLEANUP_ECO_RUST:
+        return L"rust";
+    case CLEANUP_ECO_JAVA:
+        return L"java";
+    case CLEANUP_ECO_DOTNET:
+        return L"dotnet";
+    case CLEANUP_ECO_CPP:
+        return L"cpp";
+    case CLEANUP_ECO_GO:
+        return L"go";
+    default:
+        return L"generic";
+    }
 }
 
 const wchar_t *cleanup_category_name(CleanupCategory category)
@@ -300,6 +424,35 @@ int cleanup_protect_contains(const CleanupProtect *p, const wchar_t *path)
         if (qlen <= len && name_eq_n(q, qlen, s, qlen) &&
             (qlen == len || path_is_separator(s[qlen]))) {
             return 1;
+        }
+    }
+    return 0;
+}
+
+int cleanup_is_quarantine_name(const wchar_t *name)
+{
+    return name != NULL && name_eq(name, CLEANUP_QUARANTINE_DIR);
+}
+
+int cleanup_in_quarantine(const wchar_t *path)
+{
+    size_t qlen = wcslen(CLEANUP_QUARANTINE_DIR);
+    const wchar_t *s;
+
+    if (path == NULL) {
+        return 0;
+    }
+    for (s = path; *s != L'\0';) {
+        size_t len = 0;
+        while (s[len] != L'\0' && !path_is_separator(s[len])) {
+            len++;
+        }
+        if (name_eq_n(s, len, CLEANUP_QUARANTINE_DIR, qlen)) {
+            return 1;
+        }
+        s += len;
+        while (*s != L'\0' && path_is_separator(*s)) {
+            s++;
         }
     }
     return 0;

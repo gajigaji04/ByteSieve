@@ -7,6 +7,14 @@
 #define ITEM_NONE ((size_t)-1)
 
 /*
+ * 내부 표시(공개 플래그와 겹치지 않는 비트). 표시 파일이 있어야만 후보인 폴더는 일단 항목으로
+ * 만들고(MARKER_PENDING) 그 폴더 열거가 끝날 때 표시 파일이 없으면 REJECTED 로 바꾼다.
+ * 버린 항목은 소유자가 아니므로 그 안은 일반 폴더처럼 탐지하고, finalize 에서 목록에서 뺀다.
+ */
+#define ITEM_MARKER_PENDING (1u << 30)
+#define ITEM_REJECTED (1u << 31)
+
+/*
  * 탐색 상태. 폴더 id 는 그 폴더를 차지한 항목 번호 + 1 이고, 아무 항목에도 속하지
  * 않으면 0 이다. 그래서 폴더마다 따로 메모리를 잡지 않는다.
  */
@@ -23,7 +31,7 @@ typedef struct {
     /* 지금 열거 중인 폴더(on_dir_begin ~ on_dir_end) */
     wchar_t *cur_dir;  /* 표시용 경로 */
     size_t cur_first;  /* 이 폴더에서 처음 만든 항목 번호 */
-    int cur_marker;    /* 이 폴더에 프로젝트 표시 파일이 있었는지 */
+    unsigned cur_markers; /* 이 폴더의 프로젝트 표시 파일이 가리키는 개발 환경(비트) */
 } DetectCtx;
 
 void cleanup_result_init(CleanupResult *r)
@@ -75,10 +83,31 @@ static size_t add_item(DetectCtx *c, const wchar_t *name, CleanupCategory catego
     memset(item, 0, sizeof(*item));
     item->path = path;
     item->category = category;
+    item->eco = CLEANUP_ECO_GENERIC;
     item->flags = flags;
     item->bytes = bytes;
     item->files = files;
     return r->len++;
+}
+
+/* id 가 가리키는 소유 항목. 없거나 버린 항목이면 NULL. */
+static CleanupItem *owner_of(DetectCtx *c, uintptr_t id)
+{
+    CleanupItem *item;
+
+    if (id == 0) {
+        return NULL;
+    }
+    item = &c->r->items[id - 1];
+    return (item->flags & ITEM_REJECTED) ? NULL : item;
+}
+
+/* 경로의 마지막 구성 요소. */
+static const wchar_t *base_name(const wchar_t *path)
+{
+    const wchar_t *slash = wcsrchr(path, L'\\');
+
+    return slash != NULL ? slash + 1 : path;
 }
 
 static uintptr_t on_entry(const ScanEntry *entry, uintptr_t parent, int will_descend,
@@ -86,6 +115,8 @@ static uintptr_t on_entry(const ScanEntry *entry, uintptr_t parent, int will_des
 {
     DetectCtx *c = ctx;
     CleanupCategory category;
+    CleanupDirRule rule;
+    CleanupItem *owner;
     size_t index;
 
     /* 링크는 대상이 다른 곳에 있으므로 세지 않는다(삭제해도 링크만 사라진다). */
@@ -94,8 +125,8 @@ static uintptr_t on_entry(const ScanEntry *entry, uintptr_t parent, int will_des
     }
 
     /* 이미 항목에 속한 폴더 안: 용량만 더한다. */
-    if (parent != 0) {
-        CleanupItem *owner = &c->r->items[parent - 1];
+    owner = owner_of(c, parent);
+    if (owner != NULL) {
         if (entry->is_dir) {
             owner->dirs++;
             if (will_descend) {
@@ -111,9 +142,7 @@ static uintptr_t on_entry(const ScanEntry *entry, uintptr_t parent, int will_des
     }
 
     if (!entry->is_dir) {
-        if (cleanup_is_project_marker(entry->name)) {
-            c->cur_marker = 1;
-        }
+        c->cur_markers |= cleanup_marker_ecos(entry->name);
         category = cleanup_classify_file(entry->name);
         if (category != CLEANUP_NONE &&
             add_item(c, entry->name, category, 0, entry->size, 1) != ITEM_NONE) {
@@ -122,11 +151,11 @@ static uintptr_t on_entry(const ScanEntry *entry, uintptr_t parent, int will_des
         return 0;
     }
 
-    category = cleanup_classify_dir(entry->name);
-    if (category == CLEANUP_NONE) {
+    if (!cleanup_dir_rule(entry->name, &rule)) {
         return 0;
     }
-    index = add_item(c, entry->name, category, CLEANUP_ITEM_DIR, 0, 0);
+    index = add_item(c, entry->name, rule.category,
+                     CLEANUP_ITEM_DIR | (rule.require != 0 ? ITEM_MARKER_PENDING : 0u), 0, 0);
     if (index == ITEM_NONE || !will_descend) {
         return 0;
     }
@@ -141,7 +170,7 @@ static void on_dir_begin(const ScanDirInfo *dir, void *ctx)
     free(c->cur_dir);
     c->cur_dir = path_strip_extended(dir->path);
     c->cur_first = c->r->len;
-    c->cur_marker = 0;
+    c->cur_markers = 0;
 
     if (c->progress != NULL) {
         CleanupProgress p;
@@ -163,11 +192,12 @@ static void on_dir_begin(const ScanDirInfo *dir, void *ctx)
 static void on_dir_end(const ScanDirInfo *dir, ScanStatus result, void *ctx)
 {
     DetectCtx *c = ctx;
+    CleanupItem *owner;
     size_t i;
 
     c->dirs_scanned++;
-    if (dir->id != 0) {
-        CleanupItem *owner = &c->r->items[dir->id - 1];
+    owner = owner_of(c, dir->id);
+    if (owner != NULL) {
         if (owner->pending > 0) {
             owner->pending--;
         }
@@ -176,13 +206,27 @@ static void on_dir_end(const ScanDirInfo *dir, ScanStatus result, void *ctx)
         }
         return;
     }
-    /* 이 폴더의 직속 후보는 모두 [cur_first, len) 에 있다(하위 폴더는 이후에 열거된다). */
-    if (c->cur_marker) {
-        for (i = c->cur_first; i < c->r->len; i++) {
-            CleanupItem *item = &c->r->items[i];
-            if ((item->flags & CLEANUP_ITEM_DIR) && cleanup_needs_marker(item->category)) {
-                item->flags |= CLEANUP_ITEM_CONFIRMED;
+    /*
+     * 이 폴더의 직속 후보는 모두 [cur_first, len) 에 있다(하위 폴더는 이후에 열거된다).
+     * 표시 파일은 폴더 항목보다 뒤에 열거될 수 있어 여기서 한꺼번에 정한다.
+     */
+    for (i = c->cur_first; i < c->r->len; i++) {
+        CleanupItem *item = &c->r->items[i];
+        CleanupDirRule rule;
+        if (!(item->flags & CLEANUP_ITEM_DIR) ||
+            !cleanup_dir_rule(base_name(item->path), &rule)) {
+            continue;
+        }
+        if (item->flags & ITEM_MARKER_PENDING) {
+            item->flags &= ~ITEM_MARKER_PENDING;
+            if (!(c->cur_markers & rule.require)) {
+                item->flags |= ITEM_REJECTED;
+                continue;
             }
+        }
+        item->eco = cleanup_resolve_eco(&rule, c->cur_markers);
+        if (c->cur_markers != 0 && cleanup_needs_marker(item->category)) {
+            item->flags |= CLEANUP_ITEM_CONFIRMED;
         }
     }
 }
@@ -198,15 +242,29 @@ static int should_skip_dir(const ScanEntry *entry, const ScanDirInfo *parent, vo
 {
     DetectCtx *c = ctx;
 
-    return c->skip_protected && cleanup_protect_match(c->protect, parent->path, entry->name);
+    /* 격리 폴더는 이미 정리한 항목이므로 보호 경로 안을 고른 경우에도 들어가지 않는다. */
+    return cleanup_is_quarantine_name(entry->name) ||
+           (c->skip_protected && cleanup_protect_match(c->protect, parent->path, entry->name));
 }
 
 static void finalize(CleanupResult *r)
 {
-    size_t i;
+    size_t i, kept = 0;
+
+    /* 표시 파일이 없어 버린 항목을 뺀다(발견 순서는 유지). */
+    for (i = 0; i < r->len; i++) {
+        if (r->items[i].flags & ITEM_REJECTED) {
+            free(r->items[i].path);
+        } else {
+            r->items[kept++] = r->items[i];
+        }
+    }
+    r->len = kept;
 
     for (i = 0; i < r->len; i++) {
         CleanupItem *item = &r->items[i];
+        /* 취소로 열거를 마치지 못한 폴더의 항목은 판정 전 상태로 남을 수 있다. */
+        item->flags &= ~ITEM_MARKER_PENDING;
         /* 열거하지 못하고 남은 하위 폴더가 있으면 용량이 실제보다 작다. */
         if (item->pending > 0) {
             item->flags |= CLEANUP_ITEM_INCOMPLETE;
@@ -218,6 +276,8 @@ static void finalize(CleanupResult *r)
         r->total_bytes += item->bytes;
         r->category_bytes[item->category] += item->bytes;
         r->category_count[item->category]++;
+        r->eco_bytes[item->eco] += item->bytes;
+        r->eco_count[item->eco]++;
     }
 }
 
@@ -297,6 +357,17 @@ static int cmp_bytes_desc(const void *a, const void *b)
 size_t cleanup_select(const CleanupResult *r, unsigned mask, size_t *out, size_t cap,
                       uint64_t *bytes)
 {
+    return cleanup_select_ex(r, mask, CLEANUP_ECO_MASK_ALL, out, cap, bytes);
+}
+
+static int item_matches(const CleanupItem *item, unsigned mask, unsigned eco_mask)
+{
+    return (mask & CLEANUP_MASK(item->category)) && (eco_mask & CLEANUP_ECO_BIT(item->eco));
+}
+
+size_t cleanup_select_ex(const CleanupResult *r, unsigned mask, unsigned eco_mask, size_t *out,
+                         size_t cap, uint64_t *bytes)
+{
     SortItem *sorted;
     size_t i, count = 0, n;
     uint64_t sum = 0;
@@ -308,7 +379,7 @@ size_t cleanup_select(const CleanupResult *r, unsigned mask, size_t *out, size_t
         return 0;
     }
     for (i = 0; i < r->len; i++) {
-        if (mask & CLEANUP_MASK(r->items[i].category)) {
+        if (item_matches(&r->items[i], mask, eco_mask)) {
             count++;
             sum += r->items[i].bytes;
         }
@@ -323,7 +394,7 @@ size_t cleanup_select(const CleanupResult *r, unsigned mask, size_t *out, size_t
     sorted = malloc(count * sizeof(*sorted));
     n = 0;
     for (i = 0; i < r->len; i++) {
-        if (!(mask & CLEANUP_MASK(r->items[i].category))) {
+        if (!item_matches(&r->items[i], mask, eco_mask)) {
             continue;
         }
         if (sorted == NULL) {
