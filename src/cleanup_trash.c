@@ -661,7 +661,7 @@ CleanupTrashStatus cleanup_trash_one(const CleanupGuard *g, const wchar_t *root,
 
 struct CleanupTrashJob {
     HANDLE thread;
-    wchar_t *root;
+    wchar_t **roots;    /* 항목마다 탐지 경로(복사본) */
     CleanupItem *items; /* 경로는 복사본 */
     CleanupTrashOutcome *outcomes;
     size_t count;
@@ -698,7 +698,7 @@ static unsigned __stdcall trash_thread(void *arg)
             o->status = CLEANUP_TRASH_FAILED;
             o->code = (uint32_t)init;
         } else {
-            cleanup_trash_one(&job->guard, job->root, &job->items[i], o);
+            cleanup_trash_one(&job->guard, job->roots[i], &job->items[i], o);
         }
 
         EnterCriticalSection(&job->lock);
@@ -733,21 +733,44 @@ static void job_free(CleanupTrashJob *job)
     size_t i;
 
     DeleteCriticalSection(&job->lock);
-    if (job->items != NULL) {
-        for (i = 0; i < job->count; i++) {
+    for (i = 0; i < job->count; i++) {
+        if (job->items != NULL) {
             free(job->items[i].path);
+        }
+        if (job->roots != NULL) {
+            free(job->roots[i]);
         }
     }
     free(job->items);
+    free(job->roots);
     cleanup_trash_outcomes_free(job->outcomes, job->count);
     cleanup_guard_free(&job->guard);
-    free(job->root);
     free(job);
 }
 
 CleanupTrashJob *cleanup_trash_job_start(const wchar_t *root, const CleanupItem *const *items,
                                          size_t count, uint32_t interval_ms,
                                          cleanup_trash_notify_fn notify, void *ctx)
+{
+    const wchar_t **roots = malloc((count > 0 ? count : 1) * sizeof(*roots));
+    CleanupTrashJob *job;
+    size_t i;
+
+    if (roots == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < count; i++) {
+        roots[i] = root;
+    }
+    job = cleanup_trash_job_start_each(roots, items, count, interval_ms, notify, ctx);
+    free((void *)roots);
+    return job;
+}
+
+CleanupTrashJob *cleanup_trash_job_start_each(const wchar_t *const *roots,
+                                              const CleanupItem *const *items, size_t count,
+                                              uint32_t interval_ms,
+                                              cleanup_trash_notify_fn notify, void *ctx)
 {
     CleanupTrashJob *job = calloc(1, sizeof(*job));
     size_t i;
@@ -764,17 +787,18 @@ CleanupTrashJob *cleanup_trash_job_start(const wchar_t *root, const CleanupItem 
     job->notify = notify;
     job->ctx = ctx;
     job->last_notify = GetTickCount64();
-    job->root = path_dup(root != NULL ? root : L"");
+    job->roots = calloc(count > 0 ? count : 1, sizeof(*job->roots));
     job->items = calloc(count > 0 ? count : 1, sizeof(*job->items));
     job->outcomes = calloc(count > 0 ? count : 1, sizeof(*job->outcomes));
-    if (job->root == NULL || job->items == NULL || job->outcomes == NULL) {
+    if (job->roots == NULL || job->items == NULL || job->outcomes == NULL) {
         job_free(job);
         return NULL;
     }
     for (i = 0; i < count; i++) {
         job->items[i] = *items[i];
         job->items[i].path = path_dup(items[i]->path != NULL ? items[i]->path : L"");
-        if (job->items[i].path == NULL) {
+        job->roots[i] = path_dup(roots[i] != NULL ? roots[i] : L"");
+        if (job->items[i].path == NULL || job->roots[i] == NULL) {
             job_free(job);
             return NULL;
         }

@@ -13,6 +13,7 @@ CLI(`disk-scanner`)와 Win32 GUI(`bytesieve-gui`)를 제공합니다.
 | 결과 내보내기 | 스캔 결과를 CSV(Excel에서 한글이 깨지지 않는 UTF-8 BOM)와 HTML 보고서(요약·통계·용량 순위 표)로 저장 |
 | 스캔 기록 관리 | GUI에서 스캔 기록 자동 저장을 켜고 끄며(재실행 후에도 유지), 확인 후 저장된 기록 삭제 |
 | 정리 후보 탐지 | `node_modules`·빌드 결과물·개발 캐시·임시·로그를 개발 환경(Node.js·Python·Rust·Java·.NET·C/C++·Go)별로 분류 |
+| 공용 개발 캐시 | npm·pip·Gradle·Cargo·NuGet이 사용자 폴더에 두는 캐시를 환경 변수·설정 파일까지 확인해 찾고 용량·파일 수를 표시, 주의 사항을 보고 골라 휴지통으로 정리 |
 | 안전한 정리 | 고르고 확인한 항목만 **Windows 휴지통으로** 이동(영구 삭제 없음), 시스템·중요 폴더 보호 |
 | 격리 폴더 | 휴지통이 없는 드라이브(USB 등)는 같은 드라이브의 격리 폴더(`.bytesieve-trash`)로 옮기고, GUI에서 복원(덮어쓰기 없음)하거나 두 번 확인한 뒤 영구 삭제 |
 | 드라이브·시스템 | 드라이브별 사용률, RAM·CPU 사용률 1초 갱신과 60초 그래프 |
@@ -51,8 +52,9 @@ On disk:        12.50 KiB (12800 bytes)
 Status:         complete (all directories scanned)
 ```
 
-GUI는 **폴더 스캔 / 드라이브 / 정리 후보 / 격리 폴더 / 시스템** 다섯 탭으로 나뉩니다. 정리 후보 탭에서 [탐지] → 항목 체크 →
+GUI는 **폴더 스캔 / 드라이브 / 정리 후보 / 공용 캐시 / 격리 폴더 / 시스템** 여섯 탭으로 나뉩니다. 정리 후보 탭에서 [탐지] → 항목 체크 →
 [휴지통으로 이동...] → 확인 창에서 [예] 순서로 정리하며, 옮긴 항목은 Windows 휴지통에서 복원할 수 있습니다.
+공용 캐시 탭은 열면 바로 npm·pip·Gradle·Cargo·NuGet 캐시를 찾아 보여 주며, 같은 방식으로 골라 정리합니다.
 
 ## 테스트
 
@@ -60,7 +62,7 @@ GUI는 **폴더 스캔 / 드라이브 / 정리 후보 / 격리 폴더 / 시스�
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-단위 테스트 16개, CLI 검사 24개, GUI 자체 검사 11개(총 51개)가 등록되어 있습니다.
+단위 테스트 17개, CLI 검사 24개, GUI 자체 검사 12개(총 53개)가 등록되어 있습니다.
 
 ## 문서
 
@@ -83,6 +85,7 @@ ByteSieve/
 │   ├── scanner, scan_model, scan_job, scan_history   폴더 열거·트리 모델·스캔 스레드·변화 추적
 │   ├── scan_export                                   스캔 결과 CSV·HTML 내보내기
 │   ├── cleanup_rules, cleanup_scan, cleanup_job, cleanup_trash   정리 후보 탐지·휴지통 이동
+│   ├── dev_cache                                     공용 개발 캐시 위치 탐지·용량 세기
 │   ├── quarantine                                    격리 폴더(이동·기록·복원·영구 삭제)
 │   ├── drive, sysmon, path, size_format              드라이브·RAM/CPU 측정·경로·용량 표시
 │   ├── cli, jsonl, main.c                            CLI(disk-scanner)
@@ -93,7 +96,7 @@ ByteSieve/
 
 ## 구현 상태와 향후 계획
 
-CLI 스캐너, JSON Lines 출력, GUI 다섯 탭, 정리 후보 탐지·휴지통 이동, 휴지통 없는 드라이브의 격리 폴더(복원·영구 삭제), 디스크 사용량 분석, 폴더별 변화 추적(자동 저장 설정·기록 삭제 포함), 스캔 결과 CSV·HTML 내보내기, 병렬 스캔이 구현되어 있습니다.
+CLI 스캐너, JSON Lines 출력, GUI 여섯 탭, 정리 후보 탐지·휴지통 이동, 공용 개발 캐시(npm·pip·Gradle·Cargo·NuGet) 탐지·정리, 휴지통 없는 드라이브의 격리 폴더(복원·영구 삭제), 디스크 사용량 분석, 폴더별 변화 추적(자동 저장 설정·기록 삭제 포함), 스캔 결과 CSV·HTML 내보내기, 병렬 스캔이 구현되어 있습니다.
 
 ### 향후 개선 계획(미구현)
 
@@ -101,7 +104,6 @@ CLI 스캐너, JSON Lines 출력, GUI 다섯 탭, 정리 후보 탐지·휴지�
 
 **기능**
 - 트리맵 시각화: 폴더별 용량을 사각형 크기로 표현
-- 공용 개발 캐시 탐지: 프로젝트 밖의 npm·pip·Gradle·Cargo·NuGet 전역 캐시 탐지
 - BitLocker 등 볼륨 암호화 정보 표시
 
 **정확도·성능**

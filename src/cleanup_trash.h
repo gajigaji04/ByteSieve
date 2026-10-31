@@ -133,6 +133,16 @@ CleanupTrashJob *cleanup_trash_job_start(const wchar_t *root, const CleanupItem 
                                          size_t count, uint32_t interval_ms,
                                          cleanup_trash_notify_fn notify, void *ctx);
 
+/*
+ * cleanup_trash_job_start 와 같지만 항목마다 탐지 경로를 따로 받는다(roots[i] 가 items[i] 의
+ * 탐지 경로). 공용 개발 캐시처럼 서로 다른 폴더·드라이브에 있는 항목을 한 번에 옮길 때 쓴다.
+ * 안전 장치는 항목마다 자기 탐지 경로로 똑같이 거친다(탐지 경로 안쪽이어야 함 등).
+ */
+CleanupTrashJob *cleanup_trash_job_start_each(const wchar_t *const *roots,
+                                              const CleanupItem *const *items, size_t count,
+                                              uint32_t interval_ms,
+                                              cleanup_trash_notify_fn notify, void *ctx);
+
 /* 남은 항목을 처리하지 않게 한다(진행 중인 항목은 끝까지 옮긴다). 어느 스레드에서든 된다. */
 void cleanup_trash_job_cancel(CleanupTrashJob *job);
 

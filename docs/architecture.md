@@ -11,10 +11,10 @@
 
 ```
                     disk-scanner (CLI)                bytesieve-gui (GUI)
-                     │  cli · jsonl                     │  폴더 스캔 │ 드라이브 │ 정리 후보 │ 격리 폴더 │ 시스템
+                     │  cli · jsonl                     │  폴더 스캔 │ 드라이브 │ 정리 후보 │ 공용 캐시 │ 격리 폴더 │ 시스템
                      │                                  │
-   scan_history ── scan_model ── scan_job        cleanup_job ── cleanup_trash      drive   sysmon
-   (변화 추적)     (폴더 트리)   (스캔 스레드)   (탐지 스레드)   (휴지통 이동)    (드라이브) (RAM·CPU)
+   scan_history ── scan_model ── scan_job        cleanup_job ── cleanup_trash ── dev_cache   drive   sysmon
+   (변화 추적)     (폴더 트리)   (스캔 스레드)   (탐지 스레드)   (휴지통 이동)    (공용 캐시)  (드라이브) (RAM·CPU)
                                                                         │
                                                                     quarantine
                                                                     (격리 폴더)
@@ -35,7 +35,8 @@
 | `bytesieve_history` | 폴더별 용량 스냅숏 저장·읽기·비교 |
 | `bytesieve_export` | 스캔 결과 CSV·HTML 보고서 내보내기(임시 파일 → 바꿔치기, 64 KiB 버퍼로 나눠 쓰기) |
 | `bytesieve_cleanup_rules` / `bytesieve_cleanup` / `bytesieve_cleanup_job` | 정리 후보 규칙, 탐지 엔진, 탐지 스레드 |
-| `bytesieve_cleanup_trash` | 삭제 보호 판정, 직전 확인, 휴지통 이동(쓸 수 없으면 격리 폴더로) |
+| `bytesieve_cleanup_trash` | 삭제 보호 판정, 직전 확인, 휴지통 이동(쓸 수 없으면 격리 폴더로). 항목마다 탐지 경로를 따로 받는 작업도 지원 |
+| `bytesieve_dev_cache` | 공용 개발 캐시(npm·pip·Gradle·Cargo·NuGet) 위치 탐지(환경 변수·설정 파일·기본 위치, 캐시 구조 확인), 용량 세기, 작업 스레드 |
 | `bytesieve_quarantine` | 드라이브별 격리 폴더: 같은 볼륨 안 이동, 기록(원자적 쓰기), 목록·불일치 판정, 복원, 영구 삭제 |
 | `bytesieve_drive` / `bytesieve_sysmon` / `bytesieve_format` | 드라이브 조회, RAM·CPU 측정, 용량 표시 문자열 |
 | `bytesieve_cli` / `bytesieve_jsonl` | CLI 인자 해석·출력, JSON Lines 직렬화 |

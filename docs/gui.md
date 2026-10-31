@@ -5,7 +5,7 @@ build\Debug\bytesieve-gui.exe                          # 창을 열고 경로를
 build\Debug\bytesieve-gui.exe C:\Users\me\Projects     # 폴더를 지정하면 바로 스캔
 ```
 
-창은 다섯 탭으로 나뉩니다.
+창은 여섯 탭(폴더 스캔·드라이브·정리 후보·공용 캐시·격리 폴더·시스템)으로 나뉩니다.
 
 ## 폴더 스캔
 
@@ -57,6 +57,31 @@ build\Debug\bytesieve-gui.exe C:\Users\me\Projects     # 폴더를 지정하면 
    옮긴 항목은 Windows 휴지통 또는 **격리 폴더** 탭에서 복원할 수 있습니다.
 
 탐지 규칙과 보호 조건은 [cleanup.md](cleanup.md)를 참고하세요.
+
+## 공용 캐시
+
+프로젝트 안의 캐시([정리 후보] 탭)와 따로, 패키지 관리자·빌드 도구가 사용자 폴더에 하나씩 두고 여러 프로젝트가 함께 쓰는 캐시를 보여 줍니다.
+탭을 처음 열면 바로 탐지하며, [다시 탐지]로 새로 찾고 [취소]로 멈출 수 있습니다.
+
+| 도구 | 캐시 | 기본 위치 |
+|---|---|---|
+| npm | 패키지 캐시 | `%LOCALAPPDATA%\npm-cache` |
+| pip | 패키지 캐시 | `%LOCALAPPDATA%\pip\Cache` |
+| Gradle | 의존성·빌드 캐시 / 래퍼 배포판 | `%USERPROFILE%\.gradle\caches` / `\wrapper\dists` |
+| Cargo | 레지스트리 캐시 / git 의존성 | `%USERPROFILE%\.cargo\registry` / `\git` |
+| NuGet | 전역 패키지 / HTTP 캐시 | `%USERPROFILE%\.nuget\packages` / `%LOCALAPPDATA%\NuGet\v3-cache`(또는 `http-cache`) |
+
+- 위치는 사용자 환경에 맞춰 정합니다: 환경 변수(`npm_config_cache`, `PIP_CACHE_DIR`, `GRADLE_USER_HOME`, `CARGO_HOME`,
+  `NUGET_PACKAGES`, `NUGET_HTTP_CACHE_PATH`)와 설정 파일(`.npmrc`의 `cache=`, `pip.ini`의 `cache-dir`, `NuGet.Config`의
+  `globalPackagesFolder`)을 먼저 보고, 없으면 기본 위치를 씁니다. **위치 근거** 열에 어디서 정했는지 표시합니다.
+- 열: 용량, 도구, 캐시, 경로, 파일 수, 정리(가능 여부·결과), 위치 근거, 주의 사항. 기본은 **용량 내림차순**이며 머리글을 누르면 그 열로
+  정렬합니다(다시 누르면 반대 방향). 행을 고르면 아래 칸에 그 캐시를 정리하면 어떻게 되는지와 주의 사항이 나옵니다.
+- **정리** 열: `정리 가능`, `정리 가능 · 주의`(정리 뒤 인터넷 없이는 빌드할 수 없는 Gradle 래퍼 배포판·NuGet 전역 패키지),
+  또는 정리하지 않는 이유(`없음`, `링크라 정리하지 않음`, `캐시 구조가 아니라 정리하지 않음`, `정리 불가: 일부를 읽지 못함`, `보호: …`).
+- 체크한 캐시는 **[휴지통으로 이동...]** → 확인 창(캐시마다 용량·경로·주의 사항, 기본 버튼 [아니요])을 거쳐 [정리 후보] 탭과 같은 안전 장치로
+  휴지통(없으면 격리 폴더)으로 옮깁니다. 영구 삭제하지 않습니다. 해당 도구가 실행 중이면 사용 중 오류로 실패할 수 있으니 끝낸 뒤 정리하세요.
+
+보호 조건은 [cleanup.md](cleanup.md#공용-개발-캐시)를 참고하세요.
 
 ## 격리 폴더
 

@@ -4,13 +4,13 @@
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-CTest에 등록된 테스트는 51개입니다.
+CTest에 등록된 테스트는 53개입니다.
 
 | 분류 | 테스트 | 확인 내용 |
 |---|---|---|
-| 단위 테스트(16개) | `path`, `scanner`, `scan_alloc`, `scan_model`, `scan_history`, `export`, `scan_job`, `jsonl`, `cli`, `drive`, `sysmon`, `size_format`, `cleanup_rules`, `cleanup_scan`, `cleanup_trash`, `quarantine` | 아래 참고 |
+| 단위 테스트(17개) | `path`, `scanner`, `scan_alloc`, `scan_model`, `scan_history`, `export`, `scan_job`, `jsonl`, `cli`, `drive`, `sysmon`, `size_format`, `cleanup_rules`, `cleanup_scan`, `cleanup_trash`, `dev_cache`, `quarantine` | 아래 참고 |
 | CLI 검사(24개) | `no_args`, `help`, `scan_*`, `cli_*` | 종료 코드, 텍스트·JSONL 출력, 인자 오류, 접근 거부 픽스처, `--track` 기준 → 변경 → 비교(`cli_track`) |
-| GUI 자체 검사(11개) | `gui_scan`, `gui_cancel`, `gui_missing_dir`, `gui_drives`, `gui_cleanup`, `gui_cleanup_cancel`, `gui_trash`, `gui_quarantine`, `gui_history`, `gui_export`, `gui_monitor` | 숨긴 창에서 실제 작업을 실행하고 화면 상태를 검증 |
+| GUI 자체 검사(11개) | `gui_scan`, `gui_cancel`, `gui_missing_dir`, `gui_drives`, `gui_cleanup`, `gui_cleanup_cancel`, `gui_trash`, `gui_quarantine`, `gui_history`, `gui_export`, `gui_cache`, `gui_monitor` | 숨긴 창에서 실제 작업을 실행하고 화면 상태를 검증 |
 
 ## 주요 단위 테스트 범위
 
@@ -22,6 +22,10 @@ CTest에 등록된 테스트는 51개입니다.
   HTML(구역, 이름 이스케이프, 순위 표 100행 제한, 통계), 실패(없는 폴더, 빈·실패한 스캔, 다른 프로그램이 연 파일에서 기존 내용 보존·임시 파일 없음)
 - `cleanup_scan`·`cleanup_rules`: 중첩 항목, 확인됨/추정, 개발 환경 분류, 표시 파일이 없는 `bin`·`.gradle`, 보호 경로, 필터, 취소
 - `cleanup_trash`: 보호 판정 규칙과 **실제 휴지통 이동·거부**(테스트가 넣은 휴지통 항목만 지워 사용자 휴지통은 그대로 둠)
+- `dev_cache`: `USERPROFILE`·`LOCALAPPDATA`·`APPDATA`를 임시 픽스처로 돌리고 도구 환경 변수를 지워 실제 캐시를 보지 않는다.
+  기본 위치(없음·있음, NuGet `v3-cache`·`http-cache` 둘 다), 용량·파일 수, 도구 폴더 자체·`.cargo\bin`·`gradle.properties` 제외,
+  환경 변수·`.npmrc`(`${VAR}`)·`pip.ini`(구역·상대 경로)·`NuGet.Config`(상대 경로), 캐시 구조가 아닌 폴더·파일·정션·바꾸지 못한 변수,
+  세기 전·취소 뒤 정리 거부, 중요 경로 거부, 항목별 탐지 경로로 판정하는 휴지통 작업(밖·없음), 작업 스레드·취소
 - `quarantine`: 임시 폴더를 가짜 볼륨으로 써서 격리 이동·목록, 같은 이름 여러 번 격리, 이동 실패(사용 중·없음·다른 볼륨)
   뒤 원래 항목 보존, 격리 폴더가 정션일 때 거부, 복원(같은 이름은 덮어쓰지 않음, 다른 이름 복원, 없어진 상위 폴더,
   드라이브 문자 변경), 기록 불일치(파일 없음·기록 손상·`moving` 상태·볼륨 밖 상대 경로·사용자가 넣은 파일)에서 파일 보존,
@@ -46,8 +50,14 @@ build\Debug\bytesieve-gui.exe --self-test-trash C:\some\dir     # 주의: 옮길
 $env:BYTESIEVE_QUARANTINE_ROOT = "C:\some\dir"                # 이 폴더 안을 휴지통 없는 드라이브로 다룸
 build\Debug\bytesieve-gui.exe --self-test-quarantine C:\some\dir C:\some\dir\app\server.log
                                                                  # 주의: 격리 → 복원 → 남은 항목 영구 삭제
+$env:USERPROFILE = "C:\fx\home"; $env:LOCALAPPDATA = "C:\fx\local"; $env:APPDATA = "C:\fx\roaming"
+build\Debug\bytesieve-gui.exe --self-test-cache C:\fx             # 주의: 찾은 캐시를 확인 창 없이 휴지통으로
 build\Debug\bytesieve-gui.exe --self-test-monitor
 ```
+
+`--self-test-cache`는 찾은 캐시가 **하나라도** 지정한 폴더 밖이면(실제 사용자 캐시를 볼 수 있으므로) 아무것도 옮기지 않고 실패합니다.
+사용자 폴더 환경 변수를 테스트 폴더로 돌리고 `npm_config_cache`·`PIP_CACHE_DIR`·`GRADLE_USER_HOME`·`CARGO_HOME`·`NUGET_PACKAGES` 등을 지운 뒤
+실행하세요(`gui_cache`가 그렇게 합니다).
 
 `--self-test-trash`는 확인 창 없이 실제로 휴지통으로 옮기므로 테스트용 폴더에만 쓰세요. `--self-test-quarantine`도 확인 창 없이
 옮기고 영구 삭제하므로 테스트용 폴더에만 쓰세요(격리 폴더 탭은 이 폴더만 보여 주어 사용자의 실제 격리 항목은 건드리지 않습니다).
