@@ -51,7 +51,9 @@ enum {
     IDC_MONITOR,
     IDC_VIEW,
     IDC_ANALYSIS,
-    IDC_QUARANTINE
+    IDC_QUARANTINE,
+    IDC_AUTOSAVE,
+    IDC_CLEAR_HISTORY
 };
 
 /* 탭 순서. */
@@ -69,7 +71,9 @@ typedef enum {
     HIST_BASELINE,   /* 직전 스냅숏이 없어 이번 스캔을 기준으로 저장했다 */
     HIST_COMPARED,   /* 직전 스냅숏과 비교했고 새 스냅숏을 저장했다 */
     HIST_CANCELLED,  /* 취소되어 저장하지 않았다(직전과 비교만 했을 수 있음) */
-    HIST_FAILED      /* 기록 위치를 정하지 못했거나 저장하지 못했다 */
+    HIST_FAILED,     /* 기록 위치를 정하지 못했거나 저장하지 못했다 */
+    HIST_DISABLED,   /* 자동 저장이 꺼져 있어 저장하지 않았다(직전과 비교만 했을 수 있음) */
+    HIST_CLEARED     /* 스캔 뒤 [기록 삭제]로 이 대상의 기록을 지웠다(변화 표시도 지움) */
 } HistoryState;
 
 typedef enum {
@@ -83,12 +87,15 @@ typedef enum {
     SELF_TEST_MONITOR, /* 시스템 탭 측정 몇 회 → 화면·갱신 간격·실패 표시 검증 → 종료 */
     SELF_TEST_QUARANTINE, /* 정리(격리 폴더로) → 격리 폴더 탭 → 복원(같은 이름 1개는 건너뜀) →
                            * 남은 항목 영구 삭제 → 각 단계 화면 검증 → 종료 */
-    SELF_TEST_CHANGES  /* 스캔 → 직전 스냅숏과 비교한 변화 보기 검증·출력 → 종료 */
+    SELF_TEST_CHANGES,  /* 스캔 → 직전 스냅숏과 비교한 변화 보기 검증·출력 → 종료 */
+    SELF_TEST_NO_AUTOSAVE, /* 처음 설정 출력 → 자동 저장 끔 → 스캔 → 저장하지 않았는지 검증 → 종료 */
+    SELF_TEST_CLEAR_HISTORY /* 스캔 → 기록 삭제(확인 창 없이) → 화면 반영 검증·출력 → 종료 */
 } SelfTest;
 
 typedef struct {
     HWND hwnd;
     HWND path, browse, scan, cancel, progress, status, tree, list, view, analysis;
+    HWND autosave, clear_history;
     HWND tabs, drives, cleanup, quarantine, monitor;
     HFONT font;
     int dpi;
@@ -104,6 +111,8 @@ typedef struct {
     HistoryDiff diff;        /* history 가 COMPARED(또는 비교 뒤 CANCELLED)일 때 */
     int has_diff;
     size_t *change_of_node;  /* 노드 → diff 항목 번호(없으면 SCAN_NODE_NONE) */
+    int autosave_on;         /* 스캔 기록 자동 저장(설정 파일에 저장된 값과 같게 유지) */
+    HistoryClearResult cleared; /* 마지막 [기록 삭제] 결과 */
 
     SelfTest self_test;
     int self_test_exit;
@@ -151,7 +160,8 @@ static void layout(void)
 {
     RECT rc;
     int m = scale(8), h = scale(24), bw = scale(84), gap = scale(6), view_w = scale(170);
-    int x, w, y, path_w, body_h, tree_w;
+    int check_w = scale(150);
+    int x, w, y, path_w, bar_w, body_h, tree_w;
 
     /* 탭 컨트롤이 창 전체를 차지하고, 각 탭의 컨트롤은 탭의 표시 영역 안에 놓는다. */
     GetClientRect(g_app.hwnd, &rc);
@@ -178,9 +188,16 @@ static void layout(void)
     /* 콤보 상자 높이는 펼친 목록 높이까지 포함한다. */
     MoveWindow(g_app.view, x + m + path_w + gap + 3 * (bw + gap), y, view_w, scale(120), TRUE);
 
+    /* 진행 막대 오른쪽에 기록 설정: [v] 스캔 기록 자동 저장  [기록 삭제...] */
     y += h + gap;
-    MoveWindow(g_app.progress, x + m, y, w - 2 * m, scale(16), TRUE);
-    y += scale(16) + gap;
+    bar_w = w - 2 * m - check_w - bw - 2 * gap;
+    if (bar_w < scale(40)) {
+        bar_w = scale(40);
+    }
+    MoveWindow(g_app.progress, x + m, y + (h - scale(16)) / 2, bar_w, scale(16), TRUE);
+    MoveWindow(g_app.autosave, x + m + bar_w + gap, y, check_w, h, TRUE);
+    MoveWindow(g_app.clear_history, x + m + bar_w + gap + check_w + gap, y, bw, h, TRUE);
+    y += h + gap;
     MoveWindow(g_app.status, x + m, y, w - 2 * m, scale(20), TRUE);
     y += scale(20);
     MoveWindow(g_app.analysis, x + m, y, w - 2 * m, scale(20), TRUE);
@@ -219,7 +236,7 @@ static void show_tab(int tab)
 {
     HWND scan_controls[] = {g_app.path,   g_app.browse, g_app.scan,     g_app.cancel,
                             g_app.view,   g_app.progress, g_app.status, g_app.analysis,
-                            g_app.tree,   g_app.list};
+                            g_app.tree,   g_app.list,     g_app.autosave, g_app.clear_history};
     int show_scan = tab == TAB_SCAN;
     size_t i;
 
@@ -538,6 +555,13 @@ static void update_analysis(void)
         APPEND(L"%ls변화 기록을 저장하지 못했습니다(오류 %lu)", g_app.has_diff ? L" · " : L"",
                g_app.history_error);
         break;
+    case HIST_DISABLED:
+        APPEND(L"%ls자동 저장이 꺼져 있어 이번 스캔은 기록하지 않았습니다",
+               g_app.has_diff ? L" · " : L"");
+        break;
+    case HIST_CLEARED:
+        APPEND(L"저장된 스캔 기록을 삭제했습니다(직전 스캔과 비교한 변화 표시도 지움)");
+        break;
     default:
         break;
     }
@@ -546,7 +570,7 @@ static void update_analysis(void)
 }
 
 /*
- * 직전 스냅숏과 비교하고, 취소되지 않았으면 새 스냅숏을 저장한다.
+ * 직전 스냅숏과 비교하고, 취소되지 않았고 자동 저장이 켜져 있으면 새 스냅숏을 저장한다.
  * 기록 위치: BYTESIEVE_HISTORY_DIR 또는 %LOCALAPPDATA%\ByteSieve\history.
  */
 static void track_history(void)
@@ -590,6 +614,8 @@ static void track_history(void)
     }
     if (g_app.model.report.cancelled) {
         g_app.history = HIST_CANCELLED;
+    } else if (!g_app.autosave_on) {
+        g_app.history = HIST_DISABLED;
     } else if (history_ensure_dir(dir) != 0 ||
                history_save(&cur, file, &g_app.history_error) != 0) {
         g_app.history = HIST_FAILED;
@@ -678,17 +704,132 @@ static void reveal_in_tree(size_t index)
 
 /* ---- 스캔 ---- */
 
+/* [기록 삭제]는 스캔 중이 아니고 저장된 기록이 있을 때만 누를 수 있다. */
+static void update_clear_button(void)
+{
+    wchar_t dir[MAX_PATH * 2];
+    size_t count = 0;
+
+    if (g_app.job == NULL && history_default_dir(dir, sizeof(dir) / sizeof(dir[0])) == 0) {
+        count = history_count(dir);
+    }
+    EnableWindow(g_app.clear_history, count > 0);
+}
+
 static void set_scanning(int scanning)
 {
     EnableWindow(g_app.scan, !scanning);
     EnableWindow(g_app.browse, !scanning);
     EnableWindow(g_app.path, !scanning);
     EnableWindow(g_app.cancel, scanning);
+    update_clear_button();
 }
 
 static void set_status(const wchar_t *text)
 {
     SetWindowTextW(g_app.status, text);
+}
+
+/* ---- 기록 설정 ---- */
+
+/*
+ * 자동 저장 설정을 바꾸고 기록 폴더의 설정 파일에 저장한다(다음 실행에도 유지).
+ * 저장하지 못하면 체크 상태를 이전 값으로 되돌리고 상태 줄에 알린다. 성공하면 1.
+ */
+static int apply_autosave(int on)
+{
+    wchar_t dir[MAX_PATH * 2], text[256];
+    unsigned long error = ERROR_PATH_NOT_FOUND;
+
+    on = on != 0;
+    if (history_default_dir(dir, sizeof(dir) / sizeof(dir[0])) == 0 &&
+        history_set_autosave(dir, on, &error) == 0) {
+        g_app.autosave_on = on;
+        SendMessageW(g_app.autosave, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+        set_status(on ? L"스캔 기록 자동 저장을 켰습니다. 다음 스캔부터 결과를 기록합니다."
+                      : L"스캔 기록 자동 저장을 껐습니다. 이후 스캔 결과는 저장하지 않습니다"
+                        L"(이미 저장된 기록은 그대로 둡니다).");
+        return 1;
+    }
+    SendMessageW(g_app.autosave, BM_SETCHECK, g_app.autosave_on ? BST_CHECKED : BST_UNCHECKED, 0);
+    swprintf(text, 256, L"자동 저장 설정을 저장하지 못했습니다(오류 %lu). 설정은 바뀌지 않았습니다.",
+             error);
+    set_status(text);
+    return 0;
+}
+
+/*
+ * 저장된 스캔 기록을 모두 삭제한다. confirm 이 1 이면 개수·위치·되돌릴 수 없다는 안내로 먼저
+ * 확인한다. 지금 보이는 변화가 지운 기록과 비교한 것이면 변화 열·변화 순위·분석 줄에서 지운다.
+ * 일부 파일을 지우지 못해도 나머지는 지우고 결과를 상태 줄에 쓴다.
+ * 삭제를 실행했으면 1, 기록이 없거나 스캔 중이거나 취소했으면 0.
+ */
+static int clear_history(int confirm)
+{
+    wchar_t dir[MAX_PATH * 2], text[MAX_PATH * 2 + 512], *file;
+    size_t count;
+    int rc;
+
+    if (g_app.job != NULL) {
+        return 0;
+    }
+    if (history_default_dir(dir, sizeof(dir) / sizeof(dir[0])) != 0) {
+        set_status(L"기록 폴더를 정하지 못해 기록을 삭제할 수 없습니다.");
+        return 0;
+    }
+    count = history_count(dir);
+    if (count == 0) {
+        set_status(L"삭제할 스캔 기록이 없습니다.");
+        update_clear_button();
+        return 0;
+    }
+    if (confirm) {
+        swprintf(text, sizeof(text) / sizeof(text[0]),
+                 L"저장된 스캔 기록 %u개를 삭제할까요?\n\n기록 폴더: %ls\n\n"
+                 L"삭제하면 직전 스캔과 비교한 변화를 더 볼 수 없고, 다음 스캔은 새 기준이 됩니다. "
+                 L"같은 폴더를 쓰는 CLI --track 기록도 함께 삭제됩니다.\n"
+                 L"스캔한 폴더와 파일은 건드리지 않으며, 자동 저장 설정은 그대로 둡니다.\n\n"
+                 L"삭제한 기록은 되돌릴 수 없습니다.",
+                 (unsigned)count, dir);
+        if (MessageBoxW(g_app.hwnd, text, L"스캔 기록 삭제",
+                        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+            set_status(L"기록 삭제를 취소했습니다. 아무것도 바뀌지 않았습니다.");
+            return 0;
+        }
+    }
+
+    rc = history_clear(dir, &g_app.cleared);
+    /* 지금 대상의 기록이 사라졌으면 그 기록과 비교한 변화 표시도 지운다. */
+    if (g_app.has_model && g_app.model.len > 0 &&
+        (file = history_file_for(dir, g_app.model.nodes[0].name)) != NULL) {
+        if (GetFileAttributesW(file) == INVALID_FILE_ATTRIBUTES) {
+            history_diff_free(&g_app.diff);
+            g_app.has_diff = 0;
+            free(g_app.change_of_node);
+            g_app.change_of_node = NULL;
+            g_app.history = HIST_CLEARED;
+        }
+        free(file);
+    }
+    if (rc == 0) {
+        swprintf(text, sizeof(text) / sizeof(text[0]), L"스캔 기록 %u개를 삭제했습니다.",
+                 (unsigned)g_app.cleared.removed);
+    } else if (g_app.cleared.failed == 0) {
+        swprintf(text, sizeof(text) / sizeof(text[0]),
+                 L"기록 폴더를 읽지 못해 기록을 삭제하지 못했습니다(오류 %lu).",
+                 g_app.cleared.error);
+    } else {
+        swprintf(text, sizeof(text) / sizeof(text[0]),
+                 L"스캔 기록 %u개를 삭제했고 %u개는 삭제하지 못했습니다(오류 %lu: 사용 중이거나 "
+                 L"권한이 없을 수 있음). 다시 시도하세요.",
+                 (unsigned)g_app.cleared.removed, (unsigned)g_app.cleared.failed,
+                 g_app.cleared.error);
+    }
+    set_status(text);
+    update_analysis();
+    fill_rank();
+    update_clear_button();
+    return 1;
 }
 
 /* 스캔 스레드에서 호출된다. 창이 이미 없으면 PostMessage 가 실패할 뿐이다. */
@@ -816,6 +957,7 @@ static void finish_scan(void)
     set_status(text);
     set_scanning(0);
     track_history();
+    update_clear_button();
     update_analysis();
     show_results();
 }
@@ -932,6 +1074,64 @@ static void print_changes(void)
     fflush(stdout);
 }
 
+/*
+ * SELF_TEST_NO_AUTOSAVE: 자동 저장을 끈 채 스캔했으니 저장하지 않았고 설정이 파일에 남았는지.
+ * SELF_TEST_CLEAR_HISTORY: 직전 스냅숏과 비교한 뒤 기록을 삭제(확인 창 없이)하면 기록 파일이
+ * 없어지고 변화 열·변화 순위·분석 줄·[기록 삭제] 버튼에 반영되는지. 지운 개수를 stdout 에 쓴다.
+ * 실패 수.
+ */
+static int verify_history_settings(void)
+{
+    int failures = 0, rows;
+    wchar_t dir[MAX_PATH * 2], text[512], cell[96];
+    size_t before;
+
+    SELF_CHECK(g_app.model.report.cancelled == 0);
+    SELF_CHECK(g_app.model.status != SCAN_FATAL);
+    SELF_CHECK(history_default_dir(dir, sizeof(dir) / sizeof(dir[0])) == 0);
+    SELF_CHECK(history_autosave_enabled(dir) == g_app.autosave_on);
+    SELF_CHECK((SendMessageW(g_app.autosave, BM_GETCHECK, 0, 0) == BST_CHECKED) ==
+               (g_app.autosave_on != 0));
+    if (g_app.self_test == SELF_TEST_NO_AUTOSAVE) {
+        SELF_CHECK(!g_app.autosave_on);
+        SELF_CHECK(g_app.history == HIST_DISABLED);
+        GetWindowTextW(g_app.analysis, text, 512);
+        SELF_CHECK(wcsstr(text, L"자동 저장이 꺼져") != NULL);
+        return failures;
+    }
+
+    /* 기록 삭제 */
+    SELF_CHECK(g_app.has_diff);
+    before = history_count(dir);
+    SELF_CHECK(before > 0 && IsWindowEnabled(g_app.clear_history));
+    SELF_CHECK(clear_history(0) == 1);
+    SELF_CHECK(g_app.cleared.failed == 0 && g_app.cleared.removed == before);
+    SELF_CHECK(history_count(dir) == 0);
+    SELF_CHECK(history_autosave_enabled(dir) == g_app.autosave_on);
+    SELF_CHECK(!g_app.has_diff && g_app.change_of_node == NULL);
+    SELF_CHECK(g_app.history == HIST_CLEARED);
+    SELF_CHECK(!IsWindowEnabled(g_app.clear_history));
+    GetWindowTextW(g_app.analysis, text, 512);
+    SELF_CHECK(wcsstr(text, L"기록을 삭제했습니다") != NULL && wcsstr(text, L"직전 스캔(") == NULL);
+    GetWindowTextW(g_app.status, text, 512);
+    SELF_CHECK(wcsstr(text, L"삭제했습니다") != NULL);
+    rows = ListView_GetItemCount(g_app.list);
+    if (rows > 0) {
+        ListView_GetItemText(g_app.list, 0, COL_CHANGE, cell, 96);
+        SELF_CHECK(cell[0] == L'\0');
+    }
+    SendMessageW(g_app.view, CB_SETCURSEL, VIEW_CHANGE, 0);
+    fill_rank();
+    SELF_CHECK(ListView_GetItemCount(g_app.list) == 0);
+    SendMessageW(g_app.view, CB_SETCURSEL, VIEW_SIZE, 0);
+    fill_rank();
+    /* 더 지울 것이 없으면 아무것도 하지 않는다. */
+    SELF_CHECK(clear_history(0) == 0);
+    wprintf(L"cleared: %u\n", (unsigned)g_app.cleared.removed);
+    fflush(stdout);
+    return failures;
+}
+
 /* 스캔이 끝난 뒤 화면 상태가 모델과 맞는지 확인하고 종료 코드를 정한다. */
 static int verify_screen(void)
 {
@@ -1006,6 +1206,9 @@ static int verify_screen(void)
             SELF_CHECK(g_app.has_diff);
             print_changes();
         }
+    } else if (g_app.self_test == SELF_TEST_NO_AUTOSAVE ||
+               g_app.self_test == SELF_TEST_CLEAR_HISTORY) {
+        failures += verify_history_settings();
     } else if (g_app.model.report.cancelled) {
         SELF_CHECK(g_app.history == HIST_CANCELLED);
         size_t i;
@@ -1225,6 +1428,18 @@ static void create_controls(void)
         col.fmt = cols[i].fmt;
         SendMessageW(g_app.list, LVM_INSERTCOLUMNW, (WPARAM)i, (LPARAM)&col);
     }
+    g_app.autosave = make_child(L"BUTTON", L"스캔 기록 자동 저장", BS_AUTOCHECKBOX | WS_TABSTOP,
+                                0, IDC_AUTOSAVE);
+    g_app.clear_history = make_child(L"BUTTON", L"기록 삭제...", BS_PUSHBUTTON | WS_TABSTOP, 0,
+                                     IDC_CLEAR_HISTORY);
+    {
+        /* 저장된 설정을 읽는다(없거나 읽을 수 없으면 켬). */
+        wchar_t dir[MAX_PATH * 2];
+        g_app.autosave_on = history_default_dir(dir, sizeof(dir) / sizeof(dir[0])) != 0 ||
+                            history_autosave_enabled(dir);
+        SendMessageW(g_app.autosave, BM_SETCHECK,
+                     g_app.autosave_on ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
     set_scanning(0);
 
     g_app.drives = drive_panel_create(g_app.hwnd, IDC_DRIVES, g_app.font, g_app.dpi);
@@ -1302,6 +1517,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (HIWORD(wp) == CBN_SELCHANGE) {
                 fill_rank();
             }
+            return 0;
+        case IDC_AUTOSAVE:
+            /* BS_AUTOCHECKBOX 가 이미 체크 상태를 바꿨다. 저장에 실패하면 되돌린다. */
+            if (HIWORD(wp) == BN_CLICKED) {
+                apply_autosave(SendMessageW(g_app.autosave, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            }
+            return 0;
+        case IDC_CLEAR_HISTORY:
+            clear_history(1);
             return 0;
         case IDC_DRIVES:
             if (HIWORD(wp) == DPN_REFRESHED && g_app.self_test == SELF_TEST_DRIVES) {
@@ -1418,6 +1642,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  *   bytesieve-gui --self-test-monitor     시스템 탭에서 RAM·CPU 를 몇 번 측정한 뒤 화면을 검증하고 종료
  *   bytesieve-gui --self-test-changes <dir> 스캔 후 직전 스냅숏과 비교한 변화 보기를 검증하고
  *                                          변화 목록을 stdout 에 쓴 뒤 종료(직전 스냅숏 필요)
+ *   bytesieve-gui --self-test-no-autosave <dir>
+ *                                         처음 읽은 자동 저장 설정을 stdout 에 쓰고 끈 뒤 스캔해
+ *                                         기록하지 않았는지 검증하고 종료
+ *   bytesieve-gui --self-test-clear-history <dir>
+ *                                         스캔(직전 스냅숏 필요) 후 기록을 삭제(확인 창 없음)하고
+ *                                         화면 반영을 검증한 뒤 지운 개수를 stdout 에 쓰고 종료
  */
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
@@ -1439,6 +1669,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         target = argv[2];
     } else if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test-changes") == 0) {
         g_app.self_test = SELF_TEST_CHANGES;
+        target = argv[2];
+    } else if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test-no-autosave") == 0) {
+        g_app.self_test = SELF_TEST_NO_AUTOSAVE;
+        target = argv[2];
+    } else if (argv != NULL && argc >= 3 &&
+               wcscmp(argv[1], L"--self-test-clear-history") == 0) {
+        g_app.self_test = SELF_TEST_CLEAR_HISTORY;
         target = argv[2];
     } else if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test-cancel") == 0) {
         g_app.self_test = SELF_TEST_CANCEL;
@@ -1511,6 +1748,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     ShowWindow(g_app.hwnd, g_app.self_test != SELF_TEST_NONE ? SW_HIDE : show);
     UpdateWindow(g_app.hwnd);
 
+    if (g_app.self_test == SELF_TEST_NO_AUTOSAVE) {
+        /* 처음 읽은 설정을 알려(재실행 뒤 유지 확인용) 자동 저장을 끈 다음 스캔한다.
+         * 체크박스를 누른 것과 같은 경로(apply_autosave)를 탄다. */
+        wprintf(L"autosave: %d\n", g_app.autosave_on);
+        fflush(stdout);
+        if (g_app.autosave_on) {
+            SendMessageW(g_app.autosave, BM_SETCHECK, BST_UNCHECKED, 0);
+            if (!apply_autosave(0)) {
+                fwprintf(stderr, L"self-test failed: could not turn off autosave\n");
+                target = NULL;
+                g_app.self_test_exit = 1;
+                DestroyWindow(g_app.hwnd);
+            }
+        }
+    }
     if (target != NULL) {
         SetWindowTextW(g_app.path, target);
         start_scan();
