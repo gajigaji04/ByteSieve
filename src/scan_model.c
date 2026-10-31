@@ -140,6 +140,9 @@ static void fill_progress(const BuildCtx *b, ScanProgress *p)
     p->bytes = r->total_bytes;
     p->errors = r->error_count;
     p->dirs_scanned = b->dirs_scanned;
+    p->precise = (b->model->options & SCAN_OPT_HARDLINKS) != 0;
+    p->dup_files = r->hardlink_dup_files;
+    p->dup_bytes = r->hardlink_dup_bytes;
 }
 
 static uintptr_t on_entry(const ScanEntry *entry, uintptr_t parent_id,
@@ -160,6 +163,11 @@ static uintptr_t on_entry(const ScanEntry *entry, uintptr_t parent_id,
         m->nodes[parent].own_files++;
         m->nodes[parent].own_bytes += entry->size;
         m->nodes[parent].own_alloc += entry->alloc_size;
+        if (entry->hardlink_dup) {
+            m->nodes[parent].own_dup_files++;
+            m->nodes[parent].own_dup_bytes += entry->size;
+            m->nodes[parent].own_dup_alloc += entry->alloc_size;
+        }
         return 0;
     }
 
@@ -239,6 +247,9 @@ static void finalize(ScanModel *m)
         n->total_bytes = n->own_bytes;
         n->total_alloc = n->own_alloc;
         n->total_dirs = 0;
+        n->total_dup_files = n->own_dup_files;
+        n->total_dup_bytes = n->own_dup_bytes;
+        n->total_dup_alloc = n->own_dup_alloc;
     }
 
     /* 자식은 항상 부모보다 인덱스가 크므로 뒤에서부터 부모로 더하면 된다. */
@@ -249,6 +260,9 @@ static void finalize(ScanModel *m)
         p->total_bytes += n->total_bytes;
         p->total_alloc += n->total_alloc;
         p->total_dirs += n->total_dirs + 1;
+        p->total_dup_files += n->total_dup_files;
+        p->total_dup_bytes += n->total_dup_bytes;
+        p->total_dup_alloc += n->total_dup_alloc;
     }
 }
 
@@ -262,6 +276,13 @@ ScanStatus scan_model_build_ex(ScanModel *model, const wchar_t *root, uint32_t m
                                scan_progress_fn progress, scan_cancel_fn cancel,
                                void *ctx)
 {
+    return scan_model_build_opts(model, root, max_depth, 0, progress, cancel, ctx);
+}
+
+ScanStatus scan_model_build_opts(ScanModel *model, const wchar_t *root, uint32_t max_depth,
+                                 unsigned options, scan_progress_fn progress,
+                                 scan_cancel_fn cancel, void *ctx)
+{
     ScanHooks hooks = {on_entry, on_dir_begin, on_dir_end, NULL, should_skip_dir};
     BuildCtx b;
     size_t root_index = SCAN_NODE_NONE;
@@ -269,6 +290,7 @@ ScanStatus scan_model_build_ex(ScanModel *model, const wchar_t *root, uint32_t m
 
     scan_model_free(model);
     model->max_depth = max_depth;
+    model->options = options;
 
     full = root != NULL && root[0] != L'\0' ? path_full(root) : NULL;
     if (full != NULL) {
@@ -286,9 +308,9 @@ ScanStatus scan_model_build_ex(ScanModel *model, const wchar_t *root, uint32_t m
         hooks.should_cancel = should_cancel;
     }
     b.dirs_scanned = 0;
-    model->status = scan_tree_ex(root, max_depth,
-                                 root_index == SCAN_NODE_NONE ? 0 : ID_OF(root_index),
-                                 &model->report, &hooks, &b);
+    model->status = scan_tree_opts(root, max_depth,
+                                   root_index == SCAN_NODE_NONE ? 0 : ID_OF(root_index),
+                                   &model->report, &hooks, &b, options);
     finalize(model);
 
     if (progress != NULL) {
@@ -452,9 +474,23 @@ size_t scan_model_rank(const ScanModel *model, ScanRankKey key, size_t *out, siz
     }
     for (i = 0; i < count; i++) {
         const ScanNode *node = &model->nodes[i + 1];
-        items[i].key = key == SCAN_RANK_OWN_BYTES     ? node->own_bytes
-                       : key == SCAN_RANK_TOTAL_ALLOC ? node->total_alloc
-                                                      : node->total_bytes;
+        switch (key) {
+        case SCAN_RANK_OWN_BYTES:
+            items[i].key = node->own_bytes;
+            break;
+        case SCAN_RANK_TOTAL_ALLOC:
+            items[i].key = node->total_alloc;
+            break;
+        case SCAN_RANK_TOTAL_UNIQUE:
+            items[i].key = node->total_bytes - node->total_dup_bytes;
+            break;
+        case SCAN_RANK_TOTAL_DUP:
+            items[i].key = node->total_dup_bytes;
+            break;
+        default:
+            items[i].key = node->total_bytes;
+            break;
+        }
         items[i].index = i + 1;
     }
     qsort(items, count, sizeof(*items), cmp_rank);

@@ -242,6 +242,13 @@ target_link_libraries(test_scan_history PRIVATE bytesieve_history)
 bytesieve_configure(test_scan_history)
 add_test(NAME scan_history COMMAND test_scan_history)
 
+# 정밀 스캔(하드 링크 중복 보정): 실제 하드 링크 픽스처로 기본 합계 유지, 중복 경로·용량·할당,
+# 작업 스레드 1개·8개의 같은 결과, 모델의 폴더별 중복·순위·진행률을 확인한다.
+add_executable(test_hardlink tests/test_hardlink.c)
+target_link_libraries(test_hardlink PRIVATE bytesieve_model)
+bytesieve_configure(test_hardlink)
+add_test(NAME hardlink COMMAND test_hardlink)
+
 add_executable(test_export tests/test_export.c)
 target_link_libraries(test_export PRIVATE bytesieve_export)
 bytesieve_configure(test_export)
@@ -327,6 +334,12 @@ add_test(NAME gui_history
                  -DFIXTURE=${CMAKE_CURRENT_BINARY_DIR}/gui_history_fixture
                  -DHIST=${CMAKE_CURRENT_BINARY_DIR}/gui_history_check
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/gui_history_check.cmake)
+# 폴더 스캔 탭 정밀 스캔: 하드 링크 픽스처를 정밀 스캔(보정 열·보기·분석 줄) → 기본 스캔(열 숨김) 확인.
+add_test(NAME gui_precise
+         COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bytesieve-gui>
+                 -DFIXTURE=${CMAKE_CURRENT_BINARY_DIR}/gui_precise_fixture
+                 -DHIST=${CMAKE_CURRENT_BINARY_DIR}/gui_precise_history
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/gui_precise_check.cmake)
 # 폴더 스캔 탭 내보내기: 스캔 → CSV·HTML 보고서 저장(대화 상자 없이) → 파일 내용 확인.
 add_test(NAME gui_export
          COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:bytesieve-gui>
@@ -344,7 +357,7 @@ add_test(NAME gui_cache
 add_test(NAME gui_monitor COMMAND bytesieve-gui --self-test-monitor)
 set_tests_properties(gui_scan gui_cancel gui_missing_dir gui_drives gui_cleanup
                      gui_cleanup_cancel gui_trash gui_quarantine gui_monitor gui_history
-                     gui_export gui_cache PROPERTIES TIMEOUT 120)
+                     gui_export gui_cache gui_precise PROPERTIES TIMEOUT 120)
 # 폴더 스캔 자체 검사가 사용자 기록 폴더(%LOCALAPPDATA%)에 스냅숏을 쓰지 않게 한다.
 set_tests_properties(gui_scan gui_cancel gui_missing_dir PROPERTIES
                      ENVIRONMENT "BYTESIEVE_HISTORY_DIR=${CMAKE_CURRENT_BINARY_DIR}/gui_test_history")

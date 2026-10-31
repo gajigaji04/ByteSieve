@@ -697,6 +697,18 @@ int export_html(const ScanModel *model, const ExportInfo *info, const wchar_t *f
     if (r->cluster_bytes > 0) {
         w_kv_size(&w, L"클러스터 크기", r->cluster_bytes);
     }
+    /* 정밀 스캔: 위 값은 경로마다 센 기본 집계이고, 하드 링크로 중복 집계된 몫을 따로 보인다. */
+    if (r->hardlinks_checked && r->hardlinks_unsupported) {
+        w_kv_text(&w, L"정밀 스캔(하드 링크)", L"하드 링크가 없는 파일 시스템이라 보정할 것이 없음");
+    } else if (r->hardlinks_checked) {
+        w_kv_count(&w, L"하드 링크 중복 경로", r->hardlink_dup_files);
+        w_kv_size(&w, L"하드 링크 중복 용량(-)", r->hardlink_dup_bytes);
+        w_kv_size(&w, L"중복 제외 용량(정밀)", r->total_bytes - r->hardlink_dup_bytes);
+        w_kv_size(&w, L"실제 디스크 사용(정밀)", r->alloc_bytes - r->hardlink_dup_alloc);
+        if (r->hardlink_unknown_files > 0) {
+            w_kv_count(&w, L"파일 ID를 몰라 경로마다 센 파일", r->hardlink_unknown_files);
+        }
+    }
     w_str(&w, "</table></div>\n");
 
     w_top_level(&w, model);

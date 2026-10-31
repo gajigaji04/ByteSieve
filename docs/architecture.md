@@ -71,6 +71,20 @@
 클라우드 자리표시자는 내려받기를 일으키지 않도록 건드리지 않습니다. 원인은 클라우드 전용 > 압축 > 스파스 > 기타 순으로 하나에만 넣으므로
 `디스크 사용 = 논리 크기 + 클러스터 낭비 - (압축 + 스파스 + 클라우드 + 기타)`가 항상 성립합니다.
 
+## 정밀 스캔(하드 링크 중복 보정)
+
+`scan_tree_opts(..., SCAN_OPT_HARDLINKS)`(모델은 `scan_model_build_opts`, 작업은 `scan_job_start_ex`)로 켭니다.
+
+- 열거 정보를 `FileFullDirectoryInfo` 대신 `FileIdExtdDirectoryInfo`(128비트 파일 ID)로 받고, 안 되면 `FileIdBothDirectoryInfo`(64비트),
+  그것도 안 되면 ID 없이 받습니다. 볼륨 일련번호는 폴더 핸들의 `FileIdInfo`로 구합니다. 파일을 열지 않으므로 추가 I/O가 거의 없습니다.
+- 파일 ID는 정밀 스캔일 때만 열거 기록(`EntryRec`)에 16바이트로 붙어, 기본 스캔의 메모리·속도는 그대로입니다.
+- 같은 실제 파일인지는 호출 스레드가 훅 순서대로 (볼륨, 파일 ID) 집합을 확인해 정하므로, 병렬 미리 열거와 상관없이 같은 경로가 "처음"이 됩니다.
+  처음이 아닌 경로는 `ScanEntry.hardlink_dup`로 알리고 `ScanReport.hardlink_dup_*`, `ScanNode.*_dup_*`에 따로 더합니다.
+  경로마다 센 기본 값(`total_bytes`·`alloc_bytes` 등)은 바꾸지 않으므로 기본 스캔과 정밀 스캔의 차이를 한 번의 정밀 스캔으로 보여 줄 수 있습니다.
+- 탐색 시작 볼륨이 `FILE_SUPPORTS_HARD_LINKS`가 아니면(FAT·exFAT) ID를 모으지 않습니다(FAT의 파일 ID는 믿을 수 없음). ID가 0이거나 없는 파일과,
+  집합을 늘릴 메모리가 없을 때의 파일은 `hardlink_unknown_files`로 세고 경로마다 셉니다.
+- 예: `C:\Windows`(파일 21만 개)는 경로마다 35.5 GB이지만 그중 5만 7천여 경로·10.9 GB가 하드 링크 중복이라 중복 제외 용량은 24.6 GB입니다.
+
 ## 변화 추적
 
 폴더 트리를 깊이 4까지 저장하며(그 아래 변화는 조상 폴더 용량에 반영), 새 폴더·삭제된 폴더 안의 하위 폴더는 따로 나열하지 않습니다.

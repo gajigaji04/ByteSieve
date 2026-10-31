@@ -46,6 +46,20 @@ typedef struct {
     uint64_t total_bytes;
     uint64_t own_alloc;   /* 바로 아래 파일의 디스크 할당 크기(ScanEntry.alloc_size 합) */
     uint64_t total_alloc; /* 하위 트리 전체의 디스크 할당 크기 */
+
+    /*
+     * 정밀 스캔(SCAN_OPT_HARDLINKS)에서 위 값 중 하드 링크로 이미 다른 경로에서 센 몫.
+     * 기본 스캔이면 모두 0 이다. 같은 실제 파일은 처음 만난 폴더에만 넣으므로(du 와 같은 방식)
+     *   중복 제외 용량 = total_bytes - total_dup_bytes,  실제 디스크 사용 = total_alloc - total_dup_alloc
+     * 이고 자식들의 중복 제외 용량 합이 부모와 맞는다. 다른 폴더와 실제 파일을 나눠 쓰는 폴더는
+     * 그 폴더만 따로 지울 때 확보되는 용량보다 작게 보일 수 있다.
+     */
+    uint64_t own_dup_files;
+    uint64_t own_dup_bytes;
+    uint64_t own_dup_alloc;
+    uint64_t total_dup_files;
+    uint64_t total_dup_bytes;
+    uint64_t total_dup_alloc;
 } ScanNode;
 
 /* 진행률 스냅샷(콜백 호출 동안만 유효). 전체 양은 미리 알 수 없으므로 비율은 추정치다. */
@@ -60,6 +74,9 @@ typedef struct {
     const wchar_t *current_dir; /* 지금 열거 중인 폴더(표시용 경로), 완료 시 NULL */
     int finished;            /* 마지막 호출이면 1 */
     ScanStatus status;       /* finished 일 때만 의미 있음 */
+    int precise;             /* 정밀 스캔(하드 링크 확인) 중이면 1 */
+    uint64_t dup_files;      /* 정밀 스캔: 지금까지 찾은 하드 링크 중복 경로 */
+    uint64_t dup_bytes;      /* 그 논리 크기 합 */
 } ScanProgress;
 
 typedef void (*scan_progress_fn)(const ScanProgress *progress, void *ctx);
@@ -78,6 +95,7 @@ typedef struct {
     ScanReport report; /* 전체 집계·오류(scanner 와 같은 의미) */
     ScanStatus status;
     uint32_t max_depth;
+    unsigned options;  /* 스캔에 쓴 SCAN_OPT_*(정밀 스캔이면 SCAN_OPT_HARDLINKS) */
     int out_of_memory; /* 노드를 만들지 못해 트리가 일부 빠졌으면 1 (report 집계는 정확) */
 } ScanModel;
 
@@ -102,6 +120,15 @@ ScanStatus scan_model_build(ScanModel *model, const wchar_t *root, uint32_t max_
 ScanStatus scan_model_build_ex(ScanModel *model, const wchar_t *root, uint32_t max_depth,
                                scan_progress_fn progress, scan_cancel_fn cancel,
                                void *ctx);
+
+/*
+ * scan_model_build_ex 에 스캔 옵션(SCAN_OPT_*)을 더한 판. SCAN_OPT_HARDLINKS 면 정밀 스캔으로
+ * 노드의 *_dup_* 와 report 의 hardlink_* 를 채운다(경로마다 센 기본 값은 그대로). options 0 은
+ * scan_model_build_ex 와 같다.
+ */
+ScanStatus scan_model_build_opts(ScanModel *model, const wchar_t *root, uint32_t max_depth,
+                                 unsigned options, scan_progress_fn progress,
+                                 scan_cancel_fn cancel, void *ctx);
 
 /* 진행률 추정(0.0~1.0): 열거를 마친 폴더 / (마친 폴더 + 남은 폴더). */
 double scan_progress_fraction(const ScanProgress *progress);
@@ -128,7 +155,9 @@ wchar_t *scan_model_path(const ScanModel *model, size_t index);
 typedef enum {
     SCAN_RANK_TOTAL_BYTES = 0, /* 하위 트리 포함 용량 */
     SCAN_RANK_OWN_BYTES,       /* 폴더 바로 아래 파일 용량 */
-    SCAN_RANK_TOTAL_ALLOC      /* 하위 트리 포함 디스크 할당 크기 */
+    SCAN_RANK_TOTAL_ALLOC,     /* 하위 트리 포함 디스크 할당 크기 */
+    SCAN_RANK_TOTAL_UNIQUE,    /* 정밀 스캔: 하드 링크 중복 제외 용량(total_bytes - total_dup_bytes) */
+    SCAN_RANK_TOTAL_DUP        /* 정밀 스캔: 하드 링크로 중복 집계된 용량(total_dup_bytes) */
 } ScanRankKey;
 
 /*

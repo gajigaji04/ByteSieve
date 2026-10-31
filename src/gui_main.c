@@ -59,7 +59,8 @@ enum {
     IDC_CLEAR_HISTORY,
     IDC_EXPORT_CSV,
     IDC_EXPORT_HTML,
-    IDC_CACHE
+    IDC_CACHE,
+    IDC_PRECISE
 };
 
 /* 내보내기 형식. */
@@ -69,10 +70,22 @@ typedef enum { EXPORT_KIND_CSV, EXPORT_KIND_HTML } ExportKind;
 enum { TAB_SCAN, TAB_DRIVES, TAB_CLEANUP, TAB_CACHE, TAB_QUARANTINE, TAB_MONITOR };
 
 /* 순위 목록 열. */
-enum { COL_RANK, COL_PATH, COL_SIZE, COL_CHANGE, COL_ALLOC, COL_FILES, COL_SHARE, COL_COUNT };
+/* COL_UNIQUE·COL_DUP 는 정밀 스캔 결과일 때만 보인다(기본 스캔이면 너비 0). */
+enum {
+    COL_RANK,
+    COL_PATH,
+    COL_SIZE,
+    COL_UNIQUE,
+    COL_DUP,
+    COL_CHANGE,
+    COL_ALLOC,
+    COL_FILES,
+    COL_SHARE,
+    COL_COUNT
+};
 
 /* 오른쪽 목록 보기(보기 콤보 상자 순서). */
-enum { VIEW_SIZE, VIEW_ALLOC, VIEW_CHANGE, VIEW_COUNT };
+enum { VIEW_SIZE, VIEW_ALLOC, VIEW_CHANGE, VIEW_UNIQUE, VIEW_DUP, VIEW_COUNT };
 
 /* 직전 스캔과의 비교·기록 상태. */
 typedef enum {
@@ -100,6 +113,7 @@ typedef enum {
     SELF_TEST_NO_AUTOSAVE, /* 처음 설정 출력 → 자동 저장 끔 → 스캔 → 저장하지 않았는지 검증 → 종료 */
     SELF_TEST_CLEAR_HISTORY, /* 스캔 → 기록 삭제(확인 창 없이) → 화면 반영 검증·출력 → 종료 */
     SELF_TEST_EXPORT, /* 스캔 → CSV·HTML 내보내기(대화 상자 없이) → 화면 검증·출력 → 종료 */
+    SELF_TEST_PRECISE, /* [정밀 스캔] 체크 → 스캔 → 하드 링크 보정 열·보기·분석 줄 검증·출력 → 종료 */
     SELF_TEST_CACHE   /* 공용 캐시 탭 탐지 → 픽스처 안인지·화면 검증 → 정리 가능한 캐시를 모두
                        * 휴지통으로(확인 창 없이) → 결과 검증 → 종료 */
 } SelfTest;
@@ -107,6 +121,7 @@ typedef enum {
 typedef struct {
     HWND hwnd;
     HWND path, browse, scan, cancel, progress, status, tree, list, view, analysis;
+    HWND precise; /* [정밀 스캔(하드 링크)] 체크 상자 */
     HWND autosave, clear_history, export_csv, export_html;
     HWND tabs, drives, cleanup, cache, quarantine, monitor;
     HFONT font;
@@ -177,7 +192,7 @@ static void layout(void)
 {
     RECT rc;
     int m = scale(8), h = scale(24), bw = scale(84), gap = scale(6), view_w = scale(170);
-    int check_w = scale(150), export_w = scale(104);
+    int check_w = scale(150), export_w = scale(104), precise_w = scale(160);
     int x, w, y, path_w, bar_w, body_h, tree_w;
 
     /* 탭 컨트롤이 창 전체를 차지하고, 각 탭의 컨트롤은 탭의 표시 영역 안에 놓는다. */
@@ -193,8 +208,9 @@ static void layout(void)
         w = 0;
     }
 
+    /* [경로] [찾아보기] [스캔] [취소]  [v] 정밀 스캔(하드 링크)  [보기 ▼] */
     y = rc.top + m;
-    path_w = w - 2 * m - 3 * (bw + gap) - (view_w + gap);
+    path_w = w - 2 * m - 3 * (bw + gap) - (precise_w + gap) - (view_w + gap);
     if (path_w < scale(80)) {
         path_w = scale(80);
     }
@@ -202,8 +218,10 @@ static void layout(void)
     MoveWindow(g_app.browse, x + m + path_w + gap, y, bw, h, TRUE);
     MoveWindow(g_app.scan, x + m + path_w + gap + (bw + gap), y, bw, h, TRUE);
     MoveWindow(g_app.cancel, x + m + path_w + gap + 2 * (bw + gap), y, bw, h, TRUE);
+    MoveWindow(g_app.precise, x + m + path_w + gap + 3 * (bw + gap) + gap, y, precise_w, h, TRUE);
     /* 콤보 상자 높이는 펼친 목록 높이까지 포함한다. */
-    MoveWindow(g_app.view, x + m + path_w + gap + 3 * (bw + gap), y, view_w, scale(120), TRUE);
+    MoveWindow(g_app.view, x + m + path_w + gap + 3 * (bw + gap) + precise_w + gap, y, view_w,
+               scale(160), TRUE);
 
     /* 진행 막대 오른쪽에 내보내기와 기록 설정:
      * [CSV 내보내기...] [HTML 보고서...]  [v] 스캔 기록 자동 저장  [기록 삭제...] */
@@ -265,7 +283,7 @@ static void show_tab(int tab)
     HWND scan_controls[] = {g_app.path,   g_app.browse, g_app.scan,     g_app.cancel,
                             g_app.view,   g_app.progress, g_app.status, g_app.analysis,
                             g_app.tree,   g_app.list,     g_app.autosave, g_app.clear_history,
-                            g_app.export_csv, g_app.export_html};
+                            g_app.export_csv, g_app.export_html, g_app.precise};
     int show_scan = tab == TAB_SCAN;
     size_t i;
 
@@ -296,12 +314,24 @@ static void show_tab(int tab)
 
 /* ---- 결과 표시 ---- */
 
-/* 트리 항목 표시 문자열(malloc, 호출자가 free). */
+/* 지금 결과가 정밀 스캔(하드 링크 보정)으로 집계됐는지. */
+static int precise_result(void)
+{
+    return g_app.has_model && (g_app.model.options & SCAN_OPT_HARDLINKS) != 0;
+}
+
+/* 하드 링크 중복을 뺀 용량(정밀 스캔이 아니면 경로마다 센 용량과 같다). */
+static uint64_t unique_bytes(const ScanNode *n)
+{
+    return n->total_bytes - n->total_dup_bytes;
+}
+
+/* 트리 항목 표시 문자열(malloc, 호출자가 free). 정밀 스캔에서 중복이 있으면 중복 제외 용량을 덧붙인다. */
 static wchar_t *tree_item_text(size_t index)
 {
     const ScanNode *n = scan_model_node(&g_app.model, index);
     uint64_t whole = g_app.model.nodes[0].total_bytes;
-    size_t len = wcslen(n->name) + 64;
+    size_t len = wcslen(n->name) + 128, used;
     wchar_t size[32], *buf = malloc(len * sizeof(*buf));
 
     if (buf == NULL) {
@@ -309,11 +339,18 @@ static wchar_t *tree_item_text(size_t index)
     }
     format_size(n->total_bytes, size, 32);
     if (index == 0) {
-        swprintf(buf, len, L"%ls  —  %ls%ls", n->name, size, flag_label(n->flags));
+        swprintf(buf, len, L"%ls  —  %ls", n->name, size);
     } else {
-        swprintf(buf, len, L"%ls  —  %ls (%.1f%%)%ls", n->name, size,
-                 share_of(n->total_bytes, whole), flag_label(n->flags));
+        swprintf(buf, len, L"%ls  —  %ls (%.1f%%)", n->name, size,
+                 share_of(n->total_bytes, whole));
     }
+    used = wcslen(buf);
+    if (precise_result() && n->total_dup_bytes > 0) {
+        format_size(unique_bytes(n), size, 32);
+        swprintf(buf + used, len - used, L" · 중복 제외 %ls", size);
+        used = wcslen(buf);
+    }
+    swprintf(buf + used, len - used, L"%ls", flag_label(n->flags));
     return buf;
 }
 
@@ -455,6 +492,17 @@ static void insert_row(int index, size_t node, const wchar_t *path, const wchar_
         list_set(row, COL_FILES, buf);
         swprintf(buf, 96, L"%.1f%%", share_of(n->total_bytes, whole));
         list_set(row, COL_SHARE, buf);
+        /* 정밀 스캔: 중복 제외 용량, 하드 링크로 중복 집계된 용량(기본 스캔 대비 차이) */
+        if (precise_result()) {
+            format_size(unique_bytes(n), buf, 96);
+            list_set(row, COL_UNIQUE, buf);
+            if (n->total_dup_bytes > 0 || n->total_dup_files > 0) {
+                wchar_t size[32];
+                format_size(n->total_dup_bytes, size, 32);
+                swprintf(buf, 96, L"-%ls (%llu개)", size, (unsigned long long)n->total_dup_files);
+                list_set(row, COL_DUP, buf);
+            }
+        }
     } else {
         list_set(row, COL_SIZE, L"-");
         list_set(row, COL_ALLOC, L"-");
@@ -467,10 +515,27 @@ static void insert_row(int index, size_t node, const wchar_t *path, const wchar_
     }
 }
 
+/* 보기에 맞는 순위 기준. */
+static ScanRankKey view_rank_key(int view)
+{
+    switch (view) {
+    case VIEW_ALLOC:
+        return SCAN_RANK_TOTAL_ALLOC;
+    case VIEW_UNIQUE:
+        return SCAN_RANK_TOTAL_UNIQUE;
+    case VIEW_DUP:
+        return SCAN_RANK_TOTAL_DUP;
+    default:
+        return SCAN_RANK_TOTAL_BYTES;
+    }
+}
+
 /*
  * 오른쪽 목록을 보기에 맞게 채운다.
  *   용량·디스크 사용 순위: 상위 RANK_COUNT 개 폴더(변화 열은 직전 스캔 대비, 없으면 빈칸)
  *   변화 순위: 직전 스캔 대비 변화가 큰 폴더(삭제된 폴더 포함)
+ *   중복 제외 용량 순위: 하드 링크 중복을 뺀 용량 순(기본 스캔이면 용량 순위와 같다)
+ *   하드 링크 중복 순위: 중복 집계된 용량이 있는 폴더만(기본 스캔이면 비어 있다)
  */
 static void fill_rank(void)
 {
@@ -497,9 +562,13 @@ static void fill_rank(void)
             free(path);
         }
     } else {
-        count = scan_model_rank(&g_app.model,
-                                view == VIEW_ALLOC ? SCAN_RANK_TOTAL_ALLOC : SCAN_RANK_TOTAL_BYTES,
-                                top, RANK_COUNT);
+        count = scan_model_rank(&g_app.model, view_rank_key(view), top, RANK_COUNT);
+        if (view == VIEW_DUP) {
+            /* 중복이 없는 폴더는 빼낸다(순위가 내림차순이므로 앞부분만 남는다). */
+            while (count > 0 && g_app.model.nodes[top[count - 1]].total_dup_files == 0) {
+                count--;
+            }
+        }
         for (i = 0; i < count; i++) {
             const HistoryChange *c = NULL;
             wchar_t *path = scan_model_path(&g_app.model, top[i]);
@@ -519,7 +588,7 @@ static void fill_rank(void)
 static void update_analysis(void)
 {
     const ScanReport *r = &g_app.model.report;
-    wchar_t text[768], a[32], b[32], c[32];
+    wchar_t text[1024], a[32], b[32], c[32];
     size_t used = 0;
     int n;
 
@@ -539,6 +608,22 @@ static void update_analysis(void)
     format_size(r->alloc_bytes, a, 32);
     format_delta((int64_t)(r->alloc_bytes - r->total_bytes), b, 32);
     APPEND(L"디스크 사용 %ls(논리 크기 대비 %ls)", a, b);
+    /* 정밀 스캔: 기본 집계(경로마다)와 하드 링크 중복을 뺀 집계의 차이 */
+    if (precise_result() && r->hardlinks_unsupported) {
+        APPEND(L" · 정밀 스캔: 하드 링크가 없는 파일 시스템이라 보정할 것이 없음");
+    } else if (precise_result()) {
+        format_size(r->total_bytes - r->hardlink_dup_bytes, a, 32);
+        format_size(r->total_bytes, b, 32);
+        format_size(r->hardlink_dup_bytes, c, 32);
+        APPEND(L" · 정밀 스캔: 중복 제외 %ls(기본 %ls, 하드 링크 중복 %llu개 -%ls)", a, b,
+               (unsigned long long)r->hardlink_dup_files, c);
+        format_size(r->alloc_bytes - r->hardlink_dup_alloc, a, 32);
+        APPEND(L" · 실제 디스크 사용 %ls", a);
+        if (r->hardlink_unknown_files > 0) {
+            APPEND(L" · 파일 ID 모름 %llu개(경로마다 셈)",
+                   (unsigned long long)r->hardlink_unknown_files);
+        }
+    }
     if (r->slack_bytes > 0) {
         format_size(r->slack_bytes, a, 32);
         APPEND(L" · 클러스터 낭비 +%ls", a);
@@ -679,10 +764,20 @@ static void clear_results(void)
     EnableWindow(g_app.export_html, FALSE);
 }
 
+/* 정밀 스캔 열(중복 제외·하드 링크 중복)은 정밀 스캔 결과일 때만 보인다. */
+static void update_precise_columns(void)
+{
+    int on = precise_result();
+
+    ListView_SetColumnWidth(g_app.list, COL_UNIQUE, on ? scale(90) : 0);
+    ListView_SetColumnWidth(g_app.list, COL_DUP, on ? scale(120) : 0);
+}
+
 static void show_results(void)
 {
     HTREEITEM root;
 
+    update_precise_columns();
     if (g_app.model.len == 0) {
         return;
     }
@@ -764,6 +859,7 @@ static void set_scanning(int scanning)
     EnableWindow(g_app.browse, !scanning);
     EnableWindow(g_app.path, !scanning);
     EnableWindow(g_app.cancel, scanning);
+    EnableWindow(g_app.precise, !scanning);
     EnableWindow(g_app.export_csv, can_export());
     EnableWindow(g_app.export_html, can_export());
     update_clear_button();
@@ -1026,7 +1122,7 @@ static void on_job_notify(int finished, void *ctx)
 static void start_scan(void)
 {
     wchar_t *target;
-    int len;
+    int len, precise;
 
     if (g_app.job != NULL) {
         return;
@@ -1046,15 +1142,17 @@ static void start_scan(void)
     clear_results();
     g_app.progress_pos = 0;
     SendMessageW(g_app.progress, PBM_SETPOS, 0, 0);
-    g_app.job = scan_job_start(target, SCAN_DEPTH_UNLIMITED, PROGRESS_INTERVAL_MS,
-                               on_job_notify, g_app.hwnd);
+    precise = SendMessageW(g_app.precise, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    g_app.job = scan_job_start_ex(target, SCAN_DEPTH_UNLIMITED,
+                                  precise ? (unsigned)SCAN_OPT_HARDLINKS : 0u,
+                                  PROGRESS_INTERVAL_MS, on_job_notify, g_app.hwnd);
     free(target);
     if (g_app.job == NULL) {
         set_status(L"스캔을 시작하지 못했습니다(메모리 또는 스레드 생성 실패).");
         return;
     }
     set_scanning(1);
-    set_status(L"스캔 중...");
+    set_status(precise ? L"정밀 스캔 중(하드 링크 확인)..." : L"스캔 중...");
 }
 
 static void cancel_scan(void)
@@ -1086,10 +1184,22 @@ static void update_progress(void)
         SendMessageW(g_app.progress, PBM_SETPOS, (WPARAM)pos, 0);
     }
     format_size(snap.progress.bytes, size, 32);
-    swprintf(text, sizeof(text) / sizeof(text[0]),
-             L"스캔 중... 파일 %llu · 폴더 %llu · %ls · 오류 %llu  |  %ls",
-             (unsigned long long)snap.progress.files, (unsigned long long)snap.progress.dirs,
-             size, (unsigned long long)snap.progress.errors, snap.current_dir);
+    if (snap.progress.precise) {
+        /* 정밀 스캔: 지금까지 찾은 하드 링크 중복도 보여 준다. */
+        wchar_t dup[32];
+        format_size(snap.progress.dup_bytes, dup, 32);
+        swprintf(text, sizeof(text) / sizeof(text[0]),
+                 L"정밀 스캔 중... 파일 %llu · 폴더 %llu · %ls · 하드 링크 중복 %llu개(-%ls) · "
+                 L"오류 %llu  |  %ls",
+                 (unsigned long long)snap.progress.files, (unsigned long long)snap.progress.dirs,
+                 size, (unsigned long long)snap.progress.dup_files, dup,
+                 (unsigned long long)snap.progress.errors, snap.current_dir);
+    } else {
+        swprintf(text, sizeof(text) / sizeof(text[0]),
+                 L"스캔 중... 파일 %llu · 폴더 %llu · %ls · 오류 %llu  |  %ls",
+                 (unsigned long long)snap.progress.files, (unsigned long long)snap.progress.dirs,
+                 size, (unsigned long long)snap.progress.errors, snap.current_dir);
+    }
     set_status(text);
 }
 
@@ -1135,10 +1245,11 @@ static void finish_scan(void)
     } else {
         format_size(r->total_bytes, size, 32);
         swprintf(text, sizeof(text) / sizeof(text[0]),
-                 L"%ls: 파일 %llu · 폴더 %llu · %ls · 오류 %llu · 건너뛴 폴더 %llu · %.1f초",
-                 head, (unsigned long long)r->file_count, (unsigned long long)r->dir_count,
-                 size, (unsigned long long)r->error_count,
-                 (unsigned long long)r->skipped_dir_count, (double)snap.elapsed_ms / 1000.0);
+                 L"%ls%ls: 파일 %llu · 폴더 %llu · %ls · 오류 %llu · 건너뛴 폴더 %llu · %.1f초",
+                 r->hardlinks_checked ? L"정밀 스캔 " : L"", head,
+                 (unsigned long long)r->file_count, (unsigned long long)r->dir_count, size,
+                 (unsigned long long)r->error_count, (unsigned long long)r->skipped_dir_count,
+                 (double)snap.elapsed_ms / 1000.0);
         if (!r->cancelled) {
             SendMessageW(g_app.progress, PBM_SETPOS, PROGRESS_RANGE, 0);
         }
@@ -1241,8 +1352,64 @@ static int verify_views(void)
         }
     }
 
+    /* 중복 제외 용량 순위: 내림차순(기본 스캔이면 용량 순위와 같다) */
+    SendMessageW(g_app.view, CB_SETCURSEL, VIEW_UNIQUE, 0);
+    fill_rank();
+    rows = ListView_GetItemCount(g_app.list);
+    expect = g_app.model.len > 0 ? g_app.model.len - 1 : 0;
+    SELF_CHECK(rows == (int)(expect < RANK_COUNT ? expect : RANK_COUNT));
+    for (i = 0; (int)i < rows; i++) {
+        size_t prev = 0;
+        memset(&lv, 0, sizeof(lv));
+        lv.mask = LVIF_PARAM;
+        lv.iItem = (int)i;
+        SendMessageW(g_app.list, LVM_GETITEMW, 0, (LPARAM)&lv);
+        if (i > 0) {
+            LVITEMW pv;
+            memset(&pv, 0, sizeof(pv));
+            pv.mask = LVIF_PARAM;
+            pv.iItem = (int)i - 1;
+            SendMessageW(g_app.list, LVM_GETITEMW, 0, (LPARAM)&pv);
+            prev = (size_t)pv.lParam;
+            SELF_CHECK(unique_bytes(&g_app.model.nodes[prev]) >=
+                       unique_bytes(&g_app.model.nodes[(size_t)lv.lParam]));
+        }
+    }
+
+    /* 하드 링크 중복 순위: 중복이 있는 폴더만(기본 스캔이면 없음) */
+    SendMessageW(g_app.view, CB_SETCURSEL, VIEW_DUP, 0);
+    fill_rank();
+    rows = ListView_GetItemCount(g_app.list);
+    expect = 0;
+    for (i = 1; i < g_app.model.len; i++) {
+        expect += g_app.model.nodes[i].total_dup_files > 0;
+    }
+    SELF_CHECK(rows == (int)(expect < RANK_COUNT ? expect : RANK_COUNT));
+    SELF_CHECK(precise_result() || rows == 0);
+    for (i = 0; (int)i < rows; i++) {
+        const ScanNode *n;
+        memset(&lv, 0, sizeof(lv));
+        lv.mask = LVIF_PARAM;
+        lv.iItem = (int)i;
+        SendMessageW(g_app.list, LVM_GETITEMW, 0, (LPARAM)&lv);
+        n = &g_app.model.nodes[(size_t)lv.lParam];
+        SELF_CHECK(n->total_dup_files > 0);
+        ListView_GetItemText(g_app.list, (int)i, COL_UNIQUE, cell, 96);
+        format_size(unique_bytes(n), want, 96);
+        SELF_CHECK(wcscmp(cell, want) == 0);
+        ListView_GetItemText(g_app.list, (int)i, COL_DUP, cell, 96);
+        SELF_CHECK(cell[0] == L'-');
+    }
+
+    /* 정밀 스캔 열은 정밀 스캔 결과일 때만 보이고, 기본 스캔이면 비어 있다 */
+    SELF_CHECK((ListView_GetColumnWidth(g_app.list, COL_UNIQUE) > 0) == precise_result());
+    SELF_CHECK((ListView_GetColumnWidth(g_app.list, COL_DUP) > 0) == precise_result());
     SendMessageW(g_app.view, CB_SETCURSEL, VIEW_SIZE, 0);
     fill_rank();
+    if (!precise_result() && ListView_GetItemCount(g_app.list) > 0) {
+        ListView_GetItemText(g_app.list, 0, COL_UNIQUE, cell, 96);
+        SELF_CHECK(cell[0] == L'\0');
+    }
     return failures;
 }
 
@@ -1359,6 +1526,53 @@ static int verify_export(void)
     return failures;
 }
 
+/*
+ * SELF_TEST_PRECISE: 정밀 스캔 결과가 화면(상태 줄·분석 줄·트리·열)에 맞게 나오는지 확인하고,
+ * 검사 스크립트가 확인하도록 기본 집계와 중복 제외 집계를 stdout 에 쓴다. 실패 수.
+ */
+static int verify_precise(void)
+{
+    const ScanReport *r = &g_app.model.report;
+    const ScanNode *root = &g_app.model.nodes[0];
+    int failures = 0;
+    wchar_t text[1024], want[64], size[32];
+    TVITEMW tv;
+    HTREEITEM item = TreeView_GetRoot(g_app.tree);
+
+    SELF_CHECK(r->hardlinks_checked && !r->hardlinks_unsupported);
+    SELF_CHECK(!IsWindowEnabled(g_app.precise) == (g_app.job != NULL));
+    SELF_CHECK(root->total_dup_bytes == r->hardlink_dup_bytes &&
+               root->total_dup_files == r->hardlink_dup_files);
+    GetWindowTextW(g_app.status, text, 1024);
+    /* "정밀 스캔 완료: …" 또는 "정밀 스캔 완료(일부 폴더를 읽지 못함): …" */
+    SELF_CHECK(wcsstr(text, L"정밀 스캔 완료") == text);
+    /* 분석 줄: 중복 제외(기본 대비 차이)와 실제 디스크 사용 */
+    GetWindowTextW(g_app.analysis, text, 1024);
+    format_size(r->total_bytes - r->hardlink_dup_bytes, size, 32);
+    swprintf(want, 64, L"중복 제외 %ls(기본 ", size);
+    SELF_CHECK(wcsstr(text, want) != NULL);
+    format_size(r->alloc_bytes - r->hardlink_dup_alloc, size, 32);
+    swprintf(want, 64, L"실제 디스크 사용 %ls", size);
+    SELF_CHECK(wcsstr(text, want) != NULL);
+    /* 트리 루트에 중복 제외 용량이 덧붙는다(중복이 있을 때) */
+    memset(&tv, 0, sizeof(tv));
+    tv.mask = TVIF_TEXT;
+    tv.hItem = item;
+    tv.pszText = text;
+    tv.cchTextMax = 1024;
+    SELF_CHECK(item != NULL && TreeView_GetItem(g_app.tree, &tv));
+    SELF_CHECK((wcsstr(text, L" · 중복 제외 ") != NULL) == (root->total_dup_bytes > 0));
+
+    wprintf(L"precise: files %llu bytes %llu dup_files %llu dup_bytes %llu unique %llu "
+            L"unknown %llu\n",
+            (unsigned long long)r->file_count, (unsigned long long)r->total_bytes,
+            (unsigned long long)r->hardlink_dup_files, (unsigned long long)r->hardlink_dup_bytes,
+            (unsigned long long)(r->total_bytes - r->hardlink_dup_bytes),
+            (unsigned long long)r->hardlink_unknown_files);
+    fflush(stdout);
+    return failures;
+}
+
 /* 스캔이 끝난 뒤 화면 상태가 모델과 맞는지 확인하고 종료 코드를 정한다. */
 static int verify_screen(void)
 {
@@ -1421,20 +1635,27 @@ static int verify_screen(void)
     SELF_CHECK(IsWindowEnabled(g_app.export_csv) == (g_app.model.status != SCAN_FATAL));
     SELF_CHECK(IsWindowEnabled(g_app.export_html) == (g_app.model.status != SCAN_FATAL));
 
-    if (g_app.self_test == SELF_TEST_SCAN || g_app.self_test == SELF_TEST_CHANGES) {
-        wchar_t text[512];
+    if (g_app.self_test == SELF_TEST_SCAN || g_app.self_test == SELF_TEST_CHANGES ||
+        g_app.self_test == SELF_TEST_PRECISE) {
+        wchar_t text[1024];
         SELF_CHECK(g_app.model.report.cancelled == 0);
         SELF_CHECK(g_app.model.status != SCAN_FATAL);
         SELF_CHECK(pos == PROGRESS_RANGE);
         /* 직전 스냅숏이 없으면 기준으로, 있으면 비교한 뒤 저장한다. */
         SELF_CHECK(g_app.history == HIST_BASELINE || g_app.history == HIST_COMPARED);
         SELF_CHECK((g_app.history == HIST_COMPARED) == (g_app.has_diff != 0));
-        GetWindowTextW(g_app.analysis, text, 512);
+        GetWindowTextW(g_app.analysis, text, 1024);
         SELF_CHECK(wcsstr(text, L"디스크 사용 ") == text);
         SELF_CHECK(wcsstr(text, g_app.has_diff ? L"직전 스캔(" : L"첫 스캔") != NULL);
+        /* 정밀 스캔 요약은 정밀 스캔 결과에만 */
+        SELF_CHECK((wcsstr(text, L"정밀 스캔: ") != NULL) == precise_result());
+        SELF_CHECK(precise_result() == (g_app.self_test == SELF_TEST_PRECISE));
         if (g_app.self_test == SELF_TEST_CHANGES) {
             SELF_CHECK(g_app.has_diff);
             print_changes();
+        }
+        if (g_app.self_test == SELF_TEST_PRECISE) {
+            failures += verify_precise();
         }
     } else if (g_app.self_test == SELF_TEST_NO_AUTOSAVE ||
                g_app.self_test == SELF_TEST_CLEAR_HISTORY) {
@@ -1601,6 +1822,8 @@ static void create_controls(void)
         {L"순위", 48, LVCFMT_RIGHT},
         {L"폴더", 220, LVCFMT_LEFT},
         {L"용량", 80, LVCFMT_RIGHT},
+        {L"중복 제외", 0, LVCFMT_RIGHT},     /* 정밀 스캔일 때만 보인다 */
+        {L"하드 링크 중복", 0, LVCFMT_RIGHT}, /* 정밀 스캔일 때만 보인다 */
         {L"변화", 110, LVCFMT_RIGHT},
         {L"디스크 사용", 84, LVCFMT_RIGHT},
         {L"파일 수", 64, LVCFMT_RIGHT},
@@ -1639,6 +1862,9 @@ static void create_controls(void)
                               IDC_BROWSE);
     g_app.scan = make_child(L"BUTTON", L"스캔", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, IDC_SCAN);
     g_app.cancel = make_child(L"BUTTON", L"취소", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_CANCEL);
+    /* 정밀 스캔: 하드 링크로 같은 실제 파일을 여러 번 세지 않게 보정한다(조금 느리고 메모리를 더 씀). */
+    g_app.precise = make_child(L"BUTTON", L"정밀 스캔(하드 링크)", BS_AUTOCHECKBOX | WS_TABSTOP,
+                               0, IDC_PRECISE);
     g_app.progress = make_child(PROGRESS_CLASSW, L"", PBS_SMOOTH, 0, IDC_PROGRESS);
     g_app.status = make_child(L"STATIC", L"폴더를 선택하고 [스캔]을 누르세요.",
                               SS_LEFTNOWORDWRAP | SS_PATHELLIPSIS, 0, IDC_STATUS);
@@ -1647,13 +1873,15 @@ static void create_controls(void)
     g_app.view = make_child(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0,
                             IDC_VIEW);
     {
-        static const wchar_t *const views[VIEW_COUNT] = {L"용량 순위", L"디스크 사용 순위",
-                                                         L"변화 순위(직전 스캔 대비)"};
+        static const wchar_t *const views[VIEW_COUNT] = {
+            L"용량 순위", L"디스크 사용 순위", L"변화 순위(직전 스캔 대비)",
+            L"중복 제외 용량 순위(정밀 스캔)", L"하드 링크 중복 순위(정밀 스캔)"};
         int v;
         for (v = 0; v < VIEW_COUNT; v++) {
             SendMessageW(g_app.view, CB_ADDSTRING, 0, (LPARAM)views[v]);
         }
         SendMessageW(g_app.view, CB_SETCURSEL, VIEW_SIZE, 0);
+        SendMessageW(g_app.view, CB_SETDROPPEDWIDTH, (WPARAM)scale(240), 0);
     }
     g_app.tree = make_child(WC_TREEVIEWW, L"",
                             TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT |
@@ -1747,7 +1975,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         layout();
         return 0;
     case WM_GETMINMAXINFO:
-        ((MINMAXINFO *)lp)->ptMinTrackSize.x = scale(700);
+        ((MINMAXINFO *)lp)->ptMinTrackSize.x = scale(800);
         ((MINMAXINFO *)lp)->ptMinTrackSize.y = scale(320);
         return 0;
     case WM_COMMAND:
@@ -1923,6 +2151,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  *                                         정리 가능한 캐시를 모두 휴지통으로 옮기고(확인 창 없음)
  *                                         결과를 검증하고 종료(USERPROFILE 등을 <dir> 안으로 돌려 실행)
  *   bytesieve-gui --self-test-monitor     시스템 탭에서 RAM·CPU 를 몇 번 측정한 뒤 화면을 검증하고 종료
+ *   bytesieve-gui --self-test-precise <dir> [정밀 스캔]을 체크하고 스캔한 뒤 하드 링크 보정 열·보기·
+ *                                          분석 줄을 검증하고 기본·중복 제외 집계를 stdout 에 쓴 뒤 종료
  *   bytesieve-gui --self-test-changes <dir> 스캔 후 직전 스냅숏과 비교한 변화 보기를 검증하고
  *                                          변화 목록을 stdout 에 쓴 뒤 종료(직전 스냅숏 필요)
  *   bytesieve-gui --self-test-no-autosave <dir>
@@ -1952,6 +2182,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test") == 0) {
         g_app.self_test = SELF_TEST_SCAN;
+        target = argv[2];
+    } else if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test-precise") == 0) {
+        g_app.self_test = SELF_TEST_PRECISE;
         target = argv[2];
     } else if (argv != NULL && argc >= 3 && wcscmp(argv[1], L"--self-test-changes") == 0) {
         g_app.self_test = SELF_TEST_CHANGES;
@@ -2056,6 +2289,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
                 DestroyWindow(g_app.hwnd);
             }
         }
+    }
+    if (g_app.self_test == SELF_TEST_PRECISE) {
+        /* 사용자가 [정밀 스캔]을 체크한 것과 같다. */
+        SendMessageW(g_app.precise, BM_SETCHECK, BST_CHECKED, 0);
     }
     if (target != NULL) {
         g_app.export_enabled_before_scan =
