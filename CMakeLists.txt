@@ -132,6 +132,11 @@ bytesieve_configure(disk-scanner)
 
 enable_testing()
 
+# 성능 측정 도구가 동작하고 스캐너 진단(작업 수·메모리·미리 열거)을 출력하는지(최적화 전후 비교용).
+add_test(NAME bench_smoke COMMAND bytesieve-bench --mode tree --runs 1 ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_tests_properties(bench_smoke PROPERTIES
+                     PASS_REGULAR_EXPRESSION "scanner: peak tasks [0-9]+ .* prefetched [0-9]+")
+
 # 인자 없이 실행하면 종료 코드 2(비정상)여야 한다.
 add_test(NAME no_args COMMAND disk-scanner)
 set_tests_properties(no_args PROPERTIES WILL_FAIL TRUE)
@@ -244,6 +249,14 @@ add_test(NAME scan_history COMMAND test_scan_history)
 
 # 정밀 스캔(하드 링크 중복 보정): 실제 하드 링크 픽스처로 기본 합계 유지, 중복 경로·용량·할당,
 # 작업 스레드 1개·8개의 같은 결과, 모델의 폴더별 중복·순위·진행률을 확인한다.
+# 병렬 미리 열거: 하위 폴더 2500개 픽스처에서 동시에 살아 있는 폴더 작업 수 상한, 작업 스레드 1개·8개의
+# 같은 결과, 열거 수 맞추기(직접 + 미리 - 버림 = 처리), 제외 훅·취소 뒤 정리를 확인한다.
+add_executable(test_scan_parallel tests/test_scan_parallel.c)
+target_link_libraries(test_scan_parallel PRIVATE bytesieve_scanner)
+bytesieve_configure(test_scan_parallel)
+add_test(NAME scan_parallel COMMAND test_scan_parallel)
+set_tests_properties(scan_parallel PROPERTIES TIMEOUT 120)
+
 add_executable(test_hardlink tests/test_hardlink.c)
 target_link_libraries(test_hardlink PRIVATE bytesieve_model)
 bytesieve_configure(test_hardlink)

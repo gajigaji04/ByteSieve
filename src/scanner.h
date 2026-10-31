@@ -75,6 +75,16 @@ typedef struct {
     uint64_t hardlink_dup_bytes;    /* 그 논리 크기 합 */
     uint64_t hardlink_dup_alloc;    /* 그 할당 크기 합 */
     uint64_t hardlink_unknown_files; /* 파일 ID를 얻지 못해 중복인지 모르는 파일(경로마다 셈) */
+    /*
+     * 병렬 열거 진단(scan_tree_ex 한 번 기준, 여러 번 부르면 최대값·합계가 쌓인다). 스캐너 내부의
+     * 폴더 작업만 센다(결과 모델·훅이 쓰는 메모리 제외). 성능 측정·메모리 상한 테스트용.
+     */
+    uint64_t peak_tasks;          /* 동시에 살아 있던 폴더 작업 수의 최대 */
+    uint64_t peak_task_bytes;     /* 그 작업들(구조·경로·열거 결과·자식 목록)이 붙잡은 메모리의 최대 */
+    uint64_t prefetched_dirs;     /* 작업 스레드가 미리 열거한 폴더 */
+    uint64_t self_fetched_dirs;   /* 호출 스레드가 직접 열거한 폴더 */
+    uint64_t prefetch_waits;      /* 호출 스레드가 열거 중인 작업 스레드를 기다린 횟수 */
+    uint64_t discarded_dirs;      /* 만들었다가 쓰지 않고 버린 폴더 작업(제외·취소) */
     ScanError *errors;
     size_t errors_len;
     size_t errors_cap;
@@ -180,12 +190,15 @@ typedef struct {
  *                 하위 탐색 대상 디렉터리마다 on_entry 보다 먼저 호출한다. parent 는 그 항목을
  *                 담은 디렉터리. 0 이 아니면 들어가지 않고(on_entry 의 will_descend 가 0)
  *                 report->excluded_dir_count 를 늘린다. 오류로 치지 않는다.
- * 스택에 넣지 못한 하위 디렉터리(경로 초과·메모리 부족)는 begin/end 없이 끝난다.
+ * 내려갈 수 없는 하위 디렉터리(경로 초과·메모리 부족)는 begin/end 없이 끝난다. 경로 초과는 부모를
+ * 처리할 때, 작업을 만들 메모리가 없는 경우는 그 하위 디렉터리 차례에 오류로 기록한다.
  *
  * 열거: 폴더 핸들로 GetFileInformationByHandleEx(FileFullDirectoryInfo)를 써서 이름·크기·
  * 속성·할당 크기를 한 번에 받는다. 지원하지 않는 파일 시스템에서는 FindFirstFileExW 로
- * 대신한다(할당 크기 모름). 작업 스레드가 스택에 쌓인 폴더를 미리 열거해 두지만, 훅 호출
- * 순서(깊이 우선, 폴더 안은 열거 순서)는 병렬이 아닐 때와 같다.
+ * 대신한다(할당 크기 모름). 작업 스레드가 곧 필요한 폴더를 미리 열거해 두지만(미리 열거한 결과는
+ * 폴더 1024개·2 MiB 안팎으로 제한), 훅 호출 순서(깊이 우선, 폴더 안은 열거 순서)는 병렬이 아닐 때와
+ * 같다. 내려가기를 기다리는 하위 디렉터리마다 작업을 미리 만들지 않으므로 폴더가 아무리 넓어도
+ * 스캐너가 붙잡는 작업 수는 상한 안에 머문다(ScanReport.peak_tasks).
  */
 typedef struct {
     uintptr_t (*on_entry)(const ScanEntry *entry, uintptr_t parent,

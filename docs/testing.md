@@ -4,18 +4,22 @@
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-CTest에 등록된 테스트는 55개입니다.
+CTest에 등록된 테스트는 57개입니다.
 
 | 분류 | 테스트 | 확인 내용 |
 |---|---|---|
-| 단위 테스트(18개) | `path`, `scanner`, `scan_alloc`, `hardlink`, `scan_model`, `scan_history`, `export`, `scan_job`, `jsonl`, `cli`, `drive`, `sysmon`, `size_format`, `cleanup_rules`, `cleanup_scan`, `cleanup_trash`, `dev_cache`, `quarantine` | 아래 참고 |
-| CLI 검사(24개) | `no_args`, `help`, `scan_*`, `cli_*` | 종료 코드, 텍스트·JSONL 출력, 인자 오류, 접근 거부 픽스처, `--track` 기준 → 변경 → 비교(`cli_track`) |
+| 단위 테스트(19개) | `path`, `scanner`, `scan_alloc`, `scan_parallel`, `hardlink`, `scan_model`, `scan_history`, `export`, `scan_job`, `jsonl`, `cli`, `drive`, `sysmon`, `size_format`, `cleanup_rules`, `cleanup_scan`, `cleanup_trash`, `dev_cache`, `quarantine` | 아래 참고 |
+| CLI·도구 검사(25개) | `no_args`, `help`, `scan_*`, `cli_*`, `bench_smoke` | 종료 코드, 텍스트·JSONL 출력, 인자 오류, 접근 거부 픽스처, `--track` 기준 → 변경 → 비교(`cli_track`), 성능 측정 도구의 스캐너 진단 출력(`bench_smoke`) |
 | GUI 자체 검사(13개) | `gui_scan`, `gui_cancel`, `gui_missing_dir`, `gui_drives`, `gui_cleanup`, `gui_cleanup_cancel`, `gui_trash`, `gui_quarantine`, `gui_history`, `gui_precise`, `gui_export`, `gui_cache`, `gui_monitor` | 숨긴 창에서 실제 작업을 실행하고 화면 상태를 검증 |
 
 ## 주요 단위 테스트 범위
 
 - `scanner`: 권한 거부, 정션과 정션 순환, 260자를 넘는 경로, 5 GiB 넘는 크기, 깊이 제한, 취소, 제외 훅
 - `scan_alloc`: 디스크 사용량 원인 분류, 실제 NTFS 압축·스파스 파일, 작업 스레드 1개와 8개의 훅 호출 기록이 같은지(제외·취소 포함)
+- `scan_parallel`: 하위 폴더 2,500개 픽스처에서 동시에 살아 있는 폴더 작업 수가 상한 안인지(예전 방식은 2,500개를 넘음, 1 스레드는 깊이만큼),
+  작업 스레드 1개·8개의 집계·훅 호출(순서 포함)이 같은지, 직접 열거 + 미리 열거 − 버림 = 처리한 폴더 수(빠뜨리거나 두 번 쓰지 않음),
+  제외 훅이 미리 열거한 하위 트리를 정리하는지, 취소 뒤 폴더를 새로 시작하지 않고 남은 작업을 버리는지.
+  최적화 전후의 시간·메모리 비교는 `bytesieve-bench`로 합니다([performance.md](performance.md))
 - `hardlink`: 실제 하드 링크 픽스처(같은 폴더·다른 폴더·크기 0 파일)로 기본 스캔은 그대로(중복 0), 정밀 스캔의 중복 경로 수·용량·할당,
   실제 파일마다 한 경로만 세는지, 작업 스레드 1개와 8개의 같은 결과, 모델의 폴더별 중복·부모 합계·순위(중복 제외·중복)·진행률
 - `scan_history`: 스냅숏 저장·읽기, 늘어남·줄어듦·새 폴더·삭제·불확실 판정, 손상된 파일,
