@@ -242,6 +242,8 @@ static void clean_text(const ItemState *st, wchar_t *buf, size_t len)
             swprintf(buf, len, L"옮기지 못함: %ls - 닫은 뒤 다시 시도",
                      cleanup_trash_status_text(st->result));
         }
+    } else if (st->result == CLEANUP_TRASH_ACCESS_DENIED) {
+        swprintf(buf, len, L"옮기지 못함: %ls", cleanup_trash_status_text(st->result));
     } else if (st->result == CLEANUP_TRASH_QUARANTINE_FAILED) {
         /* 휴지통을 쓸 수 없어 격리 폴더로 옮기려다 실패(권한 부족·사용 중·공간 부족 등). */
         error_text(st->code, why, 160);
@@ -262,7 +264,8 @@ static int can_check(const ItemState *st)
 {
     return st->deny == CLEANUP_TRASH_PENDING &&
            (st->result == CLEANUP_TRASH_PENDING || st->result == CLEANUP_TRASH_FAILED ||
-            st->result == CLEANUP_TRASH_IN_USE || st->result == CLEANUP_TRASH_QUARANTINE_FAILED ||
+            st->result == CLEANUP_TRASH_IN_USE || st->result == CLEANUP_TRASH_ACCESS_DENIED ||
+            st->result == CLEANUP_TRASH_QUARANTINE_FAILED ||
             st->result == CLEANUP_TRASH_CANCELLED);
 }
 
@@ -632,13 +635,13 @@ static int confirm_trash(CleanupPanel *p, const size_t *index, size_t count)
 }
 
 /*
- * 옮기지 못한 항목 요약 창(사용자가 시작한 이동에서 실패나 사용 중이 있을 때만). 사용 중인
- * 항목뿐이면 실패가 아니라 안내로 보여 준다.
+ * 옮기지 못한 항목 요약 창(사용자가 시작한 이동에서 실패·사용 중·권한 없음이 있을 때만). 사용 중·
+ * 권한 없음뿐이면 실패가 아니라 안내로 보여 준다.
  */
-static void show_failures(CleanupPanel *p, size_t failed, size_t in_use)
+static void show_failures(CleanupPanel *p, size_t failed, size_t in_use, size_t denied)
 {
     size_t i, shown = 0, cap = 1024 + (size_t)FAILURE_LIST_MAX * (MAX_PATH + 256), used = 0;
-    size_t total = failed + in_use;
+    size_t total = failed + in_use + denied;
     wchar_t *text = malloc(cap * sizeof(*text)), why[256];
     int n;
 
@@ -658,6 +661,13 @@ static void show_failures(CleanupPanel *p, size_t failed, size_t in_use)
                      L"닫은 뒤 다시 시도하세요. 실행 중인 앱의 임시 파일은 앱을 닫으면 대개 스스로 "
                      L"지워집니다.\n",
                      (unsigned)in_use);
+        used += n > 0 ? (size_t)n : 0;
+    }
+    if (denied > 0) {
+        n = swprintf(text + used, cap - used,
+                     L"%u개 항목은 바꿀 권한이 없어 옮기지 못했습니다(그대로 남아 있음). 다른 계정·"
+                     L"관리자가 설치한 프로그램의 파일일 수 있으니 필요한 경우에만 관리자로 정리하세요.\n",
+                     (unsigned)denied);
         used += n > 0 ? (size_t)n : 0;
     }
     n = swprintf(text + used, cap - used, L"\n");
@@ -685,9 +695,9 @@ static void show_failures(CleanupPanel *p, size_t failed, size_t in_use)
 static void finish_trash(CleanupPanel *p)
 {
     CleanupTrashOutcome *out = NULL;
-    size_t n, i, moved = 0, quarantined = 0, failed = 0, in_use = 0, cancelled = 0;
+    size_t n, i, moved = 0, quarantined = 0, failed = 0, in_use = 0, denied = 0, cancelled = 0;
     uint64_t bytes = 0;
-    wchar_t text[384], size[32], in_use_text[64];
+    wchar_t text[384], size[32], in_use_text[96];
     ULONGLONG elapsed;
 
     if (p->trash == NULL) {
@@ -720,6 +730,8 @@ static void finish_trash(CleanupPanel *p)
                 out[i].in_use_by = NULL;
             }
             in_use++;
+        } else if (st->result == CLEANUP_TRASH_ACCESS_DENIED) {
+            denied++;
         } else {
             failed++;
         }
@@ -736,8 +748,9 @@ static void finish_trash(CleanupPanel *p)
 
     format_size(bytes, size, 32);
     in_use_text[0] = L'\0';
-    if (in_use > 0) {
-        swprintf(in_use_text, 64, L" · 사용 중 %u개", (unsigned)in_use);
+    if (in_use > 0 || denied > 0) {
+        swprintf(in_use_text, 96, L" · 사용 중 %u개 · 권한 없음 %u개", (unsigned)in_use,
+                 (unsigned)denied);
     }
     if (quarantined > 0) {
         swprintf(text, sizeof(text) / sizeof(text[0]),
@@ -755,8 +768,8 @@ static void finish_trash(CleanupPanel *p)
     SendMessageW(p->progress, PBM_SETPOS, cancelled == 0 ? PROGRESS_RANGE : 0, 0);
     set_busy(p, 0);
     InvalidateRect(p->list, NULL, TRUE);
-    if (p->trash_interactive && failed + in_use > 0) {
-        show_failures(p, failed, in_use);
+    if (p->trash_interactive && failed + in_use + denied > 0) {
+        show_failures(p, failed, in_use, denied);
     }
     SendMessageW(GetParent(p->hwnd), WM_COMMAND,
                  MAKEWPARAM(GetDlgCtrlID(p->hwnd), CPN_TRASHED), (LPARAM)p->hwnd);

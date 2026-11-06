@@ -105,8 +105,10 @@ CleanupJob *cleanup_job_start(const wchar_t *root, uint32_t interval_ms,
     cleanup_result_init(&job->result);
     cleanup_protect_init(&job->protect);
     cleanup_protect_add_system(&job->protect);
-    /* 앱 데이터 폴더(브라우저·편집기의 데이터베이스)는 정리 후보 탐지에서만 들어가지 않는다. */
+    /* 앱 데이터 폴더(브라우저·편집기의 데이터베이스)와 다른 사용자 프로필은 정리 후보 탐지에서만
+     * 들어가지 않는다. */
     cleanup_protect_add_app_data(&job->protect);
+    cleanup_protect_add_other_profiles(&job->protect);
     job->root = path_dup(root != NULL ? root : L"");
     job->interval_ms = interval_ms;
     job->notify = notify;

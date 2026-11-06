@@ -46,6 +46,8 @@ const wchar_t *cleanup_trash_status_text(CleanupTrashStatus status)
         return L"이동 실패";
     case CLEANUP_TRASH_IN_USE:
         return L"다른 프로그램이 사용 중";
+    case CLEANUP_TRASH_ACCESS_DENIED:
+        return L"권한 없음(관리자 권한이 필요할 수 있음)";
     case CLEANUP_TRASH_QUARANTINE_FAILED:
         return L"격리 폴더로 옮기지 못함";
     case CLEANUP_TRASH_CANCELLED:
@@ -84,6 +86,8 @@ const wchar_t *cleanup_trash_status_name(CleanupTrashStatus status)
         return L"failed";
     case CLEANUP_TRASH_IN_USE:
         return L"in_use";
+    case CLEANUP_TRASH_ACCESS_DENIED:
+        return L"access_denied";
     case CLEANUP_TRASH_QUARANTINE_FAILED:
         return L"quarantine_failed";
     case CLEANUP_TRASH_CANCELLED:
@@ -117,6 +121,13 @@ int cleanup_trash_is_in_use_code(uint32_t code)
            code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION ||
            code == (uint32_t)HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION) ||
            code == (uint32_t)HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION);
+}
+
+int cleanup_trash_is_access_denied_code(uint32_t code)
+{
+    return code == (uint32_t)COPYENGINE_E_ACCESS_DENIED_SRC ||
+           code == (uint32_t)COPYENGINE_E_REQUIRES_ELEVATION ||
+           code == (uint32_t)COPYENGINE_E_ACCESSDENIED_READONLY;
 }
 
 wchar_t *cleanup_trash_lockers(const wchar_t *path)
@@ -670,9 +681,12 @@ static CleanupTrashStatus recycle(const wchar_t *path, CleanupTrashOutcome *out,
         }
         out->code = (uint32_t)(FAILED(hr) ? hr : E_FAIL);
         *untouched = !sink.deleted;
-        /* 다른 프로그램이 열어 둔 경우: 격리 폴더로도 옮길 수 없으니 전환하지 않는다. */
-        return cleanup_trash_is_in_use_code(out->code) ? CLEANUP_TRASH_IN_USE
-                                                       : CLEANUP_TRASH_FAILED;
+        /* 다른 프로그램이 열어 뒀거나 원본 권한이 없는 경우: 격리 폴더로도 옮길 수 없으니 전환하지 않는다. */
+        if (cleanup_trash_is_in_use_code(out->code)) {
+            return CLEANUP_TRASH_IN_USE;
+        }
+        return cleanup_trash_is_access_denied_code(out->code) ? CLEANUP_TRASH_ACCESS_DENIED
+                                                              : CLEANUP_TRASH_FAILED;
     }
     out->recycled_path = sink.recycled_path;
     return CLEANUP_TRASH_MOVED;
@@ -711,6 +725,7 @@ static CleanupTrashStatus quarantine_item(const CleanupItem *item, CleanupTrashO
         return CLEANUP_TRASH_MISSING;
     }
     out->code = code;
+    /* 접근 거부는 쓰기 금지 미디어일 수도 있어 시스템 설명과 함께 QUARANTINE_FAILED 로 둔다. */
     return qs == QUARANTINE_IN_USE ? CLEANUP_TRASH_IN_USE : CLEANUP_TRASH_QUARANTINE_FAILED;
 }
 

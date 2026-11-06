@@ -881,6 +881,123 @@ static void test_app_data(void)
     remove_tree(g_root_ext);
 }
 
+/*
+ * 드라이브·C:\Users 를 통째로 탐지할 때: 다른 사용자 프로필(Default·Public·다른 계정)과 PEP 514 로
+ * 등록된 Python 설치 폴더(Program Files 밖)는 후보가 아니다.
+ *   Users\me = %USERPROFILE%, py\Python314 = HKCU\<테스트 키>\TestCo\3.14\InstallPath
+ */
+static int setup_profiles_fixture(void)
+{
+    wchar_t tmp[MAX_PATH];
+
+    if (GetTempPathW(MAX_PATH, tmp) == 0) {
+        return 0;
+    }
+    swprintf(g_root, MAX_PATH, L"%lsbytesieve_cleanup_profiles_%lu", tmp,
+             (unsigned long)GetCurrentProcessId());
+    swprintf(g_root_ext, MAX_PATH, L"\\\\?\\%ls", g_root);
+    remove_tree(g_root_ext);
+    if (!CreateDirectoryW(g_root_ext, NULL)) {
+        return 0;
+    }
+    return make_dir(L"Users") && make_dir(L"Users\\me") && make_dir(L"Users\\me\\proj") &&
+           write_file(L"Users\\me\\proj\\package.json", 2) &&
+           make_dir(L"Users\\me\\proj\\node_modules") &&
+           write_file(L"Users\\me\\proj\\node_modules\\m.js", 31) &&
+           /* 새 계정의 틀, 공용, 다른 계정 */
+           make_dir(L"Users\\Default") && make_dir(L"Users\\Default\\AppData") &&
+           write_file(L"Users\\Default\\AppData\\helper.log", 32) && make_dir(L"Users\\Public") &&
+           make_dir(L"Users\\Public\\Logs") && write_file(L"Users\\Public\\Logs\\daemon.log", 33) &&
+           make_dir(L"Users\\other") && make_dir(L"Users\\other\\proj") &&
+           write_file(L"Users\\other\\proj\\package.json", 2) &&
+           make_dir(L"Users\\other\\proj\\node_modules") &&
+           write_file(L"Users\\other\\proj\\node_modules\\o.js", 34) &&
+           /* Program Files 밖에 설치한 Python */
+           make_dir(L"py") && make_dir(L"py\\Python314") && write_file(L"py\\Python314\\python.exe", 35) &&
+           make_dir(L"py\\Python314\\Lib") && make_dir(L"py\\Python314\\Lib\\__pycache__") &&
+           write_file(L"py\\Python314\\Lib\\__pycache__\\os.cpython-314.pyc", 36) &&
+           /* 일반 프로젝트는 그대로 후보 */
+           make_dir(L"work") && write_file(L"work\\CMakeLists.txt", 2) && make_dir(L"work\\build") &&
+           write_file(L"work\\build\\a.obj", 37);
+}
+
+static void test_profiles_and_python(void)
+{
+    wchar_t saved_profile[MAX_PATH], key[96], tag_key[160];
+    int had_profile;
+    DWORD n;
+    HKEY h;
+    CleanupProtect protect;
+    CleanupResult r;
+    CleanupJob *job;
+    wchar_t *me, *python;
+
+    if (!setup_profiles_fixture()) {
+        CHECK(0);
+        remove_tree(g_root_ext);
+        return;
+    }
+    n = GetEnvironmentVariableW(L"USERPROFILE", saved_profile, MAX_PATH);
+    had_profile = n > 0 && n < MAX_PATH;
+    me = path_join(g_root, L"Users\\me");
+    python = path_join(g_root, L"py\\Python314");
+    SetEnvironmentVariableW(L"USERPROFILE", me);
+    {
+        wchar_t *users = path_join(g_root, L"Users");
+        SetEnvironmentVariableW(L"BYTESIEVE_TEST_PROFILES_DIR", users);
+        free(users);
+    }
+
+    /* 실제 Python 키(Software\Python)가 아닌 테스트 전용 키에 PEP 514 구조를 만든다. */
+    swprintf(key, 96, L"Software\\ByteSieveTest_%lu\\Python", (unsigned long)GetCurrentProcessId());
+    swprintf(tag_key, 160, L"%ls\\TestCo\\3.14\\InstallPath", key);
+    CHECK(RegCreateKeyExW(HKEY_CURRENT_USER, tag_key, 0, NULL, 0, KEY_SET_VALUE, NULL, &h, NULL) ==
+          ERROR_SUCCESS);
+    if (python != NULL) {
+        RegSetValueExW(h, NULL, 0, REG_SZ, (const BYTE *)python,
+                       (DWORD)((wcslen(python) + 1) * sizeof(wchar_t)));
+    }
+    RegCloseKey(h);
+    SetEnvironmentVariableW(L"BYTESIEVE_TEST_PYTHON_KEY", key);
+
+    cleanup_protect_init(&protect);
+    cleanup_protect_add_system(&protect);
+    CHECK(python != NULL && cleanup_protect_contains(&protect, python));
+    /* 다른 프로필: Default, Public, other */
+    CHECK_U64(cleanup_protect_add_other_profiles(&protect), 3);
+    cleanup_result_init(&r);
+    CHECK(cleanup_scan(&r, g_root, &protect, NULL, NULL, NULL) == SCAN_COMPLETE);
+    CHECK_U64(r.len, 2);
+    CHECK(find_item(&r, L"Users\\me\\proj\\node_modules") != NULL);
+    CHECK(find_item(&r, L"work\\build") != NULL);
+    CHECK(find_item(&r, L"py\\Python314\\Lib\\__pycache__") == NULL);
+    CHECK(find_item(&r, L"Users\\Default\\AppData\\helper.log") == NULL);
+    CHECK(find_item(&r, L"Users\\other\\proj\\node_modules") == NULL);
+    cleanup_result_free(&r);
+    cleanup_protect_free(&protect);
+
+    /* GUI 가 쓰는 작업 스레드도 같다 */
+    job = cleanup_job_start(g_root, 0, NULL, NULL);
+    CHECK(job != NULL);
+    if (job != NULL) {
+        CHECK(cleanup_job_finish(job, &r) == SCAN_COMPLETE);
+        CHECK_U64(r.len, 2);
+        CHECK(find_item(&r, L"Users\\me\\proj\\node_modules") != NULL);
+        CHECK(find_item(&r, L"work\\build") != NULL);
+        cleanup_result_free(&r);
+    }
+
+    SetEnvironmentVariableW(L"BYTESIEVE_TEST_PYTHON_KEY", NULL);
+    SetEnvironmentVariableW(L"BYTESIEVE_TEST_PROFILES_DIR", NULL);
+    SetEnvironmentVariableW(L"USERPROFILE", had_profile ? saved_profile : NULL);
+    swprintf(key, 96, L"Software\\ByteSieveTest_%lu", (unsigned long)GetCurrentProcessId());
+    CHECK(RegDeleteTreeW(HKEY_CURRENT_USER, key) == ERROR_SUCCESS);
+    RegDeleteKeyW(HKEY_CURRENT_USER, key);
+    free(me);
+    free(python);
+    remove_tree(g_root_ext);
+}
+
 /* 개발 도구 설치 경로와 그 안의 실행 파일·하위 폴더는 정리 후보가 아니다. */
 static void test_dev_tools(void)
 {
@@ -984,6 +1101,7 @@ int main(void)
     test_ecosystems();
     test_dev_tools();
     test_app_data();
+    test_profiles_and_python();
 
     if (g_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

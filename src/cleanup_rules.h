@@ -131,6 +131,9 @@ int cleanup_protect_add(CleanupProtect *p, const wchar_t *path);
  *   - 프로그램 제거 정보(레지스트리 Uninstall, HKLM 64·32비트와 HKCU)에 등록된 Visual Studio·
  *     VS Code 설치 경로(InstallLocation). 기본 위치가 아닌 곳(D:\VS 등)에 설치한 경우를 위한 것이며,
  *     cleanup_protect_add_install 의 조건을 통과한 경로만 넣는다.
+ *   - PEP 514 로 등록된 Python 설치 경로(HKLM 64·32비트와 HKCU 의 Software\Python\<회사>\<태그>\
+ *     InstallPath). Program Files 밖(C:\Python314 등)에 설치한 경우를 위한 것이며 같은 조건을 거친다.
+ *     테스트용으로 환경 변수 BYTESIEVE_TEST_PYTHON_KEY 가 있으면 HKCU 의 그 키도 같은 구조로 읽는다.
  * 찾지 못한 항목은 건너뛴다. 추가한 개수를 반환한다.
  */
 size_t cleanup_protect_add_system(CleanupProtect *p);
@@ -143,6 +146,22 @@ size_t cleanup_protect_add_system(CleanupProtect *p);
  * (npm·pip 캐시가 %LOCALAPPDATA% 아래에 있음)는 이 목록을 쓰지 않는다. 추가한 개수를 반환한다.
  */
 size_t cleanup_protect_add_app_data(CleanupProtect *p);
+
+/*
+ * 정리 후보 탐지에서 들어가지 않을 다른 사용자 프로필을 추가한다: 프로필 폴더(레지스트리
+ * ProfileList\ProfilesDirectory, 보통 C:\Users) 바로 아래에서 현재 사용자 프로필(%USERPROFILE% 과
+ * 실제 프로필 위치 FOLDERID_Profile)이 아닌 폴더(Default·Public·다른 계정 등). 드라이브나 C:\Users 를
+ * 통째로 탐지할 때 남의 파일·새 계정의 틀(Default)을 후보로 삼지 않는다. 프로필 폴더가 볼륨 루트면
+ * 하지 않는다. 테스트용으로 환경 변수 BYTESIEVE_TEST_PROFILES_DIR 이 있으면 그 폴더를 프로필 폴더로 쓴다.
+ * 지금 있는 폴더를 읽어 넣으므로 탐지 직전에 부른다. 추가한 개수를 반환한다.
+ */
+size_t cleanup_protect_add_other_profiles(CleanupProtect *p);
+
+/*
+ * dir 가 볼륨 루트이고 name 이 Windows 시스템 파일(DumpStack.log·DumpStack.log.tmp·pagefile.sys·
+ * hiberfil.sys·swapfile.sys)인지. 정리 후보 탐지는 이 파일을 후보로 삼지 않는다.
+ */
+int cleanup_is_root_system_file(const wchar_t *dir, const wchar_t *name);
 
 /*
  * 프로그램 설치 경로 하나를 추가한다. 레지스트리 등 외부 값을 받으므로 cleanup_protect_add 보다

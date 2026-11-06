@@ -34,6 +34,11 @@ IndexedDB·확장 상태·세션을 LevelDB로 저장하며, 아직 본 파일�
   알립니다. 격리 폴더로 옮겨도 같은 이유로 실패하므로 전환하지 않습니다. 파일이면 재시작 관리자(`RmGetList`)로 그 파일을 연 프로그램
   이름을 조회만 해서 함께 보여 줍니다(예: Chrome·VS Code가 실행 중에 `Temp`에 열어 두는 `.tmp`, 앱을 닫으면 대개 스스로 지움).
   폴더는 일부 파일만 옮겨졌을 수 있습니다. 그 프로그램을 닫은 뒤 다시 선택해 시도할 수 있습니다.
+- 원본을 바꿀 권한이 없어 옮기지 못한 항목(`0x80270021`·`0x80270002`·`0x8027003F`)은 **권한 없음**(`access_denied`,
+  관리자 권한이 필요할 수 있음)으로 따로 알리며 격리 폴더로 전환하지 않습니다. 휴지통(대상) 쪽 거부(`0x80270022`)와 출처를 알 수 없는
+  `E_ACCESSDENIED`는 휴지통 문제일 수 있어 기존대로 실패로 두고 격리 폴더 전환을 시도합니다.
+- 볼륨 루트의 Windows 시스템 파일(`DumpStack.log`·`DumpStack.log.tmp`·`pagefile.sys`·`hiberfil.sys`·`swapfile.sys`)은 이름이
+  `.tmp`·`.log`여도 후보가 아닙니다.
 - 다음 중 하나라도 해당하면 그 항목은 건드리지 않습니다.
 
 | 시점 | 거부 조건 |
@@ -59,6 +64,7 @@ IndexedDB·확장 상태·세션을 LevelDB로 저장하며, 아직 본 파일�
 | `%LOCALAPPDATA%\Programs` | VS Code 사용자 설치(`Microsoft VS Code`), Python 등 사용자별 설치 프로그램 |
 | `%USERPROFILE%\.vscode\extensions`, `%USERPROFILE%\.vscode-insiders\extensions` | 설치한 VS Code 확장(안에 `package.json`·`node_modules`가 있어 예전에는 후보가 될 수 있었음) |
 | 프로그램 제거 정보(레지스트리 `Uninstall`, HKLM 64·32비트와 HKCU)의 `InstallLocation` | 표시 이름이 `Microsoft Visual Studio…`·`Visual Studio …`인 항목. 다른 드라이브(`D:\VS` 등)에 설치한 Visual Studio·VS Code |
+| PEP 514로 등록된 Python(레지스트리 `Software\Python\<회사>\<태그>\InstallPath`, HKLM 64·32비트와 HKCU) | Program Files 밖에 설치한 Python(`C:\Python314` 등). 안의 `__pycache__`·`build`가 후보가 되지 않음 |
 
 레지스트리 값은 앞뒤 공백·따옴표를 벗기고 `X:\폴더` 꼴의 로컬 절대 경로만 받습니다. 볼륨 루트(`D:\`)는 드라이브 전체가 보호되어
 탐지가 멈추지 않도록 받지 않습니다. 사용자가 보호 경로 안을 직접 탐지 경로로 고르면 항목은 보여 주되 모두 보호 표시를 붙여 옮기지 않습니다.
@@ -74,6 +80,16 @@ IndexedDB·확장 상태·세션을 LevelDB로 저장하며, 아직 본 파일�
   임시 폴더라 계속 탐지합니다.
 - 앱 폴더 안을 직접 탐지 경로로 고르면 보호 경로와 같이 항목은 보여 주되 보호 표시를 붙여 옮기지 않습니다.
 - [공용 캐시] 탭은 이 목록을 쓰지 않습니다. npm·pip 캐시가 `%LOCALAPPDATA%` 아래에 있어서이며, 그 탭은 캐시 구조를 확인한 폴더만 다룹니다.
+
+### 다른 사용자 프로필
+
+드라이브나 `C:\Users`를 통째로 탐지할 때 [정리 후보] 탭은 **현재 사용자가 아닌 프로필**에 들어가지 않습니다
+(`cleanup_protect_add_other_profiles`). 다른 계정의 파일, 새 계정의 틀로 쓰이는 `Default`, 공용 `Public`(설치한 앱의 로그·데이터가 있음)을
+후보로 삼지 않기 위해서입니다.
+
+- 프로필 폴더는 Windows가 정한 값(레지스트리 `ProfileList\ProfilesDirectory`, 보통 `C:\Users`)을 쓰고, 그 바로 아래에서 현재 사용자
+  프로필(`%USERPROFILE%`과 실제 프로필 위치)만 뺍니다. 프로필 폴더가 볼륨 루트면 적용하지 않습니다.
+- 그 프로필 안을 직접 탐지 경로로 고르면 항목은 보여 주되 보호 표시를 붙여 옮기지 않습니다.
 
 ## 공용 개발 캐시
 

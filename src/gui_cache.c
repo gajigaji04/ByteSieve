@@ -139,7 +139,8 @@ static int can_check(const ItemState *st)
 {
     return st->deny == CLEANUP_TRASH_PENDING &&
            (st->result == CLEANUP_TRASH_PENDING || st->result == CLEANUP_TRASH_FAILED ||
-            st->result == CLEANUP_TRASH_IN_USE || st->result == CLEANUP_TRASH_QUARANTINE_FAILED ||
+            st->result == CLEANUP_TRASH_IN_USE || st->result == CLEANUP_TRASH_ACCESS_DENIED ||
+            st->result == CLEANUP_TRASH_QUARANTINE_FAILED ||
             st->result == CLEANUP_TRASH_CANCELLED);
 }
 
@@ -161,6 +162,8 @@ static void state_text(const CachePanel *p, size_t index, wchar_t *buf, size_t l
     } else if (st->result == CLEANUP_TRASH_IN_USE) {
         swprintf(buf, len, L"옮기지 못함: %ls - 도구를 끝낸 뒤 다시 시도",
                  cleanup_trash_status_text(st->result));
+    } else if (st->result == CLEANUP_TRASH_ACCESS_DENIED) {
+        swprintf(buf, len, L"옮기지 못함: %ls", cleanup_trash_status_text(st->result));
     } else if (cleanup_trash_is_denied(st->result) || st->result == CLEANUP_TRASH_NO_RECYCLE) {
         swprintf(buf, len, L"건너뜀: %ls", cleanup_trash_status_text(st->result));
     } else if (st->result != CLEANUP_TRASH_PENDING) {

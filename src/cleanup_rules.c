@@ -1,5 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <knownfolders.h>
+#include <objbase.h>
+#include <shlobj.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -494,6 +497,55 @@ static void add_uninstall_dev_tools(CleanupProtect *p, HKEY root, REGSAM view)
     RegCloseKey(key);
 }
 
+/*
+ * PEP 514 로 등록된 Python 설치 경로를 추가한다: root\base\<회사>\<태그>\InstallPath 의 기본 값
+ * (view 는 KEY_WOW64_*). 읽지 못한 키·값은 건너뛴다.
+ */
+static void add_registered_pythons(CleanupProtect *p, HKEY root, REGSAM view, const wchar_t *base)
+{
+    HKEY key;
+    DWORD i, j;
+
+    if (RegOpenKeyExW(root, base, 0, KEY_READ | view, &key) != ERROR_SUCCESS) {
+        return;
+    }
+    for (i = 0;; i++) {
+        wchar_t company[256];
+        DWORD clen = sizeof(company) / sizeof(company[0]);
+        HKEY ck;
+        LSTATUS st = RegEnumKeyExW(key, i, company, &clen, NULL, NULL, NULL, NULL);
+
+        if (st == ERROR_NO_MORE_ITEMS) {
+            break;
+        }
+        if (st != ERROR_SUCCESS ||
+            RegOpenKeyExW(key, company, 0, KEY_READ | view, &ck) != ERROR_SUCCESS) {
+            continue;
+        }
+        for (j = 0;; j++) {
+            wchar_t tag[256], location[MAX_PATH];
+            DWORD tlen = sizeof(tag) / sizeof(tag[0]), size = sizeof(location);
+            HKEY tk;
+            st = RegEnumKeyExW(ck, j, tag, &tlen, NULL, NULL, NULL, NULL);
+            if (st == ERROR_NO_MORE_ITEMS) {
+                break;
+            }
+            if (st != ERROR_SUCCESS ||
+                RegOpenKeyExW(ck, tag, 0, KEY_READ | view, &tk) != ERROR_SUCCESS) {
+                continue;
+            }
+            /* InstallPath 키의 기본 값이 설치 폴더다. */
+            if (RegGetValueW(tk, L"InstallPath", NULL, RRF_RT_REG_SZ, NULL, location, &size) ==
+                ERROR_SUCCESS) {
+                cleanup_protect_add_install(p, location);
+            }
+            RegCloseKey(tk);
+        }
+        RegCloseKey(ck);
+    }
+    RegCloseKey(key);
+}
+
 size_t cleanup_protect_add_system(CleanupProtect *p)
 {
     static const wchar_t *const vars[] = {L"ProgramFiles", L"ProgramFiles(x86)",
@@ -530,11 +582,18 @@ size_t cleanup_protect_add_system(CleanupProtect *p)
     add_uninstall_dev_tools(p, HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY);
     add_uninstall_dev_tools(p, HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY);
     add_uninstall_dev_tools(p, HKEY_CURRENT_USER, 0);
+    add_registered_pythons(p, HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY, L"SOFTWARE\\Python");
+    add_registered_pythons(p, HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY, L"SOFTWARE\\Python");
+    add_registered_pythons(p, HKEY_CURRENT_USER, 0, L"SOFTWARE\\Python");
+    n = GetEnvironmentVariableW(L"BYTESIEVE_TEST_PYTHON_KEY", buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        add_registered_pythons(p, HKEY_CURRENT_USER, 0, buf);
+    }
     return p->len - before;
 }
 
-/* dir 바로 아래의 폴더(Temp 제외)를 목록에 넣는다. 읽지 못하면 건너뛴다. */
-static void add_app_folders(CleanupProtect *p, const wchar_t *dir)
+/* dir 바로 아래의 폴더(이름이 except 인 것 제외)를 목록에 넣는다. 읽지 못하면 건너뛴다. */
+static void add_child_folders(CleanupProtect *p, const wchar_t *dir, const wchar_t *except)
 {
     wchar_t *pattern = path_join(dir, L"*");
     wchar_t *ext = pattern != NULL ? path_to_extended(pattern) : NULL;
@@ -551,7 +610,7 @@ static void add_app_folders(CleanupProtect *p, const wchar_t *dir)
             wchar_t *child;
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
                 wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0 ||
-                name_eq(fd.cFileName, L"Temp")) {
+                name_eq(fd.cFileName, except)) {
                 continue;
             }
             child = path_join(dir, fd.cFileName);
@@ -591,11 +650,104 @@ size_t cleanup_protect_add_app_data(CleanupProtect *p)
         }
         dir = roots[i].tail != NULL ? path_join(buf, roots[i].tail) : path_dup(buf);
         if (dir != NULL) {
-            add_app_folders(p, dir);
+            /* 임시 폴더는 원래 정리할 곳이라 계속 탐지한다. */
+            add_child_folders(p, dir, L"Temp");
         }
         free(dir);
     }
     return p->len - before;
+}
+
+/* a 와 b 가 같은 로컬 경로인지(확장 접두사·끝 구분자·대소문자 무시). */
+static int same_path(const wchar_t *a, const wchar_t *b)
+{
+    const wchar_t *sa, *sb;
+    size_t la, lb;
+
+    return a != NULL && b != NULL && local_span(a, &sa, &la) && local_span(b, &sb, &lb) &&
+           name_eq_n(sa, la, sb, lb);
+}
+
+size_t cleanup_protect_add_other_profiles(CleanupProtect *p)
+{
+    wchar_t dir[MAX_PATH], env_me[MAX_PATH];
+    wchar_t *pattern, *ext;
+    PWSTR real_me = NULL;
+    const wchar_t *d;
+    WIN32_FIND_DATAW fd;
+    HANDLE find = INVALID_HANDLE_VALUE;
+    size_t before, dlen;
+    DWORD n, size = sizeof(dir);
+
+    if (p == NULL) {
+        return 0;
+    }
+    /* 프로필 폴더(보통 C:\Users)는 Windows 가 정한 값을 쓴다(현재 프로필의 상위를 짐작하지 않음). */
+    n = GetEnvironmentVariableW(L"BYTESIEVE_TEST_PROFILES_DIR", dir, MAX_PATH);
+    if ((n == 0 || n >= MAX_PATH) &&
+        RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList",
+                     L"ProfilesDirectory", RRF_RT_REG_SZ, NULL, dir, &size) != ERROR_SUCCESS) {
+        return 0;
+    }
+    /* 볼륨 루트면 드라이브의 모든 폴더가 들어가므로 하지 않는다. */
+    if (!local_span(dir, &d, &dlen) || is_volume_root(d, dlen)) {
+        return 0;
+    }
+    /* 현재 사용자: 환경 변수와 실제 프로필 위치 둘 다(환경 변수를 바꾼 경우에도 자기 파일은 탐지). */
+    n = GetEnvironmentVariableW(L"USERPROFILE", env_me, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        env_me[0] = L'\0';
+    }
+    if (FAILED(SHGetKnownFolderPath(&FOLDERID_Profile, KF_FLAG_DONT_VERIFY, NULL, &real_me))) {
+        real_me = NULL;
+    }
+
+    before = p->len;
+    pattern = path_join(dir, L"*");
+    ext = pattern != NULL ? path_to_extended(pattern) : NULL;
+    memset(&fd, 0, sizeof(fd));
+    if (ext != NULL) {
+        find = FindFirstFileExW(ext, FindExInfoBasic, &fd, FindExSearchLimitToDirectories, NULL,
+                                0);
+    }
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            wchar_t *child;
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+                wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
+                continue;
+            }
+            child = path_join(dir, fd.cFileName);
+            if (child != NULL && !same_path(child, env_me[0] != L'\0' ? env_me : NULL) &&
+                !same_path(child, real_me)) {
+                cleanup_protect_add(p, child);
+            }
+            free(child);
+        } while (FindNextFileW(find, &fd));
+        FindClose(find);
+    }
+    free(ext);
+    free(pattern);
+    CoTaskMemFree(real_me);
+    return p->len - before;
+}
+
+int cleanup_is_root_system_file(const wchar_t *dir, const wchar_t *name)
+{
+    static const wchar_t *const names[] = {L"DumpStack.log", L"DumpStack.log.tmp", L"pagefile.sys",
+                                           L"hiberfil.sys", L"swapfile.sys"};
+    const wchar_t *d;
+    size_t dlen, i;
+
+    if (name == NULL || !local_span(dir, &d, &dlen) || !is_volume_root(d, dlen)) {
+        return 0;
+    }
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (name_eq(name, names[i])) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int cleanup_protect_match(const CleanupProtect *p, const wchar_t *dir, const wchar_t *name)

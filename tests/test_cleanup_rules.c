@@ -72,6 +72,14 @@ static void test_classify_file(void)
     CHECK(!cleanup_is_leveldb_marker(L"current.txt"));
     CHECK(!cleanup_is_leveldb_marker(L"server.log"));
     CHECK(!cleanup_is_leveldb_marker(NULL));
+
+    /* 볼륨 루트의 Windows 시스템 파일 */
+    CHECK(cleanup_is_root_system_file(L"C:\\", L"DumpStack.log.tmp"));
+    CHECK(cleanup_is_root_system_file(L"\\\\?\\D:\\", L"pagefile.sys"));
+    CHECK(cleanup_is_root_system_file(L"C:", L"dumpstack.log"));
+    CHECK(!cleanup_is_root_system_file(L"C:\\work", L"DumpStack.log.tmp"));
+    CHECK(!cleanup_is_root_system_file(L"C:\\", L"session.tmp"));
+    CHECK(!cleanup_is_root_system_file(NULL, L"pagefile.sys"));
 }
 
 static void test_markers(void)

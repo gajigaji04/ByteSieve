@@ -691,6 +691,15 @@ static void test_trash_in_use(void)
     CHECK(cleanup_trash_is_in_use_code((uint32_t)HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION)));
     CHECK(!cleanup_trash_is_in_use_code((uint32_t)E_ACCESSDENIED));
     CHECK(!cleanup_trash_is_in_use_code(0x80270021u)); /* 원본 권한 문제 */
+    /* 원본 권한 문제만 권한 없음(대상 쪽·출처 모를 거부는 격리 폴더 전환 여지를 남김) */
+    CHECK(cleanup_trash_is_access_denied_code(0x80270021u));
+    CHECK(cleanup_trash_is_access_denied_code(0x80270002u));
+    CHECK(cleanup_trash_is_access_denied_code(0x8027003Fu));
+    CHECK(!cleanup_trash_is_access_denied_code(0x80270022u));
+    CHECK(!cleanup_trash_is_access_denied_code((uint32_t)E_ACCESSDENIED));
+    CHECK(!cleanup_trash_is_access_denied_code(0x80270027u));
+    CHECK(wcscmp(cleanup_trash_status_name(CLEANUP_TRASH_ACCESS_DENIED), L"access_denied") == 0);
+    CHECK(cleanup_trash_status_text(CLEANUP_TRASH_ACCESS_DENIED)[0] != L'\0');
     CHECK(wcscmp(cleanup_trash_status_name(CLEANUP_TRASH_IN_USE), L"in_use") == 0);
     CHECK(cleanup_trash_status_text(CLEANUP_TRASH_IN_USE)[0] != L'\0');
     CHECK(!cleanup_trash_is_denied(CLEANUP_TRASH_IN_USE));

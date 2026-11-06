@@ -15,7 +15,8 @@
  *   - 고정 디스크에서 셸이 영구 삭제하려 하면(휴지통 용량 초과·휴지통 없는 볼륨) 거부한 뒤,
  *     또는 셸이 아무것도 건드리지 못하고 실패하면 항목을 다시 확인하고 격리 폴더로
  *   - 휴지통이 일부를 옮긴 뒤 실패했으면 둘로 나뉘지 않게 격리하지 않고 실패로 남긴다
- *   - 다른 프로그램이 열어 둬서 옮기지 못했으면(IN_USE) 격리 폴더로도 옮길 수 없으므로 전환하지 않는다
+ *   - 다른 프로그램이 열어 둬서(IN_USE) 또는 원본을 바꿀 권한이 없어(ACCESS_DENIED) 옮기지 못했으면
+ *     격리 폴더로도 옮길 수 없으므로 전환하지 않는다
  *
  * 안전 장치(앞에서부터 차례로 확인하며 하나라도 걸리면 그 항목은 건드리지 않는다):
  *   1. 경로 판정(cleanup_guard_check, 파일 시스템 접근 없음)
@@ -55,6 +56,7 @@ typedef enum {
     CLEANUP_TRASH_FAILED,       /* 옮기지 못함(접근 거부 등, code 참고) */
     CLEANUP_TRASH_IN_USE,       /* 다른 프로그램이 열어 둬서 옮기지 못함(파일은 그대로, 폴더는 일부만
                                    옮겨졌을 수 있음. 그 프로그램을 닫은 뒤 다시 시도) */
+    CLEANUP_TRASH_ACCESS_DENIED, /* 원본을 바꿀 권한이 없어 옮기지 못함(관리자 권한이 필요할 수 있음) */
     CLEANUP_TRASH_QUARANTINE_FAILED, /* 격리 폴더로도 옮기지 못함(code 참고, 항목은 그대로) */
     CLEANUP_TRASH_CANCELLED,    /* 취소로 처리하지 않음 */
     CLEANUP_TRASH_STATUS_COUNT
@@ -75,6 +77,14 @@ int cleanup_trash_is_denied(CleanupTrashStatus status);
  * (ERROR_SHARING_VIOLATION·ERROR_LOCK_VIOLATION, HRESULT 로 감싼 것 포함).
  */
 int cleanup_trash_is_in_use_code(uint32_t code);
+
+/*
+ * 원본을 바꿀 권한이 없어 옮기지 못했다는 셸 복사 엔진 오류 코드인지: COPYENGINE_E_ACCESS_DENIED_SRC
+ * (0x80270021), COPYENGINE_E_REQUIRES_ELEVATION(0x80270002), COPYENGINE_E_ACCESSDENIED_READONLY
+ * (0x8027003F). 대상(휴지통) 쪽 거부와 출처를 알 수 없는 E_ACCESSDENIED 는 포함하지 않는다
+ * (휴지통 문제라면 격리 폴더로 옮길 수 있으므로).
+ */
+int cleanup_trash_is_access_denied_code(uint32_t code);
 
 /*
  * 파일 path 를 열고 있는 프로그램 이름들(malloc, ", " 로 구분, 같은 이름은 한 번). 재시작
@@ -109,7 +119,7 @@ CleanupTrashStatus cleanup_guard_check(const CleanupGuard *g, const wchar_t *roo
 /* 항목 하나의 처리 결과. */
 typedef struct {
     CleanupTrashStatus status;
-    uint32_t code;          /* FAILED·IN_USE·NO_RECYCLE·QUARANTINE_FAILED 일 때 HRESULT 또는 Windows 오류 코드 */
+    uint32_t code;          /* FAILED·IN_USE·ACCESS_DENIED·NO_RECYCLE·QUARANTINE_FAILED 일 때 HRESULT 또는 Windows 오류 코드 */
     wchar_t *recycled_path; /* MOVED·QUARANTINED 일 때 휴지통·격리 폴더 안의 실제 위치(모르면 NULL) */
     wchar_t *in_use_by;     /* IN_USE 인 파일을 열고 있는 프로그램 이름들(cleanup_trash_lockers, 모르면 NULL) */
 } CleanupTrashOutcome;

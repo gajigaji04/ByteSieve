@@ -145,7 +145,10 @@ static uintptr_t on_entry(const ScanEntry *entry, uintptr_t parent, int will_des
     if (!entry->is_dir) {
         c->cur_markers |= cleanup_marker_ecos(entry->name);
         c->cur_leveldb |= cleanup_is_leveldb_marker(entry->name);
-        category = cleanup_classify_file(entry->name);
+        /* 볼륨 루트의 Windows 시스템 파일(DumpStack.log.tmp 등)은 후보가 아니다. */
+        category = c->cur_dir != NULL && cleanup_is_root_system_file(c->cur_dir, entry->name)
+                       ? CLEANUP_NONE
+                       : cleanup_classify_file(entry->name);
         if (category != CLEANUP_NONE &&
             add_item(c, entry->name, category, 0, entry->size, 1) != ITEM_NONE) {
             c->found_bytes += entry->size;

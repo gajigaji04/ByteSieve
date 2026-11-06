@@ -32,8 +32,12 @@ CTest에 등록된 테스트는 60개입니다.
   후보가 아닌지(직접 탐지와 작업 스레드), 설치 폴더 안을 직접 고르면 모두 보호 표시인지, 설치 경로 값 검사(볼륨 루트·상대·UNC 거부)와 제품 이름 판정.
   앱 데이터·LevelDB: `LOCALAPPDATA`·`APPDATA`·`USERPROFILE`을 픽스처로 돌려 Chrome LevelDB(`000003.log`·`CURRENT`·`MANIFEST-*`)·VS Code 로그와
   세션 저장소·JetBrains 도구의 `node_modules`·`LocalLow`는 후보가 아니고 `Temp`·일반 로그는 후보인지(직접 탐지와 작업 스레드), 앱 데이터 목록
-  없이도 앱 데이터 밖의 LevelDB 폴더(`CURRENT`·`LOCK`)와 숫자 이름 로그가 빠지는지, 앱 폴더 안을 직접 고르면 보호 표시인지
+  없이도 앱 데이터 밖의 LevelDB 폴더(`CURRENT`·`LOCK`)와 숫자 이름 로그가 빠지는지, 앱 폴더 안을 직접 고르면 보호 표시인지.
+  다른 프로필·Python: 가짜 `Users`(테스트용 `BYTESIEVE_TEST_PROFILES_DIR`)에서 `Default`·`Public`·다른 계정은 후보가 아니고 현재 사용자 프로젝트는
+  후보인지, 테스트 전용 레지스트리 키(`HKCU\Software\ByteSieveTest_<pid>`, `BYTESIEVE_TEST_PYTHON_KEY`)에 PEP 514 구조로 등록한 Python 설치 폴더의
+  `__pycache__`가 후보가 아닌지(직접 탐지와 작업 스레드, 끝나면 키 삭제), 볼륨 루트 시스템 파일 판정
 - `cleanup_trash`: 보호 판정 규칙(설치 폴더 안의 실행 파일·하위 폴더는 보호, 그 상위는 중요 경로)과 **실제 휴지통 이동·거부**(테스트가 넣은 휴지통 항목만 지워 사용자 휴지통은 그대로 둠).
+  권한 없음 오류 코드 판정(원본 쪽만, 대상 쪽·`E_ACCESSDENIED` 제외).
   사용 중인 파일: 삭제를 허용하지 않고 연 파일은 `in_use`로 알리고 그대로 두며 격리 폴더로 전환하지 않는지, 연 프로그램 이름(재시작 관리자)을 알려 주는지,
   닫은 뒤에는 옮겨지는지, 공유 위반 오류 코드 판정
 - `dev_cache`: `USERPROFILE`·`LOCALAPPDATA`·`APPDATA`를 임시 픽스처로 돌리고 도구 환경 변수를 지워 실제 캐시를 보지 않는다.
