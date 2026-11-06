@@ -80,7 +80,7 @@ bytesieve_configure(bytesieve_quarantine)
 add_library(bytesieve_cleanup_trash STATIC src/cleanup_trash.c)
 target_include_directories(bytesieve_cleanup_trash PUBLIC src)
 target_link_libraries(bytesieve_cleanup_trash PUBLIC bytesieve_cleanup bytesieve_quarantine ole32
-                      shell32 uuid)
+                      shell32 uuid rstrtmgr)
 bytesieve_configure(bytesieve_cleanup_trash)
 
 # 공용 개발 캐시(npm·pip·Gradle·Cargo·NuGet) 위치 탐지·용량 세기. 읽기 전용이며 정리는 cleanup_trash 로.

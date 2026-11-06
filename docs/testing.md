@@ -33,7 +33,9 @@ CTest에 등록된 테스트는 60개입니다.
   앱 데이터·LevelDB: `LOCALAPPDATA`·`APPDATA`·`USERPROFILE`을 픽스처로 돌려 Chrome LevelDB(`000003.log`·`CURRENT`·`MANIFEST-*`)·VS Code 로그와
   세션 저장소·JetBrains 도구의 `node_modules`·`LocalLow`는 후보가 아니고 `Temp`·일반 로그는 후보인지(직접 탐지와 작업 스레드), 앱 데이터 목록
   없이도 앱 데이터 밖의 LevelDB 폴더(`CURRENT`·`LOCK`)와 숫자 이름 로그가 빠지는지, 앱 폴더 안을 직접 고르면 보호 표시인지
-- `cleanup_trash`: 보호 판정 규칙(설치 폴더 안의 실행 파일·하위 폴더는 보호, 그 상위는 중요 경로)과 **실제 휴지통 이동·거부**(테스트가 넣은 휴지통 항목만 지워 사용자 휴지통은 그대로 둠)
+- `cleanup_trash`: 보호 판정 규칙(설치 폴더 안의 실행 파일·하위 폴더는 보호, 그 상위는 중요 경로)과 **실제 휴지통 이동·거부**(테스트가 넣은 휴지통 항목만 지워 사용자 휴지통은 그대로 둠).
+  사용 중인 파일: 삭제를 허용하지 않고 연 파일은 `in_use`로 알리고 그대로 두며 격리 폴더로 전환하지 않는지, 연 프로그램 이름(재시작 관리자)을 알려 주는지,
+  닫은 뒤에는 옮겨지는지, 공유 위반 오류 코드 판정
 - `dev_cache`: `USERPROFILE`·`LOCALAPPDATA`·`APPDATA`를 임시 픽스처로 돌리고 도구 환경 변수를 지워 실제 캐시를 보지 않는다.
   기본 위치(없음·있음, NuGet `v3-cache`·`http-cache` 둘 다), 용량·파일 수, 도구 폴더 자체·`.cargo\bin`·`gradle.properties` 제외,
   환경 변수·`.npmrc`(`${VAR}`)·`pip.ini`(구역·상대 경로)·`NuGet.Config`(상대 경로), 캐시 구조가 아닌 폴더·파일·정션·바꾸지 못한 변수,

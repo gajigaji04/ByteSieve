@@ -671,6 +671,63 @@ static void test_guard_dev_tools(void)
     SetEnvironmentVariableW(L"USERPROFILE", nh > 0 && nh < MAX_PATH ? home : NULL);
 }
 
+/*
+ * 다른 프로그램이 삭제를 허용하지 않고 연 파일(Chrome 등이 Temp 의 .tmp 를 여는 방식):
+ * IN_USE 로 알리고 파일은 그대로 두며, 격리 폴더로 전환하지 않고, 연 프로그램 이름을 알려 준다.
+ * 닫은 뒤에는 옮길 수 있다.
+ */
+static void test_trash_in_use(void)
+{
+    CleanupGuard g;
+    CleanupTrashOutcome o;
+    HANDLE h;
+    wchar_t *path = fixture(L"app\\busy.log");
+    wchar_t store[] = L"?:\\.bytesieve-trash";
+    DWORD store_before;
+
+    CHECK(cleanup_trash_is_in_use_code(0x80270027u));
+    CHECK(cleanup_trash_is_in_use_code(0x80270028u));
+    CHECK(cleanup_trash_is_in_use_code(ERROR_SHARING_VIOLATION));
+    CHECK(cleanup_trash_is_in_use_code((uint32_t)HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION)));
+    CHECK(!cleanup_trash_is_in_use_code((uint32_t)E_ACCESSDENIED));
+    CHECK(!cleanup_trash_is_in_use_code(0x80270021u)); /* 원본 권한 문제 */
+    CHECK(wcscmp(cleanup_trash_status_name(CLEANUP_TRASH_IN_USE), L"in_use") == 0);
+    CHECK(cleanup_trash_status_text(CLEANUP_TRASH_IN_USE)[0] != L'\0');
+    CHECK(!cleanup_trash_is_denied(CLEANUP_TRASH_IN_USE));
+    CHECK(cleanup_trash_lockers(NULL) == NULL);
+    CHECK(cleanup_trash_lockers(g_root) == NULL); /* 폴더 */
+
+    CHECK(path != NULL && write_file(L"app\\busy.log", 9));
+    store[0] = g_root[0];
+    store_before = GetFileAttributesW(store);
+    h = path != NULL ? CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0,
+                                   NULL)
+                     : INVALID_HANDLE_VALUE;
+    CHECK(h != INVALID_HANDLE_VALUE);
+
+    cleanup_guard_init(&g);
+    cleanup_guard_add_system(&g);
+    memset(&o, 0, sizeof(o));
+    CHECK_STATUS(trash_rel(&g, L"app\\busy.log", 0, &o), CLEANUP_TRASH_IN_USE);
+    CHECK(cleanup_trash_is_in_use_code(o.code));
+    CHECK(exists(L"app\\busy.log") && o.recycled_path == NULL);
+    /* 이 테스트 프로그램이 열고 있다 */
+    CHECK(o.in_use_by != NULL && o.in_use_by[0] != L'\0');
+    /* 격리 폴더로 전환하지 않았다(드라이브 루트의 격리 폴더 상태가 그대로) */
+    CHECK(GetFileAttributesW(store) == store_before);
+
+    if (h != INVALID_HANDLE_VALUE) {
+        CloseHandle(h);
+    }
+    CHECK_STATUS(trash_rel(&g, L"app\\busy.log", 0, &o), CLEANUP_TRASH_MOVED);
+    CHECK(!exists(L"app\\busy.log") && o.in_use_by == NULL);
+    purge_recycled(o.recycled_path);
+
+    cleanup_trash_outcome_free(&o);
+    cleanup_guard_free(&g);
+    free(path);
+}
+
 int main(void)
 {
     HRESULT init = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -685,6 +742,7 @@ int main(void)
     }
     test_trash_detected();
     test_trash_denied();
+    test_trash_in_use();
     test_job();
     test_job_snapshot();
     remove_tree(g_root);

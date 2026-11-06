@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <knownfolders.h>
 #include <process.h>
+#include <restartmanager.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -43,6 +44,8 @@ const wchar_t *cleanup_trash_status_text(CleanupTrashStatus status)
         return L"휴지통에 넣을 수 없음(영구 삭제 방지)";
     case CLEANUP_TRASH_FAILED:
         return L"이동 실패";
+    case CLEANUP_TRASH_IN_USE:
+        return L"다른 프로그램이 사용 중";
     case CLEANUP_TRASH_QUARANTINE_FAILED:
         return L"격리 폴더로 옮기지 못함";
     case CLEANUP_TRASH_CANCELLED:
@@ -79,6 +82,8 @@ const wchar_t *cleanup_trash_status_name(CleanupTrashStatus status)
         return L"no_recycle";
     case CLEANUP_TRASH_FAILED:
         return L"failed";
+    case CLEANUP_TRASH_IN_USE:
+        return L"in_use";
     case CLEANUP_TRASH_QUARANTINE_FAILED:
         return L"quarantine_failed";
     case CLEANUP_TRASH_CANCELLED:
@@ -103,6 +108,85 @@ int cleanup_trash_is_denied(CleanupTrashStatus status)
     default:
         return 0;
     }
+}
+
+int cleanup_trash_is_in_use_code(uint32_t code)
+{
+    return code == (uint32_t)COPYENGINE_E_SHARING_VIOLATION_SRC ||
+           code == (uint32_t)COPYENGINE_E_SHARING_VIOLATION_DEST ||
+           code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION ||
+           code == (uint32_t)HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION) ||
+           code == (uint32_t)HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION);
+}
+
+wchar_t *cleanup_trash_lockers(const wchar_t *path)
+{
+    WCHAR key[CCH_RM_SESSION_KEY + 1];
+    DWORD session, attrs;
+    RM_PROCESS_INFO *info = NULL;
+    UINT needed = 0, count = 0, i, j;
+    DWORD reasons = 0, rc;
+    wchar_t *names = NULL;
+    size_t cap = 0, used = 0;
+
+    attrs = path != NULL ? GetFileAttributesW(path) : INVALID_FILE_ATTRIBUTES;
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        return NULL;
+    }
+    memset(key, 0, sizeof(key));
+    if (RmStartSession(&session, 0, key) != ERROR_SUCCESS) {
+        return NULL;
+    }
+    if (RmRegisterResources(session, 1, &path, 0, NULL, 0, NULL) != ERROR_SUCCESS) {
+        RmEndSession(session);
+        return NULL;
+    }
+    /* 처음에는 개수만 받고, 그사이 늘었으면 한 번 더 받는다. */
+    rc = RmGetList(session, &needed, &count, NULL, &reasons);
+    for (i = 0; i < 2 && rc == ERROR_MORE_DATA && needed > 0; i++) {
+        free(info);
+        info = calloc(needed, sizeof(*info));
+        if (info == NULL) {
+            break;
+        }
+        count = needed;
+        rc = RmGetList(session, &needed, &count, info, &reasons);
+    }
+    if (rc == ERROR_SUCCESS && info != NULL) {
+        for (i = 0; i < count; i++) {
+            const wchar_t *app = info[i].strAppName;
+            size_t len = wcslen(app);
+            int seen = 0;
+            if (len == 0) {
+                continue;
+            }
+            for (j = 0; j < i && !seen; j++) {
+                seen = _wcsicmp(info[j].strAppName, app) == 0;
+            }
+            if (seen) {
+                continue;
+            }
+            if (used + len + 3 > cap) {
+                size_t grow = (used + len + 3) * 2;
+                wchar_t *bigger = realloc(names, grow * sizeof(*bigger));
+                if (bigger == NULL) {
+                    break;
+                }
+                names = bigger;
+                cap = grow;
+            }
+            if (used > 0) {
+                names[used++] = L',';
+                names[used++] = L' ';
+            }
+            memcpy(names + used, app, len * sizeof(*app));
+            used += len;
+            names[used] = L'\0';
+        }
+    }
+    free(info);
+    RmEndSession(session);
+    return names;
 }
 
 /* ---- 경로 비교 ---- */
@@ -586,7 +670,9 @@ static CleanupTrashStatus recycle(const wchar_t *path, CleanupTrashOutcome *out,
         }
         out->code = (uint32_t)(FAILED(hr) ? hr : E_FAIL);
         *untouched = !sink.deleted;
-        return CLEANUP_TRASH_FAILED;
+        /* 다른 프로그램이 열어 둔 경우: 격리 폴더로도 옮길 수 없으니 전환하지 않는다. */
+        return cleanup_trash_is_in_use_code(out->code) ? CLEANUP_TRASH_IN_USE
+                                                       : CLEANUP_TRASH_FAILED;
     }
     out->recycled_path = sink.recycled_path;
     return CLEANUP_TRASH_MOVED;
@@ -598,6 +684,7 @@ void cleanup_trash_outcome_free(CleanupTrashOutcome *o)
 {
     if (o != NULL) {
         free(o->recycled_path);
+        free(o->in_use_by);
         memset(o, 0, sizeof(*o));
     }
 }
@@ -624,7 +711,7 @@ static CleanupTrashStatus quarantine_item(const CleanupItem *item, CleanupTrashO
         return CLEANUP_TRASH_MISSING;
     }
     out->code = code;
-    return CLEANUP_TRASH_QUARANTINE_FAILED;
+    return qs == QUARANTINE_IN_USE ? CLEANUP_TRASH_IN_USE : CLEANUP_TRASH_QUARANTINE_FAILED;
 }
 
 CleanupTrashStatus cleanup_trash_one(const CleanupGuard *g, const wchar_t *root,
@@ -652,6 +739,10 @@ CleanupTrashStatus cleanup_trash_one(const CleanupGuard *g, const wchar_t *root,
     if (quarantine && (status == CLEANUP_TRASH_PENDING || status == CLEANUP_TRASH_NO_RECYCLE ||
                        status == CLEANUP_TRASH_FAILED)) {
         status = quarantine_item(item, out);
+    }
+    if (status == CLEANUP_TRASH_IN_USE) {
+        /* 어떤 프로그램을 닫으면 되는지 알려 주려고 조회만 한다(파일일 때). */
+        out->in_use_by = cleanup_trash_lockers(item->path);
     }
     out->status = status;
     return status;
